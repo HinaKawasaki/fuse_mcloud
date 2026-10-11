@@ -1,0 +1,6 @@
+pyfuse3
+requests
+trio
+# 下面的库仅在tests/中调用，可选/非必需
+pytest
+pytest-trio

@@ -1,0 +1,5 @@
+basement/
+*.pyc
+__pycache__/
+notebooks/
+debug/
