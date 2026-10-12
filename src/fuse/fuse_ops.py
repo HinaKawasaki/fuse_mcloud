@@ -10,12 +10,13 @@ from typing import Dict, Optional
 import pyfuse3
 import trio
 
-from mapping.id_map import InodeMapper, InodeEntry, PENDING_FILE_ID_PREFIX
-from mapping.tree import DirectoryTree
-from cache.meta_cache import MetaCache
 from cache.data_cache import DataCache
-from client.wrapper import DirectClientWrapper, CloudItem, MCloudAPIException
+from cache.meta_cache import MetaCache
 from client.auth_manager import AuthRequiredException, MCloudAuthException
+from client.wrapper import CloudItem, DirectClientWrapper, MCloudAPIException
+from config import UPLOAD_KEEP_CACHE
+from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
+from mapping.tree import DirectoryTree
 from utils.trash_bin import TrashBinHandler
 
 logger = logging.getLogger(__name__)
@@ -425,10 +426,11 @@ class MCloudFuseOps(pyfuse3.Operations):
         return None
 
     async def fsync(self, fh: int, datasync: bool) -> None:
-        await self._commit_write(fh)
+        # fsync 只把当前内容推到云端，文件仍可能继续被写：保留写回暂存，不做收尾
+        await self._commit_write(fh, final=False)
 
     async def release(self, fh: int) -> None:
-        """[FUSE System Call] 关闭文件：必要时把写回缓存整文件上传。"""
+        """[FUSE System Call] 关闭文件：上传（如需要）并把写回暂存收尾为读缓存。"""
         state = self._write_state.get(fh)
         logger.debug("release fh=%s has_state=%s dirty=%s base=%s",
                      fh, state is not None, state and state.get("dirty"),
@@ -437,7 +439,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         if state is None:
             return
         try:
-            await self._commit_write(fh)
+            await self._commit_write(fh, final=True)
         finally:
             self._write_state.pop(fh, None)
 
@@ -445,17 +447,17 @@ class MCloudFuseOps(pyfuse3.Operations):
     # 上传实现
     # ------------------------------------------------------------------
 
-    async def _commit_write(self, inode: int) -> None:
+    async def _commit_write(self, inode: int, *, final: bool) -> None:
+        """把写回暂存上传到云端。
+
+        :param final: True 表示文件已关闭，上传后把暂存改名进读缓存（零拷贝）；
+                      False 表示只是 fsync，保留暂存以便继续写入。
+        """
         state = self._write_state.get(inode)
         if state is None:
             return
-        logger.debug("commit_write inode=%s dirty=%s base=%s size=%s",
-                     inode, state["dirty"], state["base_file_id"], state["size"])
-
-        is_new = str(state["base_file_id"]).startswith(PENDING_FILE_ID_PREFIX)
-        if not state["dirty"] and not is_new:
-            self.data_cache.discard_write_buffer(f"inode-{inode}")
-            return
+        logger.debug("commit_write inode=%s final=%s dirty=%s base=%s size=%s",
+                     inode, final, state["dirty"], state["base_file_id"], state["size"])
 
         parent_inode = state["target_dir_inode"]
         parent_entry = self.mapper.get_by_inode(parent_inode)
@@ -465,44 +467,63 @@ class MCloudFuseOps(pyfuse3.Operations):
         key = f"inode-{inode}"
         file_name = state["name"]
         target_dir_id = parent_entry.file_id
+        is_new = str(state["base_file_id"]).startswith(PENDING_FILE_ID_PREFIX)
+        need_upload = state["dirty"] or is_new
+
+        if not need_upload and not final:
+            return
 
         # 登记在途事件：release 异步返回后，后续 open/unlink 会等这里完成
         event = threading.Event()
         self._commit_events[inode] = event
         try:
-            def _upload() -> CloudItem:
-                return self.data_cache.commit_write_buffer(
-                    key=key,
-                    target_dir_id=target_dir_id,
-                    file_name=file_name,
+            if need_upload:
+                def _upload() -> CloudItem:
+                    return self.data_cache.upload_write_buffer(
+                        key=key,
+                        target_dir_id=target_dir_id,
+                        file_name=file_name,
+                    )
+
+                try:
+                    item = await trio.to_thread.run_sync(_upload)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("写回上传失败 inode=%s: %s", inode, exc)
+                    raise self._to_fuse_error(exc) from exc
+
+                # 用真实 fileId 替换占位/旧 fileId，保持 inode 与已打开句柄不变
+                old_file_id = state["base_file_id"]
+                self.mapper.remap_file_id(old_file_id, item.file_id)
+                self.mapper.update_entry(inode, size=state["size"])
+                # 覆盖写会在云端留下同名的旧对象，登记墓碑避免它重新出现在目录里
+                if self.tombstones is not None and old_file_id != item.file_id:
+                    if not str(old_file_id).startswith(PENDING_FILE_ID_PREFIX):
+                        self.tombstones.add(old_file_id)
+                state["base_file_id"] = item.file_id
+                state["dirty"] = False
+
+                # 云端搜索索引可能还没收录新上传的对象，给它一段宽限期
+                self.tree.mark_recent(inode)
+                self.meta_cache.invalidate_attr(inode)
+                self.meta_cache.invalidate_readdir(parent_inode)
+                self.tree.mark_directory_stale(parent_inode)
+                logger.info(
+                    "写回完成: %s -> fileId=%s (%s bytes)", file_name, item.file_id, state["size"]
                 )
 
-            try:
-                item = await trio.to_thread.run_sync(_upload)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("写回上传失败 inode=%s: %s", inode, exc)
-                raise self._to_fuse_error(exc) from exc
+            if final:
+                def _finalize():
+                    return self.data_cache.finalize_write_buffer(
+                        key=key,
+                        file_id=state["base_file_id"],
+                        file_name=file_name,
+                        keep_local_for_read=UPLOAD_KEEP_CACHE,
+                    )
 
-            # 用真实 fileId 替换占位/旧 fileId，保持 inode 与已打开句柄不变
-            old_file_id = state["base_file_id"]
-            self.mapper.remap_file_id(old_file_id, item.file_id)
-            self.mapper.update_entry(inode, size=state["size"])
-            # 覆盖写会在云端留下同名的旧对象，登记墓碑避免它重新出现在目录里
-            if self.tombstones is not None and old_file_id != item.file_id:
-                if not str(old_file_id).startswith(PENDING_FILE_ID_PREFIX):
-                    self.tombstones.add(old_file_id)
-            state["base_file_id"] = item.file_id
-            state["dirty"] = False
+                await trio.to_thread.run_sync(_finalize)
         finally:
             self._commit_events.pop(inode, None)
             event.set()
-
-        # 云端搜索索引可能还没收录新上传的对象，给它一段宽限期
-        self.tree.mark_recent(inode)
-        self.meta_cache.invalidate_attr(inode)
-        self.meta_cache.invalidate_readdir(parent_inode)
-        self.tree.mark_directory_stale(parent_inode)
-        logger.info("写回完成: %s -> fileId=%s (%s bytes)", file_name, item.file_id, state["size"])
 
     # ==================================================================
     # 创建 / 目录 / 删除 / 重命名 / 截断
@@ -589,7 +610,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         self.meta_cache.invalidate_readdir(parent_inode)
         self.tree.mark_directory_stale(parent_inode)
         # mknod 不返回句柄，立即落一个空文件
-        await self._commit_write(entry.inode)
+        await self._commit_write(entry.inode, final=True)
         self._write_state.pop(entry.inode, None)
         return self._to_attrs(entry)
 
@@ -797,7 +818,7 @@ class MCloudFuseOps(pyfuse3.Operations):
             else:
                 try:
                     await trio.to_thread.run_sync(self._truncate_sync, inode, new_size)
-                    await self._commit_write(inode)
+                    await self._commit_write(inode, final=True)
                 except pyfuse3.FUSEError:
                     raise
                 except Exception as exc:  # noqa: BLE001

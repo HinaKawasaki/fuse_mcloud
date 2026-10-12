@@ -1,5 +1,21 @@
+# 官方 Skill 与其凭据（绝不要提交）
 basement/
-*.pyc
-__pycache__/
+
+# 原作者的本地笔记与调试现场
 notebooks/
 debug/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境与工具缓存
+.venv/
+venv/
+.env
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/

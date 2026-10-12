@@ -3,7 +3,7 @@ from pathlib import PurePosixPath
 from typing import Optional
 
 from config import TRASH_BIN_DIR_NAME
-from mapping.id_map import InodeMapper, InodeEntry
+from mapping.id_map import InodeEntry, InodeMapper
 
 logger = logging.getLogger(__name__)
 

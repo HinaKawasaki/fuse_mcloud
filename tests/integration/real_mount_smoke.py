@@ -38,17 +38,17 @@ ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "basement" / "scripts"))
 
-import trio  # noqa: E402
 import pyfuse3  # noqa: E402
+import trio  # noqa: E402
 
+from cache.data_cache import DataCache  # noqa: E402
+from cache.meta_cache import MetaCache  # noqa: E402
 from client.auth_manager import AuthManager  # noqa: E402
 from client.wrapper import DirectClientWrapper  # noqa: E402
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
-from mapping.tombstones import TombstoneStore  # noqa: E402
-from cache.meta_cache import MetaCache  # noqa: E402
-from cache.data_cache import DataCache  # noqa: E402
 from fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mapping.id_map import InodeMapper  # noqa: E402
+from mapping.tombstones import TombstoneStore  # noqa: E402
+from mapping.tree import DirectoryTree  # noqa: E402
 
 TRASH = ".TrashBin"
 PROBE_DIR = "_mcloud_fuse_probe"
@@ -87,6 +87,19 @@ def wait_for(predicate, timeout=90.0, interval=2.0):
             return value, time.monotonic() - start
         time.sleep(interval)
     return None, time.monotonic() - start
+
+
+def _is_keyboard_interrupt(exc: BaseException) -> bool:
+    """判断异常是否为 KeyboardInterrupt（含被 trio 包进 BaseExceptionGroup 的情况）。
+
+    用 duck typing 判断 ``.exceptions``，避免在 Python 3.10 上引用 BaseExceptionGroup。
+    """
+    if isinstance(exc, KeyboardInterrupt):
+        return True
+    children = getattr(exc, "exceptions", None)
+    if children:
+        return all(_is_keyboard_interrupt(child) for child in children)
+    return False
 
 
 def run_checks(run, mountpoint, wrapper, root_id, api_items, results, live_write):
@@ -223,9 +236,10 @@ def main() -> int:
 
     try:
         trio.run(pyfuse3.main)
-    except* KeyboardInterrupt:
-        # 工作线程用 SIGINT 触发干净卸载，属正常收尾
-        pass
+    except BaseException as exc:  # noqa: BLE001
+        # 工作线程用 SIGINT 触发干净卸载；trio 会把它包进 BaseExceptionGroup。
+        if not _is_keyboard_interrupt(exc):
+            raise
     finally:
         try:
             pyfuse3.close()

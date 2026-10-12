@@ -1,6 +1,6 @@
+import shutil
 import sys
 import time
-import shutil
 from pathlib import Path
 
 # 确保 src 目录在 sys.path 中
@@ -67,19 +67,26 @@ def test_data_cache():
     assert mock_wrapper.download_calls == 1
     print("✅ 二次读取精准命中本地缓存测试成功！")
 
-    # ------------------ 3. 测试写回暂存与上传同步 ------------------
+    # ------------------ 3. 测试写回暂存 → 上传 → 零拷贝入缓存 ------------------
     buffer_path = cache.create_write_buffer(
         "wb_test", target_dir_id="dir_root", file_name="to_upload.txt"
     )
     buffer_path.write_bytes(b"Local new file content")
-    item = cache.commit_write_buffer(
+
+    item = cache.upload_write_buffer(
         "wb_test", target_dir_id="dir_root", file_name="to_upload.txt"
     )
-    assert item.file_id.startswith("uploaded_id_")
+    # 上传后暂存必须仍在：文件可能还开着，fsync 之后还要继续写
+    assert buffer_path.exists()
     assert mock_wrapper.upload_calls == 1
-    # 上传成功后内容应立即可作为读缓存命中
-    assert cache.get_cache_path(item.file_id) is not None
-    print("✅ 写回暂存 → 上传 → 读缓存登记测试成功！")
+
+    cache_path = cache.finalize_write_buffer("wb_test", item.file_id, "to_upload.txt")
+    # 收尾是「改名」而不是「拷贝」：暂存消失、缓存出现、内容一致、不额外占一份磁盘
+    assert not buffer_path.exists()
+    assert cache_path is not None and cache_path.exists()
+    assert cache_path.read_bytes() == b"Local new file content"
+    assert cache.get_cache_path(item.file_id) == cache_path
+    print("✅ 写回暂存 → 上传 → 零拷贝入缓存测试成功！")
 
     # ------------------ 4. 测试 LRU 容量溢出与淘汰 ------------------
     large_file_id = "fid_large"
@@ -101,6 +108,28 @@ def test_data_cache():
 
     shutil.rmtree(test_root, ignore_errors=True)
     print("🎉 DataCache 全部测试通过！")
+
+
+def test_finalize_can_discard_local_copy(tmp_path):
+    """UPLOAD_KEEP_CACHE=0 场景：上传后不保留本地副本。"""
+    wrapper = MockClientWrapper()
+    cache = DataCache(
+        client_wrapper=wrapper,
+        cache_dir=tmp_path / "cache",
+        write_back_dir=tmp_path / "wb",
+        max_size_mb=1,
+    )
+    buffer_path = cache.create_write_buffer("k1", target_dir_id="d", file_name="x.bin")
+    buffer_path.write_bytes(b"abc")
+    item = cache.upload_write_buffer("k1", target_dir_id="d", file_name="x.bin")
+
+    result = cache.finalize_write_buffer(
+        "k1", item.file_id, "x.bin", keep_local_for_read=False
+    )
+
+    assert result is None
+    assert not buffer_path.exists()
+    assert cache.get_cache_path(item.file_id) is None
 
 
 if __name__ == "__main__":

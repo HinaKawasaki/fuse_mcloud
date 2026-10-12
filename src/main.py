@@ -1,9 +1,10 @@
-import sys
 import argparse
 import logging
-import trio
+import sys
 from pathlib import Path
+
 import pyfuse3
+import trio
 
 # 1. 注入 sys.path
 SRC_DIR = Path(__file__).resolve().parent
@@ -14,15 +15,15 @@ BASEMENT_SCRIPTS_DIR = SRC_DIR.parent / "basement" / "scripts"
 if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(BASEMENT_SCRIPTS_DIR))
 
+from cache.data_cache import DataCache
+from cache.meta_cache import MetaCache
 from client.auth_manager import AuthManager
 from client.wrapper import DirectClientWrapper
-from mapping.id_map import InodeMapper
-from mapping.tree import DirectoryTree
-from mapping.tombstones import TombstoneStore
-from cache.meta_cache import MetaCache
-from cache.data_cache import DataCache
+from config import CACHE_DIR, META_CACHE_TTL
 from fuse.fuse_ops import MCloudFuseOps
-from config import META_CACHE_TTL, CACHE_DIR
+from mapping.id_map import InodeMapper
+from mapping.tombstones import TombstoneStore
+from mapping.tree import DirectoryTree
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mcloud_main")

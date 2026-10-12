@@ -3,10 +3,10 @@ import threading
 import time
 
 import pytest
+from cm_cloud_errors import ApiError, PermissionDeniedError
 
 from router.rate_limiter import RateLimiter, global_rate_limiter
 from router.retry import retry_call
-from cm_cloud_errors import ApiError, PermissionDeniedError
 
 
 def test_concurrency_limit():

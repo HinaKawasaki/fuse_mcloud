@@ -43,6 +43,13 @@ MAX_PARTS = int(os.getenv("MCLOUD_MAX_PARTS", "64"))
 PART_RETRIES = int(os.getenv("MCLOUD_PART_RETRIES", "3"))
 # 注：该后端要求分片严格按序上传（InvalidPartOrder），因此不提供并发分片。
 
+# ==================== 6. 写回收尾策略 ====================
+# 上传完成后是否把写回文件保留为本地读缓存（改名进缓存目录，零拷贝）。
+# 置 0 则上传后直接删除，适合本地磁盘紧张、且不在意刚写完立刻重读还要下次下载的场景。
+UPLOAD_KEEP_CACHE = os.getenv("MCLOUD_UPLOAD_KEEP_CACHE", "1").strip().lower() not in (
+    "0", "false", "no",
+)
+
 
 def get_effective_cache_limit_mb() -> int:
     """获取实际生效的缓存容量限额 (MB)。

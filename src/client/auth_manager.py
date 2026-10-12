@@ -1,7 +1,7 @@
-import sys
 import logging
+import sys
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 # 1. 确保将 basement/scripts 注入 sys.path (层级为 parent.parent.parent)
 BASEMENT_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "basement" / "scripts"
@@ -11,7 +11,7 @@ if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
 # 2. 导入官方 SDK
 import cm_cloud_auth  # noqa: E402
 import cm_cloud_config  # noqa: E402
-from cm_cloud_errors import NeedAuthError, AuthError  # noqa: E402
+from cm_cloud_errors import AuthError, NeedAuthError  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class AuthManager:
     def get_valid_token(self, issue_login: bool = False) -> str:
         """
         获取当前有效的 creditToken。
-        
+
         :param issue_login: 是否允许发起新的浏览器授权页面生成请求 (一般仅在 login 命令或首次初始化时设为 True)
         :return: 有效的 creditToken 字符串
         """

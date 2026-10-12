@@ -23,15 +23,15 @@ ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "basement" / "scripts"))
 
-import trio  # noqa: E402
 import pyfuse3  # noqa: E402
+import trio  # noqa: E402
 
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
-from cache.meta_cache import MetaCache  # noqa: E402
 from cache.data_cache import DataCache  # noqa: E402
+from cache.meta_cache import MetaCache  # noqa: E402
 from client.wrapper import CloudItem  # noqa: E402
 from fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mapping.id_map import InodeMapper  # noqa: E402
+from mapping.tree import DirectoryTree  # noqa: E402
 
 ROOT_ID = "sandbox_root"
 

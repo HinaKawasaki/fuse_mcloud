@@ -20,7 +20,8 @@
 
 - **正确的目录列举**：`readdir` / `lookup` 只按「当前目录自身的 fileId」调用列举接口并自动翻页，
   同名去重、按 inode 稳定分页，绝不使用全盘搜索（这是早期重复行 / 目录串台的根因）。
-- **写回缓存（Write-Back）**：`write` 先落本地暂存文件，`release` / `fsync` 时整文件上传，
+- **写回缓存（Write-Back）**：`write` 先落本地暂存文件，`fsync` 可中途推送到云端，
+  `release` 时整文件上传；收尾用**改名进读缓存（零拷贝）**，不为同一文件再占一份磁盘。
   适配云盘「整文件上传、无随机写」的语义。
 - **异步 release 同步**：FUSE 的 `release` 不阻塞 `close()`，因此对「上传在途」做了事件同步，
   `close()` 之后立刻读文件不会读到占位 ID。
@@ -73,6 +74,15 @@
 | `src/router/rate_limiter.py` | 线程安全并发 + RPS 限流 |
 | `src/router/retry.py` | 同步指数退避重试 |
 | `src/utils/trash_bin.py` | 回收站（`.TrashBin`）逻辑 |
+
+---
+
+## 📚 文档
+
+- [架构详解](docs/architecture.md)：模块划分、并发模型、读/写/删/恢复四条数据流。
+- [开发指南](docs/development.md)：环境搭建、测试策略、如何新增 FUSE 回调、调试与发布。
+- [事故复盘：目录列举重复与串台](docs/postmortem-readdir.md)：问题、根因、修复与教训。
+- [Release Notes](docs/release-notes.md)。
 
 ---
 
@@ -171,6 +181,7 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 | `MCLOUD_MIN_PART_SIZE` | `5242880`（5MiB） | 最小分片（接口硬限制） |
 | `MCLOUD_MAX_PARTS` | `64` | 最大分片数（据此自动调整分片大小） |
 | `MCLOUD_PART_RETRIES` | `3` | 单个分片上传尝试次数 |
+| `MCLOUD_UPLOAD_KEEP_CACHE` | `1` | 上传后是否把写回文件保留为读缓存（`0` = 上传后删除） |
 
 `MAX_CACHE_SIZE_MB` 留 `None` 时按物理内存的 25% 自动设定。
 
@@ -246,6 +257,9 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 - **覆盖写会产生同名旧版本**：云盘无 in-place 更新，覆盖写会生成新 fileId，旧对象留在云端（本地用墓碑屏蔽）。
 - **墓碑是本地状态**：换机器 / 清空缓存目录后，之前「删除」过的云端对象会重新出现。
 - **多段上传必须按序**，无法并发加速；跨进程不支持从中间分片续传（崩溃后由写回日志整文件重传）。
+- **写回必须整文件落本地**：接口要求在创建上传任务时就给出总大小，无法边写边传。不过收尾是
+  `os.replace` 改名进读缓存（同文件系统零拷贝），不会为同一文件再占一份磁盘；
+  `MCLOUD_UPLOAD_KEEP_CACHE=0` 可在上传后直接删除本地副本。
 - **POSIX 语义不完整**：`chmod` / `chown` / 时间戳设置被静默忽略；不支持 `flock` / `fcntl` 锁、xattr、
   符号链接 / 硬链接、`allow_other` 多用户。
 - **元数据 TTL 60s**：远端改动最长约 1 分钟才可见；索引宽限期内远端删除也可能被暂时隐藏。
@@ -279,7 +293,7 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。
 
-后续可做：**流式写回**（边写边按序分片上传，避免整文件落盘）、回收站可视化与一键清理、`rename` 语义增强。
+后续可做：回收站可视化与一键清理、`rename` 语义增强、`allow_other` 多用户与文件锁支持、Grafana 风格指标。
 
 ---
 

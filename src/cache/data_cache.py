@@ -7,12 +7,12 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+from client.wrapper import CloudItem, DirectClientWrapper
 from config import (
     CACHE_DIR,
     WRITE_BACK_DIR,
     get_effective_cache_limit_mb,
 )
-from client.wrapper import DirectClientWrapper, CloudItem
 
 logger = logging.getLogger(__name__)
 
@@ -210,16 +210,7 @@ class DataCache:
             except Exception as exc:  # noqa: BLE001 - 恢复失败保留现场
                 logger.warning("补传写回文件失败 key=%s: %s", key, exc)
                 continue
-            cache_path = self.cache_dir / f"{item.file_id}_{_safe_component(file_name)}"
-            try:
-                shutil.copyfile(path, cache_path)
-                self.register_cache_file(item.file_id, cache_path)
-            except OSError:
-                pass
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            self._promote_to_cache(path, item.file_id, file_name)
             self.clear_write_meta(key)
             recovered += 1
             logger.info("崩溃恢复：已补传 %s -> fileId=%s", file_name, item.file_id)
@@ -265,38 +256,58 @@ class DataCache:
             except OSError:
                 pass
 
-    def commit_write_buffer(
-        self,
-        key: str,
-        target_dir_id: str,
-        file_name: str,
-        *,
-        keep_local_for_read: bool = True,
-    ) -> CloudItem:
-        """
-        把写回暂存文件整文件上传到云盘，并让后续读操作立即看到新内容。
+    def upload_write_buffer(self, key: str, target_dir_id: str, file_name: str) -> CloudItem:
+        """把写回暂存文件整文件上传到云盘，**保留**暂存文件。
 
-        :return: 上传后的 CloudItem（含新 fileId）
+        保留是必要的：``fsync`` 之后文件可能仍处于打开状态，后续 ``write`` 还要继续写它。
+        真正的收尾（把暂存变成读缓存）由 ``finalize_write_buffer`` 在关闭文件时完成。
         """
         with self._lock:
             path = self._write_paths.get(key)
         if path is None or not path.exists():
             raise FileNotFoundError(f"写回暂存文件不存在: {key}")
-
-        item = self.wrapper.upload_file(
+        return self.wrapper.upload_file(
             local_file_path=path,
             target_dir_id=target_dir_id,
             name=file_name,
         )
 
-        if keep_local_for_read:
-            # 把刚上传的内容作为本地读缓存，避免刚写完马上读又触发一次下载
-            cache_path = self.cache_dir / f"{item.file_id}_{_safe_component(file_name)}"
+    def _promote_to_cache(self, source: Path, file_id: str, file_name: str) -> Optional[Path]:
+        """把已上传的本地文件变成读缓存：优先同文件系统改名（零拷贝），否则回退拷贝。"""
+        cache_path = self.cache_dir / f"{file_id}_{_safe_component(file_name)}"
+        try:
+            os.replace(source, cache_path)
+        except OSError:
             try:
-                shutil.copyfile(path, cache_path)
-                self.register_cache_file(item.file_id, cache_path)
-            except OSError as e:
-                logger.warning("写回后登记读缓存失败: %s", e)
+                shutil.copyfile(source, cache_path)
+                os.unlink(source)
+            except OSError as exc:
+                logger.warning("写回文件转读缓存失败: %s", exc)
+                return None
+        self.register_cache_file(file_id, cache_path)
+        return cache_path
 
-        self.discard_write_buffer(key)
-        return item
+    def finalize_write_buffer(
+        self,
+        key: str,
+        file_id: str,
+        file_name: str,
+        *,
+        keep_local_for_read: bool = True,
+    ) -> Optional[Path]:
+        """收尾写回：清日志、移除暂存登记，并把内容转为读缓存（或直接删除）。
+
+        用 ``os.replace`` 改名而不是 ``copyfile``，因此不会为同一个文件再占一份磁盘。
+        """
+        with self._lock:
+            path = self._write_paths.pop(key, None)
+        self.clear_write_meta(key)
+        if path is None or not path.exists():
+            return None
+        if not keep_local_for_read:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        return self._promote_to_cache(path, file_id, file_name)

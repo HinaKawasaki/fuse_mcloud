@@ -5,10 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from cm_cloud_errors import ApiError
 
 import client.wrapper as wrapper_mod
 from client.wrapper import DirectClientWrapper
-from cm_cloud_errors import ApiError
 from router.retry import retry_call
 
 

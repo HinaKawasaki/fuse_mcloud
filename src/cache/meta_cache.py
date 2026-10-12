@@ -1,8 +1,8 @@
-import time
 import logging
 import threading
-from typing import Optional, List, Dict, Any
+import time
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from config import META_CACHE_TTL
 from mapping.id_map import InodeEntry

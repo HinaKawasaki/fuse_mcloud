@@ -8,8 +8,9 @@ if str(SRC_DIR) not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cache.data_cache import DataCache  # noqa: E402
 from fakes import FakeCloud  # noqa: E402
+
+from cache.data_cache import DataCache  # noqa: E402
 
 
 def make_cache(tmp_path, cloud):

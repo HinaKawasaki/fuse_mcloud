@@ -23,8 +23,8 @@ from cm_cloud_errors import (  # noqa: E402
     ValidationError,
 )
 from cm_cloud_format import sha256_file  # noqa: E402
-from client.auth_manager import AuthManager  # noqa: E402
 
+from client.auth_manager import AuthManager  # noqa: E402
 from config import (  # noqa: E402
     MAX_PARTS,
     MIN_PART_SIZE_BYTES,

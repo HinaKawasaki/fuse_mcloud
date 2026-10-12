@@ -1,11 +1,11 @@
 import logging
 import threading
 import time
-from typing import List, Optional, Dict, Iterable
+from typing import Dict, Iterable, List, Optional
 
-from mapping.id_map import InodeMapper, InodeEntry, PENDING_FILE_ID_PREFIX
-from mapping.tombstones import TombstoneStore
 from config import TRASH_BIN_DIR_NAME
+from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
+from mapping.tombstones import TombstoneStore
 
 logger = logging.getLogger(__name__)
 

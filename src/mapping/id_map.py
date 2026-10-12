@@ -1,8 +1,8 @@
-import threading
 import logging
+import threading
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, List
 from pathlib import PurePosixPath
+from typing import Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 

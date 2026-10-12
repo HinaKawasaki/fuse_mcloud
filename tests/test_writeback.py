@@ -13,12 +13,12 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mapping.id_map import InodeMapper, PENDING_FILE_ID_PREFIX  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
-from cache.meta_cache import MetaCache  # noqa: E402
 from cache.data_cache import DataCache  # noqa: E402
+from cache.meta_cache import MetaCache  # noqa: E402
 from client.wrapper import CloudItem  # noqa: E402
 from fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeMapper  # noqa: E402
+from mapping.tree import DirectoryTree  # noqa: E402
 
 
 class FakeCloud:
@@ -202,8 +202,9 @@ def test_cloud_index_lag_does_not_drop_new_file(env):
 
 
 def test_truncate_via_setattr(env):
-    import pyfuse3
     from types import SimpleNamespace
+
+    import pyfuse3
 
     ops, cloud, mapper, _ = env
     entry = mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
@@ -219,3 +220,30 @@ def test_truncate_via_setattr(env):
     fresh = mapper.get_by_inode(entry.inode)
     assert fresh.size == 1
     assert any(name == "a.txt" and payload == b"o" for name, payload in cloud.uploads)
+
+
+def test_fsync_keeps_buffer_then_release_finalizes(env):
+    """fsync 中途提交不能破坏后续写入；release 才把暂存收尾进读缓存。"""
+    ops, cloud, mapper, _ = env
+    fi, attrs = trio.run(ops.create, 1, b"fsync.txt", 0o644, os.O_WRONLY | os.O_CREAT, None)
+
+    trio.run(ops.write, fi.fh, 0, b"part1")
+    trio.run(ops.fsync, fi.fh, False)
+
+    buffer_path = ops._write_state[attrs.st_ino]["buffer"]
+    assert buffer_path.exists(), "fsync 后暂存被删会导致后续写入丢失"
+
+    trio.run(ops.write, fi.fh, 5, b"part2")
+    trio.run(ops.release, fi.fh)
+
+    # release 收尾：暂存改名进缓存，不再存在
+    assert not buffer_path.exists()
+    entry = mapper.get_by_inode(attrs.st_ino)
+    assert entry.size == 10
+    cache_path = ops.data_cache.get_cache_path(entry.file_id)
+    assert cache_path is not None and cache_path.exists()
+    assert cache_path.read_bytes() == b"part1part2"
+
+    fi2 = trio.run(ops.open, attrs.st_ino, os.O_RDONLY, None)
+    assert trio.run(ops.read, fi2.fh, 0, 100) == b"part1part2"
+    trio.run(ops.release, fi2.fh)
