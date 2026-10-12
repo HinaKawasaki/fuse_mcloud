@@ -1,6 +1,4 @@
-pyfuse3
-requests
-trio
-# 下面的库仅在tests/中调用，可选/非必需
-pytest
-pytest-trio
+# 运行时依赖
+pyfuse3>=3.4
+trio>=0.25
+requests>=2.31.0,<3.0.0

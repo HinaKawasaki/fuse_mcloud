@@ -1,71 +1,86 @@
+"""回收站（.TrashBin）与写回上传的离线测试。"""
 import sys
-import os
-import asyncio
 from pathlib import Path
 
-# 1. 获取当前文件的真实绝对物理路径
-CURRENT_FILE = Path(__file__).resolve()
-# 强制定位项目根目录 (fuse_mcloud)
-PROJECT_ROOT = CURRENT_FILE.parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-# 2. 将真实物理路径 AND 软链接路径全部插入 sys.path 首位
-sys.path.insert(0, str(SRC_DIR))
-sys.path.insert(0, str(SRC_DIR.resolve()))
+from mapping.id_map import InodeMapper  # noqa: E402
+from mapping.tree import DirectoryTree  # noqa: E402
+from client.wrapper import CloudItem  # noqa: E402
+from utils.trash_bin import TrashBinHandler  # noqa: E402
 
-print(f"🔍 [DEBUG] CURRENT_FILE : {CURRENT_FILE}")
-print(f"🔍 [DEBUG] PROJECT_ROOT   : {PROJECT_ROOT}")
-print(f"🔍 [DEBUG] SRC_DIR        : {SRC_DIR}")
-print(f"🔍 [DEBUG] sys.path[0..2] : {sys.path[:2]}")
 
-try:
-    from utils.sandbox_router import SandboxRouter
-    from utils.trash_bin import TrashBinHandler
-    print("✅ 模块导入成功！")
-except ModuleNotFoundError as e:
-    print(f"❌ 导入失败，当前 sys.path 为: {sys.path}")
-    print(f"❌ 请检查 {SRC_DIR}/utils/sandbox_router.py 文件是否存在！")
-    sys.exit(1)
-
-# 模拟底层 Client Wrapper
-class MockClientWrapper:
+class MockWrapper:
     def __init__(self):
-        self.copied_history = []
-        self.created_dirs = []
+        self.copied = []
+        self.created = []
+        self.items = {"root_id": []}
 
-    async def mkdir(self, path: str, confirm: bool = True):
-        self.created_dirs.append(path)
-        print(f"  [MockClient] 成功创建目录: {path} (confirm={confirm})")
-        return True
+    def list_directory(self, dir_file_id, **kwargs):
+        return [
+            CloudItem(i["id"], i["name"], i.get("isDir", False), 0, "", dir_file_id)
+            for i in self.items.get(dir_file_id, [])
+        ]
 
-    async def copy(self, source_path: str, target_path: str, confirm: bool = True):
-        self.copied_history.append((source_path, target_path))
-        print(f"  [MockClient] 成功复制文件: {source_path} -> {target_path} (confirm={confirm})")
-        return True
+    def create_folder(self, name, parent_file_id):
+        new_id = f"dir_{name}"
+        self.created.append((name, parent_file_id))
+        self.items.setdefault(parent_file_id, []).append({"id": new_id, "name": name, "isDir": True})
+        self.items.setdefault(new_id, [])
+        return new_id
 
-async def main():
-    print("\n🚀 1. 测试 SandboxRouter 路径自动解析与确认选项...")
-    router = SandboxRouter()
-    
-    test_path = "my_folder/docs"
-    sandbox_path = router.to_sandbox_path(test_path)
-    print(f"  原始相对路径: {test_path}")
-    print(f"  拼接后的沙箱路径: {sandbox_path}")
-    assert sandbox_path == "/AI空间/智能体云盘助手/my_folder/docs"
-    assert router.is_in_sandbox(sandbox_path) is True
-    print("✅ 沙箱路由测试通过！")
+    def batch_copy(self, file_ids, to_parent_file_id):
+        results = []
+        for file_id in file_ids:
+            new_id = f"copy_{file_id}"
+            self.copied.append((file_id, to_parent_file_id))
+            self.items.setdefault(to_parent_file_id, []).append(
+                {"id": new_id, "name": file_id}
+            )
+            results.append({"fileId": file_id, "newFileId": new_id})
+        return results
 
-    print("\n🚀 2. 测试 TrashBinHandler 拦截删除并转存回收站...")
-    trash_handler = TrashBinHandler(router)
-    mock_client = MockClientWrapper()
 
-    original_file = "/AI空间/智能体云盘助手/test_file.txt"
-    trash_dest = await trash_handler.move_to_trash(mock_client, original_file)
-    
-    print(f"  拦截 unlink({original_file}) -> 实际重定向为: {trash_dest}")
-    assert ".TrashBin" in trash_dest
-    assert len(mock_client.copied_history) == 1
-    print("✅ 回收站移动拦截测试通过！")
+def build():
+    mapper = InodeMapper(root_file_id="root_id")
+    tree = DirectoryTree(mapper=mapper)
+    wrapper = MockWrapper()
+    tree.populate_directory(1, [{"id": "f1", "name": "to_delete.txt", "size": 3}])
+    return mapper, tree, wrapper, TrashBinHandler(wrapper, mapper, tree)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
+def test_trash_dir_created_once():
+    mapper, tree, wrapper, handler = build()
+    trash_id = handler.ensure_trash_dir()
+    assert trash_id == "dir_.TrashBin"
+    assert wrapper.created == [(".TrashBin", "root_id")]
+    # 再调用一次应命中缓存，不重复创建
+    assert handler.ensure_trash_dir() == trash_id
+    assert len(wrapper.created) == 1
+
+
+def test_move_to_trash_removes_local_node():
+    mapper, tree, wrapper, handler = build()
+    entry = mapper.get_by_path("/to_delete.txt")
+    assert entry is not None
+
+    new_id = handler.move_to_trash(entry)
+
+    assert new_id == "copy_f1"
+    assert mapper.get_by_path("/to_delete.txt") is None
+    assert wrapper.copied == [("f1", "dir_.TrashBin")]
+
+
+def test_trash_bin_hidden_from_root_listing():
+    mapper, tree, wrapper, handler = build()
+    handler.ensure_trash_dir()
+    # 模拟云端在根目录同时返回 .TrashBin 与普通文件
+    tree.populate_directory(1, [
+        {"id": "dir_.TrashBin", "name": ".TrashBin", "isDir": True},
+        {"id": "f2", "name": "visible.txt"},
+    ])
+    names = [e.path.rsplit("/", 1)[-1] for e in tree.get_children(1)]
+    assert ".TrashBin" not in names
+    assert "visible.txt" in names

@@ -1,20 +1,33 @@
+import json
+import logging
 import os
 import shutil
-import logging
 import threading
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from config import CACHE_DIR, DISK_FALLBACK_DIR, MAX_CACHE_SIZE_MB
-from client.wrapper import DirectClientWrapper
+from config import (
+    CACHE_DIR,
+    DISK_FALLBACK_DIR,
+    WRITE_BACK_DIR,
+    get_effective_cache_limit_mb,
+)
+from client.wrapper import DirectClientWrapper, CloudItem
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_component(name: str) -> str:
+    """把云端文件名清洗成可安全用作本地缓存文件名的片段。"""
+    cleaned = str(name or "").replace("/", "_").replace("\\", "_").strip()
+    return cleaned or "unnamed"
 
 
 class DataCache:
     """
     文件内容读写缓存管理器 (Data Cache)
-    提供 POSIX open/read/write 操作需要的本地文件缓存与 LRU 淘汰
+    提供 POSIX open/read 需要的本地文件缓存、LRU 淘汰，以及 write 阶段的写回暂存。
     """
 
     def __init__(
@@ -22,95 +35,288 @@ class DataCache:
         client_wrapper: DirectClientWrapper,
         cache_dir: Path = CACHE_DIR,
         fallback_dir: Path = DISK_FALLBACK_DIR,
-        max_size_mb: Optional[int] = MAX_CACHE_SIZE_MB
+        write_back_dir: Path = WRITE_BACK_DIR,
+        max_size_mb: Optional[int] = None,
     ):
         self.wrapper = client_wrapper
-        self.cache_dir = cache_dir
-        self.fallback_dir = fallback_dir
-        self.max_bytes = (max_size_mb * 1024 * 1024) if max_size_mb else (4096 * 1024 * 1024)
-        
+        self.cache_dir = Path(cache_dir)
+        self.fallback_dir = Path(fallback_dir)
+        self.write_back_dir = Path(write_back_dir)
+        limit_mb = max_size_mb if max_size_mb is not None else get_effective_cache_limit_mb()
+        self.max_bytes = max(1, int(limit_mb)) * 1024 * 1024
+
         self._lock = threading.RLock()
         # 维护 file_id -> 本地缓存 Path
         self._cache_map: Dict[str, Path] = {}
         # 维护 LRU 访问时间 file_id -> last_access_time
         self._access_time: Dict[str, float] = {}
+        # 每个 file_id 一把锁，避免同一文件被并发重复下载
+        self._download_locks: Dict[str, threading.Lock] = {}
+        # 写回暂存 key -> 本地路径
+        self._write_paths: Dict[str, Path] = {}
+        # 写回日志：崩溃恢复时用来把未上传的暂存文件补传回云盘
+        self._journal_path = self.write_back_dir / "writeback_journal.json"
+        self._journal: Dict[str, dict] = {}
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.fallback_dir.mkdir(parents=True, exist_ok=True)
+        self.write_back_dir.mkdir(parents=True, exist_ok=True)
+        self._load_journal()
+
+    # ------------------------------------------------------------------
+    # 读缓存
+    # ------------------------------------------------------------------
 
     def get_cache_path(self, file_id: str) -> Optional[Path]:
         """检查文件是否已缓存在本地 tmpfs 或 Fallback 磁盘"""
         with self._lock:
             path = self._cache_map.get(file_id)
             if path and path.exists():
-                import time
                 self._access_time[file_id] = time.time()
                 return path
             return None
 
+    def _download_lock(self, file_id: str) -> threading.Lock:
+        with self._lock:
+            return self._download_locks.setdefault(file_id, threading.Lock())
+
     def prepare_file_for_read(self, file_id: str, file_name: str) -> Path:
         """
         [关键 I/O API] 为读操作准备文件：
-        若本地已有缓存则直接复用，否则从移动云盘调用 download_file 下载到本地缓存
+        若本地已有缓存则直接复用，否则从移动云盘下载到本地缓存。
+        下载过程不持有全局锁，避免阻塞其他文件的缓存命中。
         """
-        with self._lock:
-            # 1. 命中缓存
+        existing_path = self.get_cache_path(file_id)
+        if existing_path:
+            logger.debug("命中本地文件缓存: %s", existing_path)
+            return existing_path
+
+        with self._download_lock(file_id):
+            # 双重检查：等待下载锁期间可能已被其他线程下载完成
             existing_path = self.get_cache_path(file_id)
             if existing_path:
-                logger.debug(f"命中本地文件缓存: {existing_path}")
                 return existing_path
 
-            # 2. 未命中，检查容量并在必要时触发 LRU 淘汰
             self._evict_if_needed()
 
-            # 3. 确定本地暂存路径 (/tmp/cmcloud-fuse/cache/<file_id>_<name>)
-            local_path = self.cache_dir / f"{file_id}_{file_name}"
-
-            # 4. 调用真实 API 进行下载
-            logger.info(f"正在从云盘下载文件至本地缓存: {file_id} -> {local_path}")
+            local_path = self.cache_dir / f"{file_id}_{_safe_component(file_name)}"
+            logger.info("正在从云盘下载文件至本地缓存: %s -> %s", file_id, local_path)
             self.wrapper.download_file(file_id=file_id, local_save_path=local_path)
 
-            # 5. 登记缓存映射
-            import time
-            self._cache_map[file_id] = local_path
-            self._access_time[file_id] = time.time()
-
+            with self._lock:
+                self._cache_map[file_id] = local_path
+                self._access_time[file_id] = time.time()
             return local_path
 
-    def stage_file_for_upload(self, local_source_path: Path, target_dir_id: str) -> str:
-        """
-        [关键 I/O API] 将本地修改后的文件上传写回云盘
-        """
-        logger.info(f"正在上传本地文件到云盘目录: {local_source_path} -> dir_id={target_dir_id}")
-        cloud_item = self.wrapper.upload_file(
-            local_file_path=local_source_path,
-            target_dir_id=target_dir_id
-        )
-        return cloud_item.file_id
+    def register_cache_file(self, file_id: str, local_path: Path) -> None:
+        """把外部已经落盘的文件登记进缓存（例如新建文件上传后）。"""
+        with self._lock:
+            self._cache_map[file_id] = Path(local_path)
+            self._access_time[file_id] = time.time()
 
     def invalidate_file_cache(self, file_id: str):
         """主动删除某文件的本地缓存"""
         with self._lock:
             path = self._cache_map.pop(file_id, None)
             self._access_time.pop(file_id, None)
-            if path and path.exists():
-                try:
-                    path.unlink()
-                except OSError as e:
-                    logger.warning(f"删除本地缓存失败: {e}")
+        if path and path.exists():
+            try:
+                path.unlink()
+            except OSError as e:
+                logger.warning("删除本地缓存失败: %s", e)
 
     def _get_current_cache_size(self) -> int:
         """计算当前缓存占用的总字节数"""
+        with self._lock:
+            paths = list(self._cache_map.values())
         total = 0
-        for path in self._cache_map.values():
-            if path.exists():
-                total += path.stat().st_size
+        for path in paths:
+            try:
+                if path.exists():
+                    total += path.stat().st_size
+            except OSError:
+                continue
         return total
 
     def _evict_if_needed(self):
         """根据 LRU 算法剔除最老的文件，保持缓存容量在上限以内"""
-        while self._get_current_cache_size() >= self.max_bytes and self._access_time:
-            # 找到访问时间最早的 file_id
-            oldest_file_id = min(self._access_time, key=self._access_time.get)
-            logger.info(f"缓存超出限额，触发 LRU 淘汰旧文件: file_id={oldest_file_id}")
+        while self._get_current_cache_size() >= self.max_bytes:
+            with self._lock:
+                if not self._access_time:
+                    return
+                oldest_file_id = min(self._access_time, key=self._access_time.get)
+            logger.info("缓存超出限额，触发 LRU 淘汰旧文件: file_id=%s", oldest_file_id)
             self.invalidate_file_cache(oldest_file_id)
+
+    # ------------------------------------------------------------------
+    # 写回暂存 (write-back)
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 写回日志（崩溃恢复）
+    # ------------------------------------------------------------------
+
+    def _load_journal(self) -> None:
+        try:
+            if self._journal_path.exists():
+                with open(self._journal_path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    self._journal = data
+                    logger.info("发现 %s 条未完成的写回记录", len(self._journal))
+        except (OSError, ValueError) as exc:
+            logger.warning("加载写回日志失败: %s", exc)
+
+    def _save_journal_nolock(self) -> None:
+        try:
+            tmp = self._journal_path.with_name(self._journal_path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self._journal, handle, ensure_ascii=False)
+            os.replace(tmp, self._journal_path)
+        except OSError as exc:
+            logger.warning("保存写回日志失败: %s", exc)
+
+    def register_write_meta(self, key: str, target_dir_id: str, file_name: str) -> None:
+        """登记一条待上传的写回记录。"""
+        with self._lock:
+            self._journal[key] = {
+                "target_dir_id": str(target_dir_id),
+                "file_name": str(file_name),
+            }
+            self._save_journal_nolock()
+
+    def clear_write_meta(self, key: str) -> None:
+        with self._lock:
+            if self._journal.pop(key, None) is not None:
+                self._save_journal_nolock()
+
+    def pending_uploads(self) -> Dict[str, dict]:
+        with self._lock:
+            return dict(self._journal)
+
+    def recover_pending_uploads(self) -> int:
+        """启动时把上次崩溃遗留的写回文件补传回云盘。
+
+        :return: 成功补传的数量
+        """
+        recovered = 0
+        for key, meta in self.pending_uploads().items():
+            path = self.write_back_dir / f"{_safe_component(key)}.wb"
+            target_dir_id = str(meta.get("target_dir_id") or "")
+            file_name = str(meta.get("file_name") or "")
+            if not path.exists() or not target_dir_id or not file_name:
+                self.clear_write_meta(key)
+                continue
+            try:
+                item = self.wrapper.upload_file(
+                    local_file_path=path, target_dir_id=target_dir_id, name=file_name
+                )
+            except Exception as exc:  # noqa: BLE001 - 恢复失败保留现场
+                logger.warning("补传写回文件失败 key=%s: %s", key, exc)
+                continue
+            cache_path = self.cache_dir / f"{item.file_id}_{_safe_component(file_name)}"
+            try:
+                shutil.copyfile(path, cache_path)
+                self.register_cache_file(item.file_id, cache_path)
+            except OSError:
+                pass
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            self.clear_write_meta(key)
+            recovered += 1
+            logger.info("崩溃恢复：已补传 %s -> fileId=%s", file_name, item.file_id)
+        return recovered
+
+    # ------------------------------------------------------------------
+    # 写回暂存 (write-back)
+    # ------------------------------------------------------------------
+
+    def get_write_path(self, key: str) -> Optional[Path]:
+        """返回写回暂存文件的本地路径（若存在）。"""
+        with self._lock:
+            return self._write_paths.get(key)
+
+    def create_write_buffer(
+        self,
+        key: str,
+        initial_path: Optional[Path] = None,
+        target_dir_id: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> Path:
+        """
+        为写操作创建本地暂存文件。
+        - 若 ``initial_path`` 给定（修改已有文件），先把原内容复制过来；
+        - 否则创建空的截断文件（新建文件）。
+        - 若给定 ``target_dir_id`` / ``file_name``，同时登记写回日志，
+          进程崩溃后可据此补传。
+        """
+        target = self.write_back_dir / f"{_safe_component(key)}.wb"
+        if initial_path is not None and Path(initial_path).exists():
+            shutil.copyfile(initial_path, target)
+        else:
+            target.touch()
+        with self._lock:
+            self._write_paths[key] = target
+        if target_dir_id and file_name:
+            self.register_write_meta(key, target_dir_id, file_name)
+        return target
+
+    def discard_write_buffer(self, key: str) -> None:
+        """放弃某次写操作（如上传失败后清理）。"""
+        with self._lock:
+            path = self._write_paths.pop(key, None)
+        self.clear_write_meta(key)
+        if path and path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def stage_file_for_upload(self, local_source_path: Path, target_dir_id: str) -> str:
+        """
+        [关键 I/O API] 将本地修改后的文件上传写回云盘，返回新 fileId。
+        """
+        logger.info("正在上传本地文件到云盘目录: %s -> dir_id=%s", local_source_path, target_dir_id)
+        cloud_item = self.wrapper.upload_file(
+            local_file_path=Path(local_source_path),
+            target_dir_id=target_dir_id,
+        )
+        return cloud_item.file_id
+
+    def commit_write_buffer(
+        self,
+        key: str,
+        target_dir_id: str,
+        file_name: str,
+        *,
+        keep_local_for_read: bool = True,
+    ) -> CloudItem:
+        """
+        把写回暂存文件整文件上传到云盘，并让后续读操作立即看到新内容。
+
+        :return: 上传后的 CloudItem（含新 fileId）
+        """
+        with self._lock:
+            path = self._write_paths.get(key)
+        if path is None or not path.exists():
+            raise FileNotFoundError(f"写回暂存文件不存在: {key}")
+
+        item = self.wrapper.upload_file(
+            local_file_path=path,
+            target_dir_id=target_dir_id,
+            name=file_name,
+        )
+
+        if keep_local_for_read:
+            # 把刚上传的内容作为本地读缓存，避免刚写完马上读又触发一次下载
+            cache_path = self.cache_dir / f"{item.file_id}_{_safe_component(file_name)}"
+            try:
+                shutil.copyfile(path, cache_path)
+                self.register_cache_file(item.file_id, cache_path)
+            except OSError as e:
+                logger.warning("写回后登记读缓存失败: %s", e)
+
+        self.discard_write_buffer(key)
+        return item

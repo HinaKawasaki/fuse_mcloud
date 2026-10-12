@@ -1,0 +1,95 @@
+"""已删除 fileId 的墓碑集合。
+
+移动云盘接口没有删除能力，本层把「删除」实现为复制进 .TrashBin 并摘除本地节点。
+但云端原文件依然存在，下一次 list 会把它重新列出来。因此需要记住已经删除的
+fileId，在目录充填时屏蔽它们；墓碑落盘后即使重启挂载也不会复活。
+"""
+
+import logging
+import os
+import tempfile
+import threading
+from pathlib import Path
+from typing import Iterable, Optional, Set
+
+logger = logging.getLogger(__name__)
+
+
+class TombstoneStore:
+    """线程安全、可持久化的已删除 fileId 集合。"""
+
+    def __init__(self, path: Optional[Path] = None):
+        self._path = Path(path) if path else None
+        self._lock = threading.RLock()
+        self._ids: Set[str] = set()
+        if self._path is not None:
+            self._load()
+
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            if self._path and self._path.exists():
+                with open(self._path, "r", encoding="utf-8") as handle:
+                    self._ids = {line.strip() for line in handle if line.strip()}
+                logger.info("已加载 %s 条删除墓碑", len(self._ids))
+        except OSError as exc:
+            logger.warning("加载删除墓碑失败: %s", exc)
+
+    def _save_nolock(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".tombstones.", dir=str(self._path.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for file_id in sorted(self._ids):
+                    handle.write(file_id + "\n")
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            logger.warning("保存删除墓碑失败: %s", exc)
+
+    # ------------------------------------------------------------------
+    def add(self, file_id: str) -> None:
+        text = str(file_id or "").strip()
+        if not text:
+            return
+        with self._lock:
+            if text in self._ids:
+                return
+            self._ids.add(text)
+            self._save_nolock()
+
+    def add_many(self, file_ids: Iterable[str]) -> None:
+        with self._lock:
+            changed = False
+            for file_id in file_ids:
+                text = str(file_id or "").strip()
+                if text and text not in self._ids:
+                    self._ids.add(text)
+                    changed = True
+            if changed:
+                self._save_nolock()
+
+    def discard(self, file_id: str) -> None:
+        text = str(file_id or "").strip()
+        with self._lock:
+            if text in self._ids:
+                self._ids.discard(text)
+                self._save_nolock()
+
+    def __contains__(self, file_id: object) -> bool:
+        with self._lock:
+            return str(file_id) in self._ids
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._ids)
+
+    def snapshot(self) -> Set[str]:
+        with self._lock:
+            return set(self._ids)
+
+
+# 未指定路径时使用的进程内共享墓碑（主要供测试）
+def memory_store() -> TombstoneStore:
+    return TombstoneStore(None)

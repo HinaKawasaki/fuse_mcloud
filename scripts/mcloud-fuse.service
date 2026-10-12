@@ -1,0 +1,21 @@
+[Unit]
+Description=MCloud FUSE mount (中国移动云盘 POSIX 挂载)
+Documentation=file:///opt/mcloud_fuse/READEME.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 运行参数（MCLOUD_PROJECT_DIR / MCLOUD_MOUNTPOINT / MCLOUD_CACHE_DIR / MCLOUD_PYTHON）
+# 由 scripts/install_service.sh 写入，也可手工编辑后 systemctl restart
+EnvironmentFile=-/etc/default/mcloud-fuse
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${MCLOUD_PYTHON} ${MCLOUD_PROJECT_DIR}/src/main.py --mountpoint ${MCLOUD_MOUNTPOINT} --cache-dir ${MCLOUD_CACHE_DIR}
+ExecStop=/bin/fusermount3 -u ${MCLOUD_MOUNTPOINT}
+Restart=on-failure
+RestartSec=5
+# FUSE 挂载需要访问 /dev/fuse
+PrivateDevices=no
+
+[Install]
+WantedBy=multi-user.target

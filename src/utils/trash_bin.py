@@ -1,60 +1,101 @@
-import os
 import logging
-from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Optional
-from utils.sandbox_router import SandboxRouter, TRASH_BIN_NAME
+
+from config import SANDBOX_ROOT, TRASH_BIN_DIR_NAME
+from mapping.id_map import InodeMapper, InodeEntry
 
 logger = logging.getLogger(__name__)
 
+
 class TrashBinHandler:
     """
-    回收站处理器：拦截 unlink/rmdir，将删除操作转化为重定向 copy 到 .TrashBin/ 目录
+    回收站处理器：拦截 unlink/rmdir，把删除动作改写为「复制到沙箱根下的 .TrashBin」。
+
+    移动云盘接口没有提供删除能力，因此 POSIX 删除只能通过 copy 到回收站来近似实现，
+    本地目录树随即摘除该节点，对用户表现为“已删除”。
     """
-    def __init__(self, router: Optional[SandboxRouter] = None):
-        self.router = router or SandboxRouter()
 
-    def get_trash_dir(self) -> str:
-        """获取回收站绝对路径，如 '/AI空间/智能体云盘助手/.TrashBin'"""
-        return f"{self.router.sandbox_root}/{TRASH_BIN_NAME}"
-
-    def generate_trash_path(self, target_path: str) -> str:
-        """
-        为被删除的文件生成带时间戳的回收站目标路径
-        例如: /path/to/file.txt -> /AI空间/智能体云盘助手/.TrashBin/20261004_013500_file.txt
-        """
-        filename = os.path.basename(target_path)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        trash_name = f"{timestamp}_{filename}"
-        return f"{self.get_trash_dir()}/{trash_name}"
-
-    async def ensure_trash_dir_exists(self, client_wrapper) -> bool:
-        """
-        确保云盘沙箱内存在 .TrashBin 目录；若不存在则自动调用 client 创建
-        """
-        trash_dir = self.get_trash_dir()
-        try:
-            # 尝试创建 .TrashBin 目录
-            await client_wrapper.mkdir(trash_dir, confirm=True)
-            logger.info(f"回收站目录已就绪: {trash_dir}")
-            return True
-        except Exception as e:
-            # 如果文件夹已存在或创建成功均视为正常
-            logger.debug(f"检查/创建回收站目录提示: {e}")
-            return True
-
-    async def move_to_trash(self, client_wrapper, target_path: str) -> str:
-        """
-        执行删除拦截逻辑：调用 copy API 将文件/文件夹复制到回收站目录
-        """
-        await self.ensure_trash_dir_exists(client_wrapper)
-        
-        trash_target_path = self.generate_trash_path(target_path)
-        logger.info(f"[TrashBin] 拦截删除指令，将文件从 '{target_path}' 移动(copy)至回收站: '{trash_target_path}'")
-        
-        # 调用底层 API 的 copy 能力实现“移入回收站”
-        result = await client_wrapper.copy(
-            source_path=target_path,
-            target_path=trash_target_path,
-            confirm=True
+    def __init__(
+        self,
+        wrapper,
+        mapper: InodeMapper,
+        tree,
+        *,
+        sandbox_root: str = SANDBOX_ROOT,
+        trash_name: str = TRASH_BIN_DIR_NAME,
+        tombstones=None,
+    ):
+        self.wrapper = wrapper
+        self.mapper = mapper
+        self.tree = tree
+        self.sandbox_root = sandbox_root.rstrip("/")
+        self.trash_name = trash_name
+        self.tombstones = (
+            tombstones if tombstones is not None else getattr(tree, "tombstones", None)
         )
-        return trash_target_path
+        self._trash_file_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # 回收站目录
+    # ------------------------------------------------------------------
+
+    @property
+    def sandbox_root_file_id(self) -> str:
+        """挂载根（即沙箱根）对应的云盘 fileId。"""
+        root_entry = self.mapper.get_by_inode(InodeMapper.ROOT_INODE)
+        if root_entry is None:
+            raise RuntimeError("根节点缺失，无法定位沙箱根目录")
+        return root_entry.file_id
+
+    def ensure_trash_dir(self) -> str:
+        """确保沙箱根下存在 .TrashBin 目录，返回其 fileId（进程内缓存）。"""
+        if self._trash_file_id:
+            return self._trash_file_id
+
+        root_id = self.sandbox_root_file_id
+        for item in self.wrapper.list_directory(root_id):
+            if item.name == self.trash_name:
+                self._trash_file_id = item.file_id
+                return item.file_id
+
+        self._trash_file_id = self.wrapper.create_folder(self.trash_name, root_id)
+        logger.info("已创建回收站目录 %s (%s)", self.trash_name, self._trash_file_id)
+        return self._trash_file_id
+
+    # ------------------------------------------------------------------
+    # 移入回收站
+    # ------------------------------------------------------------------
+
+    def move_to_trash(self, entry: InodeEntry) -> Optional[str]:
+        """把节点复制到回收站并从本地目录树摘除。
+
+        :return: 回收站内副本的 fileId（复制失败返回 None）
+        """
+        if entry.inode == InodeMapper.ROOT_INODE:
+            raise ValueError("不允许删除根目录")
+
+        trash_file_id = self.ensure_trash_dir()
+        try:
+            results = self.wrapper.batch_copy([entry.file_id], trash_file_id)
+        except Exception as exc:  # noqa: BLE001 - 交由上层映射 errno
+            logger.error("移入回收站失败 fileId=%s: %s", entry.file_id, exc)
+            raise
+
+        new_file_id = None
+        for row in results or []:
+            if str(row.get("fileId") or "") == str(entry.file_id):
+                new_file_id = row.get("newFileId") or None
+                break
+        if new_file_id is None and results:
+            new_file_id = results[0].get("newFileId") or None
+
+        parent_inode = entry.parent_inode
+        # 云端原对象依然存在（接口无删除能力），登记墓碑以免下次列举时复活
+        if self.tombstones is not None:
+            self.tombstones.add(entry.file_id)
+        self.mapper.remove_by_inode(entry.inode)
+        self.tree.mark_directory_stale(parent_inode)
+        name = PurePosixPath(entry.path).name
+        logger.info("已移入回收站: %s -> %s", entry.path, new_file_id)
+        return new_file_id or name

@@ -19,9 +19,11 @@ from client.auth_manager import AuthManager
 from client.wrapper import DirectClientWrapper
 from mapping.id_map import InodeMapper
 from mapping.tree import DirectoryTree
+from mapping.tombstones import TombstoneStore
 from cache.meta_cache import MetaCache
 from cache.data_cache import DataCache
 from fuse.fuse_ops import MCloudFuseOps
+from config import META_CACHE_TTL, CACHE_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mcloud_main")
@@ -38,8 +40,8 @@ def parse_args():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/tmp/mcloud_data_cache",
-        help="本地缓存目录 (默认: /tmp/mcloud_data_cache)"
+        default=str(CACHE_DIR),
+        help=f"本地缓存目录 (默认: {CACHE_DIR})"
     )
     return parser.parse_args()
 
@@ -63,9 +65,23 @@ async def main():
 
     # 初始化核心挂载组件
     mapper = InodeMapper(root_file_id=workspace_id)
-    tree = DirectoryTree(mapper=mapper)
-    meta_cache = MetaCache(ttl=60.0)
-    data_cache = DataCache(client_wrapper=wrapper, cache_dir=cache_dir)
+    # 删除墓碑持久化：重启挂载后已删除的云端对象不会复活
+    tombstones = TombstoneStore(cache_dir / ".tombstones")
+    tree = DirectoryTree(mapper=mapper, tombstones=tombstones)
+    meta_cache = MetaCache(ttl=META_CACHE_TTL)
+    data_cache = DataCache(
+        client_wrapper=wrapper,
+        cache_dir=cache_dir,
+        write_back_dir=cache_dir / "writeback",
+    )
+
+    # 崩溃恢复：把上次异常退出时未上传完的写回文件补传回云盘
+    try:
+        recovered = data_cache.recover_pending_uploads()
+        if recovered:
+            logger.info("✅ 崩溃恢复：已补传 %s 个文件", recovered)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("崩溃恢复失败（不影响挂载）: %s", exc)
 
     fuse_ops = MCloudFuseOps(
         mapper=mapper,

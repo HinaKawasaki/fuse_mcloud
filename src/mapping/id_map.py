@@ -6,6 +6,10 @@ from pathlib import PurePosixPath
 
 logger = logging.getLogger(__name__)
 
+# 新建文件在真正上传前使用的占位 fileId 前缀。
+# 目录树对账时必须保留这类节点，否则写回过程中一次 ls 就会把未上传的新文件抹掉。
+PENDING_FILE_ID_PREFIX = "pending-"
+
 
 @dataclass
 class InodeEntry:
@@ -77,19 +81,23 @@ class InodeMapper:
         with self._lock:
             # 1. 判断该 file_id 是否已经分配过 inode
             existing_inode = self._file_id_to_inode.get(file_id)
-            if existing_inode is None:
-                # 检查路径冲突，如果路径已存在但 file_id 变了，先清理旧映射
-                if clean_path in self._path_to_inode:
-                    old_inode = self._path_to_inode[clean_path]
-                    self._remove_inode_nolock(old_inode)
 
+            # 1.1 路径冲突：同一路径当前被另一个 inode 占据（云端同名/被替换），
+            #     先清理旧映射，避免两个 inode 共享同一路径导致 readdir 重复。
+            path_owner = self._path_to_inode.get(clean_path)
+            if path_owner is not None and path_owner != existing_inode:
+                self._remove_inode_nolock(path_owner)
+
+            if existing_inode is None:
                 # 分配全新 inode
                 inode = self._next_inode
                 self._next_inode += 1
             else:
                 inode = existing_inode
 
-            # 2. 构建/更新 InodeEntry
+            old_entry = self._inode_to_entry.get(inode)
+
+            # 2. 构建/更新 InodeEntry（保留已登记的子节点集合）
             entry = InodeEntry(
                 inode=inode,
                 file_id=file_id,
@@ -99,6 +107,16 @@ class InodeMapper:
                 size=size,
                 updated_at=updated_at
             )
+            if old_entry is not None:
+                entry.child_inodes = old_entry.child_inodes
+                # 2.1 若父节点发生变化（重命名/移动），从旧父节点摘除
+                if old_entry.parent_inode != parent_inode:
+                    old_parent = self._inode_to_entry.get(old_entry.parent_inode)
+                    if old_parent is not None:
+                        old_parent.child_inodes.discard(inode)
+                # 2.2 若路径发生变化，清理旧的路径索引
+                if old_entry.path != clean_path:
+                    self._path_to_inode.pop(old_entry.path, None)
 
             # 3. 更新双向映射索引
             self._inode_to_entry[inode] = entry
@@ -128,6 +146,67 @@ class InodeMapper:
         with self._lock:
             inode = self._path_to_inode.get(clean_path)
             return self._inode_to_entry.get(inode) if inode else None
+
+    def get_children_inodes(self, parent_inode: int) -> List[int]:
+        """返回父目录下所有子节点的 inode，按 inode 升序。
+
+        升序 + inode 单调递增保证 readdir 分页的 ``next_id`` 在增删文件后
+        依然稳定：新分配的文件 inode 更大，总是追加在末尾，不会造成
+        已返回条目被跳过或重复返回（pyfuse3.Operations.readdir 的硬性要求）。
+        """
+        with self._lock:
+            parent = self._inode_to_entry.get(parent_inode)
+            if parent is None:
+                return []
+            return sorted(
+                child for child in parent.child_inodes if child in self._inode_to_entry
+            )
+
+    def contains(self, inode: int) -> bool:
+        """判断 inode 是否仍在映射表中"""
+        with self._lock:
+            return inode in self._inode_to_entry
+
+    def remap_file_id(self, old_file_id: str, new_file_id: str) -> Optional[InodeEntry]:
+        """上传产生新 fileId 时，在不改变 inode 的前提下替换云盘 ID。
+
+        新建文件先以占位 fileId 分配 inode，上传成功后调用本方法把占位
+        fileId 换成真实 fileId；已打开的文件句柄因此不会失效。
+        """
+        with self._lock:
+            inode = self._file_id_to_inode.pop(old_file_id, None)
+            if inode is None:
+                return None
+            self._file_id_to_inode[new_file_id] = inode
+            entry = self._inode_to_entry.get(inode)
+            if entry is not None:
+                entry.file_id = new_file_id
+            return entry
+
+    def update_entry(
+        self,
+        inode: int,
+        *,
+        size: Optional[int] = None,
+        updated_at: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> Optional[InodeEntry]:
+        """就地更新已存在节点的属性（大小/时间戳/路径）。"""
+        with self._lock:
+            entry = self._inode_to_entry.get(inode)
+            if entry is None:
+                return None
+            if size is not None:
+                entry.size = int(size)
+            if updated_at is not None:
+                entry.updated_at = updated_at
+            if path is not None:
+                clean_path = self._normalize_path(path)
+                if clean_path != entry.path:
+                    self._path_to_inode.pop(entry.path, None)
+                    self._path_to_inode[clean_path] = inode
+                    entry.path = clean_path
+            return entry
 
     def remove_by_inode(self, inode: int):
         """删除指定 inode 的映射"""
