@@ -28,6 +28,7 @@ from client.wrapper import DirectClientWrapper, MCloudAPIException  # noqa: E402
 from config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME  # noqa: E402
 from mapping.id_map import InodeMapper  # noqa: E402
 from mapping.tree import DirectoryTree  # noqa: E402
+from utils.trash_bin import TrashBinHandler  # noqa: E402
 
 ROOT = "ROOT"
 AI = "AI"
@@ -245,6 +246,58 @@ def test_non_permission_failure_is_not_hydrated(tmp_path):
 
     assert cloud.copies == []
     assert HYDRATE_DIR_NAME not in [e["name"] for e in cloud.entries.values()]
+
+
+def test_fresh_inside_file_is_not_hydrated(tmp_path, monkeypatch):
+    """刚上传到沙箱的文件：沙箱校验暂时失败 ≠ 在沙箱外，应等待重试而非搬运。
+
+    线上现象：`echo x > /mnt/mcloud/AI空间/智能体云盘助手/f` 成功，紧接着
+    `cat` 却报 Permission denied —— 因为新对象路径还没被 batchGetPath 收录，
+    被误判成「沙箱外」送去搬运，搬运自己再失败，最终 EACCES。
+    """
+    cloud = StubCloud()
+    fresh_id = cloud.add_file("FRESH", SANDBOX, "fresh.txt", b"fresh-bytes")
+    wrapper = StubWrapper(cloud)
+
+    state = {"miss": 0}
+    real_path = cloud.path
+
+    def laggy_path(file_id):
+        if str(file_id) == fresh_id and state["miss"] < 2:
+            state["miss"] += 1
+            return ""
+        return real_path(file_id)
+
+    monkeypatch.setattr(cloud, "path", laggy_path)
+    monkeypatch.setattr(wrapper_module.time, "sleep", lambda _seconds: None)
+
+    wrapper.download_file(fresh_id, tmp_path / "fresh.out")
+
+    assert (tmp_path / "fresh.out").read_bytes() == b"fresh-bytes"
+    assert cloud.copies == [], "沙箱内的新文件绝不能被搬运"
+    assert HYDRATE_DIR_NAME not in [e["name"] for e in cloud.entries.values()]
+    assert state["miss"] == 2, "应经历过路径未就绪并等待重试"
+
+
+def test_trash_dir_does_not_use_search():
+    """回收站目录改用 batchCheckExists 定位/创建，不得调用搜索接口。
+
+    StubWrapper.list_directory 会直接抛 AssertionError，因此这条测试同时也是
+    「rm 不再依赖搜索索引」的守卫。
+    """
+    cloud = StubCloud()
+    wrapper = StubWrapper(cloud)
+    mapper = InodeMapper(root_file_id=SANDBOX)
+    tree = types.SimpleNamespace(mark_directory_stale=lambda *_: None)
+
+    handler = TrashBinHandler(wrapper=wrapper, mapper=mapper, tree=tree)
+    trash_id = handler.ensure_trash_dir()
+
+    assert cloud.entries[trash_id]["name"] == TRASH_BIN_DIR_NAME
+    assert cloud.entries[trash_id]["parent"] == SANDBOX
+    # 再调一次应命中进程内缓存，不重复建
+    assert handler.ensure_trash_dir() == trash_id
+    assert [e["name"] for e in cloud.entries.values()].count(TRASH_BIN_DIR_NAME) == 1
 
 
 def test_new_object_path_lag_is_tolerated(tmp_path, monkeypatch):

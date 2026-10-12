@@ -1,5 +1,24 @@
 # Release Notes
 
+## v0.2.1
+
+### 修复
+
+- **写入后立刻读取报 `EACCES`**：`download_file()` 把任何沙箱校验失败都当成「文件在沙箱外」
+  并送去懒搬运；但**刚上传 / 刚创建的对象**同样会被校验拒绝（`batchGetPath` 还没收录它的
+  路径），于是沙箱内的新文件被误搬运，搬运自己再失败，最终表现为 `Permission denied`。
+  现在先用 `batchGetPath` 判别成因：`inside` → 等待路径就绪后重试取直链；`outside` → 才做
+  懒搬运；`unknown` → 明确报错。
+- **删除报 `EIO`**：回收站定位 `.TrashBin` 时用的是 `list_directory()`（= merge search），
+  搜索返回「缓存信息失效」时异常消息不含任何 errno 关键词，被 `_to_fuse_error` 兜底映射成
+  `EIO`。改为 `batchCheckExists` + `createFolder`，与懒搬运一致，**不再依赖搜索索引**。
+
+### 测试
+
+- 新增 `test_fresh_inside_file_is_not_hydrated`（沙箱内新文件绝不能被搬运）
+  与 `test_trash_dir_does_not_use_search`（回收站不得调用搜索接口）。
+- 真机验证：`echo > file` → `cat` 读回 → `rm` 全链路在真实云盘通过。
+
 ## v0.2.0
 
 ### 新功能

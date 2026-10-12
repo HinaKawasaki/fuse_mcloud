@@ -360,22 +360,30 @@ class DirectClientWrapper:
 
         沙箱外文件（挂载云盘根时常见）先云内复制进沙箱暂存目录再下载：
         官方接口只允许下载沙箱内文件，copy 的源则可以是全盘任意位置。
-        「是否在沙箱外」不额外查询路径——取直链时 SDK 会抛出
-        `PermissionDeniedError`，这本身就是最准确的信号，也省掉一次接口调用。
+
+        注意 `PermissionDeniedError` 有**两种成因**，不能一律当成「在沙箱外」：
+        - 目标确实不在沙箱内 → 需要懒搬运；
+        - 目标就在沙箱内，只是**刚创建 / 刚上传，路径索引还没收录** →
+          稍等重试即可，绝不能送去搬运（否则搬运自己会失败，用户看到 EACCES）。
         """
         self._ensure_auth()
         local_save_path = Path(local_save_path)
         local_save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        url, outside_sandbox = self._try_download_url(file_id)
-        if url is None and outside_sandbox:
-            staged = self.hydrate_file(file_id)
-            url, still_denied = self._try_download_url(staged)
-            if url is None and still_denied:
-                raise MCloudAPIException(
-                    f"懒搬运已完成，但暂存副本 {staged} 仍取不到下载地址"
-                    f"（沙箱路径可能还没就绪），原文件 {file_id}"
-                )
+        url, denied = self._try_download_url(file_id)
+        if url is None and denied:
+            verdict = self._classify_sandbox_denial(file_id)
+            if verdict == "inside":
+                logger.info("文件 %s 在沙箱内但路径索引未就绪，稍候重试取直链", file_id)
+                url, denied = self._try_download_url(file_id)
+            elif verdict == "outside":
+                staged = self.hydrate_file(file_id)
+                url, still_denied = self._try_download_url(staged)
+                if url is None and still_denied:
+                    raise MCloudAPIException(
+                        f"懒搬运已完成，但暂存副本 {staged} 仍取不到下载地址"
+                        f"（沙箱路径可能还没就绪），原文件 {file_id}"
+                    )
         if not url:
             raise MCloudAPIException(f"未能获取文件 {file_id} 的下载地址（可能不在沙箱内）")
 
@@ -388,17 +396,31 @@ class DirectClientWrapper:
         return local_save_path
 
     def _try_download_url(self, file_id: str) -> tuple:
-        """取下载直链，返回 ``(url_or_None, 是否因沙箱权限被拒)``。"""
+        """取下载直链，返回 ``(url_or_None, 是否被沙箱校验拒绝)``。"""
         try:
             result = self._api(client.api_batch_download_urls, [str(file_id)])
         except PermissionDeniedError:
-            # 官方 Skill 的沙箱校验：目标不在沙箱内 → 需要先搬运
-            logger.info("文件 %s 不在沙箱内，将在云内搬运副本后再下载", file_id)
+            logger.debug("文件 %s 被沙箱校验拒绝，待进一步判别成因", file_id)
             return None, True
         except CloudError as exc:
             logger.warning("获取文件 %s 的下载地址失败: %s", file_id, exc)
             return None, False
         return result.urls.get(str(file_id)), False
+
+    def _classify_sandbox_denial(self, file_id: str) -> str:
+        """判别沙箱校验失败的成因，返回 ``inside`` / ``outside`` / ``unknown``。
+
+        依据是 batchGetPath 查到的真实路径（新对象可能暂时查不到，故带等待）。
+        - inside ：文件就在沙箱里，失败多半是路径索引还没收录 → 等待后重试即可；
+        - outside：确实在沙箱外 → 需要懒搬运；
+        - unknown：路径查不出来 → 既不搬运也不重试，交给上层报错。
+        """
+        path = self._await_path_visible(
+            str(file_id), label="待下载文件", attempts=4, pause=1.0
+        )
+        if not path:
+            return "unknown"
+        return "inside" if sandbox.is_under_sandbox(path) else "outside"
 
     # ------------------------------------------------------------------
     # 上传

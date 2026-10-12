@@ -55,11 +55,22 @@ class TrashBinHandler:
         return root_entry.file_id
 
     def ensure_trash_dir(self) -> str:
-        """确保沙箱根下存在 .TrashBin 目录，返回其 fileId（进程内缓存）。"""
+        """确保沙箱根下存在 .TrashBin 目录，返回其 fileId（进程内缓存）。
+
+        优先走 wrapper.ensure_child_folder（batchCheckExists + createFolder），
+        **不碰搜索接口**：搜索是最终一致的，且会返回「缓存信息失效」这类服务端
+        错误，removal 不该被它拖垮。测试替身没有该方法时退回列举/创建。
+        """
         if self._trash_file_id:
             return self._trash_file_id
 
         root_id = self.sandbox_root_file_id
+        ensure_child_folder = getattr(self.wrapper, "ensure_child_folder", None)
+        if callable(ensure_child_folder):
+            self._trash_file_id = ensure_child_folder(root_id, self.trash_name)
+            logger.info("回收站目录 %s → %s", self.trash_name, self._trash_file_id)
+            return self._trash_file_id
+
         for item in self.wrapper.list_directory(root_id):
             if item.name == self.trash_name:
                 self._trash_file_id = item.file_id
