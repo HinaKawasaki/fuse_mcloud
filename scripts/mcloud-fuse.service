@@ -1,6 +1,6 @@
 [Unit]
 Description=MCloud FUSE mount (中国移动云盘 POSIX 挂载)
-Documentation=file:///opt/mcloud_fuse/READEME.md
+Documentation=file:///opt/mcloud_fuse/README.md
 After=network-online.target
 Wants=network-online.target
 

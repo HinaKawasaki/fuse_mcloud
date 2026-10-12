@@ -1,0 +1,26 @@
+[project]
+name = "mcloud-fuse"
+version = "0.1.0"
+description = "中国移动云盘 POSIX FUSE 挂载中间层"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyfuse3>=3.4",
+    "trio>=0.25",
+    "requests>=2.31.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-trio>=0.8"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
