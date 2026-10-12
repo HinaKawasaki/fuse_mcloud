@@ -81,7 +81,6 @@ def env():
     cache = DataCache(
         client_wrapper=cloud,
         cache_dir=tmp / "cache",
-        fallback_dir=tmp / "fb",
         write_back_dir=tmp / "wb",
         max_size_mb=64,
     )
@@ -139,7 +138,7 @@ def test_mkdir_creates_cloud_folder(env):
 
 def test_unlink_moves_to_trash(env):
     ops, cloud, mapper, _ = env
-    entry = mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
+    mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
         "f_a", "/a.txt", False, parent_inode=1, size=3
     )
     trio.run(ops.unlink, 1, b"a.txt", None)

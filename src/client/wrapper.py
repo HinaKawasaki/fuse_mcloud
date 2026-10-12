@@ -122,28 +122,6 @@ class DirectClientWrapper:
             "has_more": res.next_page_after is not None,
         }
 
-    def search_or_list_files(
-        self,
-        keyword: str = "",
-        include_file_ids: Optional[List[str]] = None,
-        recursive: bool = False,
-        page_after: Optional[Any] = None,
-        limit: int = 50,
-    ) -> Dict[str, Any]:
-        """单页搜索/列举。
-
-        - 传入 ``include_file_ids`` 时语义等价于官方 Skill 的 ``list <dirId>``；
-        - 不传时是**全盘搜索**，绝不能用来实现某个目录的 readdir。
-        """
-        self._ensure_auth()
-        return self._search_page(
-            keyword=keyword,
-            include_file_ids=include_file_ids,
-            recursive=recursive,
-            page_after=page_after,
-            limit=limit,
-        )
-
     def list_directory(
         self,
         dir_file_id: str,
@@ -212,14 +190,6 @@ class DirectClientWrapper:
         except CloudError as e:
             raise MCloudAPIException(f"确保沙箱目录失败: {e}") from e
 
-    def get_cloud_path(self, file_id: str) -> str:
-        """查询 fileId 对应的云盘绝对路径，查不到返回空串。"""
-        self._ensure_auth()
-        try:
-            return self._api(sandbox.resolve_cloud_path, file_id)
-        except CloudError:
-            return ""
-
     # ------------------------------------------------------------------
     # 批量复制（供回收站等使用）
     # ------------------------------------------------------------------
@@ -250,10 +220,6 @@ class DirectClientWrapper:
             return res.urls
         except CloudError as e:
             raise MCloudAPIException(f"获取下载地址失败: {e}") from e
-
-    # 兼容旧调用名
-    def batch_get_download_urls(self, file_ids: Sequence[str]) -> Dict[str, str]:
-        return self.get_download_urls(file_ids)
 
     def download_file(self, file_id: str, local_save_path: Path) -> Path:
         """把云盘文件下载到本地指定路径，返回本地路径。"""
@@ -480,10 +446,6 @@ class DirectClientWrapper:
             return self._upload_single(local_file_path, file_name, size, target_dir_id)
         except CloudError as e:
             raise MCloudAPIException(f"上传文件 {file_name} 失败: {e}") from e
-
-    # 兼容旧调用名
-    def download(self, file_id: str, local_save_path: Path) -> Path:
-        return self.download_file(file_id, local_save_path)
 
     # ------------------------------------------------------------------
     # 解析

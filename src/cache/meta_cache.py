@@ -91,9 +91,3 @@ class MetaCache:
             self.invalidate_readdir(inode)  # 如果是目录，清理其本身的 readdir
             if parent_inode is not None:
                 self.invalidate_readdir(parent_inode)
-
-    def clear(self):
-        """清空全量缓存"""
-        with self._lock:
-            self._attr_cache.clear()
-            self._dir_cache.clear()

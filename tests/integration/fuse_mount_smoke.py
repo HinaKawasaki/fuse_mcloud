@@ -142,7 +142,6 @@ def build_ops(cache_root: Path):
     data_cache = DataCache(
         client_wrapper=wrapper,
         cache_dir=cache_root / "cache",
-        fallback_dir=cache_root / "fallback",
         write_back_dir=cache_root / "writeback",
         max_size_mb=64,
     )

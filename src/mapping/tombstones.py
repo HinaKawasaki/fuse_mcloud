@@ -10,7 +10,7 @@ import os
 import tempfile
 import threading
 from pathlib import Path
-from typing import Iterable, Optional, Set
+from typing import Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -59,24 +59,6 @@ class TombstoneStore:
             self._ids.add(text)
             self._save_nolock()
 
-    def add_many(self, file_ids: Iterable[str]) -> None:
-        with self._lock:
-            changed = False
-            for file_id in file_ids:
-                text = str(file_id or "").strip()
-                if text and text not in self._ids:
-                    self._ids.add(text)
-                    changed = True
-            if changed:
-                self._save_nolock()
-
-    def discard(self, file_id: str) -> None:
-        text = str(file_id or "").strip()
-        with self._lock:
-            if text in self._ids:
-                self._ids.discard(text)
-                self._save_nolock()
-
     def __contains__(self, file_id: object) -> bool:
         with self._lock:
             return str(file_id) in self._ids
@@ -88,8 +70,3 @@ class TombstoneStore:
     def snapshot(self) -> Set[str]:
         with self._lock:
             return set(self._ids)
-
-
-# 未指定路径时使用的进程内共享墓碑（主要供测试）
-def memory_store() -> TombstoneStore:
-    return TombstoneStore(None)

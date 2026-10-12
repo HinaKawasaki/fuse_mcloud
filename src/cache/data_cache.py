@@ -9,7 +9,6 @@ from typing import Dict, Optional
 
 from config import (
     CACHE_DIR,
-    DISK_FALLBACK_DIR,
     WRITE_BACK_DIR,
     get_effective_cache_limit_mb,
 )
@@ -34,13 +33,11 @@ class DataCache:
         self,
         client_wrapper: DirectClientWrapper,
         cache_dir: Path = CACHE_DIR,
-        fallback_dir: Path = DISK_FALLBACK_DIR,
         write_back_dir: Path = WRITE_BACK_DIR,
         max_size_mb: Optional[int] = None,
     ):
         self.wrapper = client_wrapper
         self.cache_dir = Path(cache_dir)
-        self.fallback_dir = Path(fallback_dir)
         self.write_back_dir = Path(write_back_dir)
         limit_mb = max_size_mb if max_size_mb is not None else get_effective_cache_limit_mb()
         self.max_bytes = max(1, int(limit_mb)) * 1024 * 1024
@@ -59,7 +56,6 @@ class DataCache:
         self._journal: Dict[str, dict] = {}
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.fallback_dir.mkdir(parents=True, exist_ok=True)
         self.write_back_dir.mkdir(parents=True, exist_ok=True)
         self._load_journal()
 
@@ -233,11 +229,6 @@ class DataCache:
     # 写回暂存 (write-back)
     # ------------------------------------------------------------------
 
-    def get_write_path(self, key: str) -> Optional[Path]:
-        """返回写回暂存文件的本地路径（若存在）。"""
-        with self._lock:
-            return self._write_paths.get(key)
-
     def create_write_buffer(
         self,
         key: str,
@@ -273,17 +264,6 @@ class DataCache:
                 path.unlink()
             except OSError:
                 pass
-
-    def stage_file_for_upload(self, local_source_path: Path, target_dir_id: str) -> str:
-        """
-        [关键 I/O API] 将本地修改后的文件上传写回云盘，返回新 fileId。
-        """
-        logger.info("正在上传本地文件到云盘目录: %s -> dir_id=%s", local_source_path, target_dir_id)
-        cloud_item = self.wrapper.upload_file(
-            local_file_path=Path(local_source_path),
-            target_dir_id=target_dir_id,
-        )
-        return cloud_item.file_id
 
     def commit_write_buffer(
         self,

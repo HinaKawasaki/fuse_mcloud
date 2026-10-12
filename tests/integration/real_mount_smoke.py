@@ -196,7 +196,6 @@ def main() -> int:
     cache = DataCache(
         client_wrapper=wrapper,
         cache_dir=workdir / "cache",
-        fallback_dir=workdir / "fb",
         write_back_dir=workdir / "wb",
         max_size_mb=256,
     )

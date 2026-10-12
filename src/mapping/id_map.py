@@ -162,11 +162,6 @@ class InodeMapper:
                 child for child in parent.child_inodes if child in self._inode_to_entry
             )
 
-    def contains(self, inode: int) -> bool:
-        """判断 inode 是否仍在映射表中"""
-        with self._lock:
-            return inode in self._inode_to_entry
-
     def remap_file_id(self, old_file_id: str, new_file_id: str) -> Optional[InodeEntry]:
         """上传产生新 fileId 时，在不改变 inode 的前提下替换云盘 ID。
 

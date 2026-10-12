@@ -16,7 +16,6 @@ def make_cache(tmp_path, cloud):
     return DataCache(
         client_wrapper=cloud,
         cache_dir=tmp_path / "cache",
-        fallback_dir=tmp_path / "fb",
         write_back_dir=tmp_path / "wb",
         max_size_mb=64,
     )

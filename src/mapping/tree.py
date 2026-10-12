@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Iterable
 
 from mapping.id_map import InodeMapper, InodeEntry, PENDING_FILE_ID_PREFIX
 from mapping.tombstones import TombstoneStore
-from config import SANDBOX_ROOT, TRASH_BIN_DIR_NAME
+from config import TRASH_BIN_DIR_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -17,22 +17,20 @@ RECENT_GRACE_SEC = 300.0
 
 class DirectoryTree:
     """
-    内存伪装树管理器：
-    1. 管理云盘沙箱根目录与挂载点 '/' 的透明映射
-    2. 协调 CloudItem 数据的解析与 InodeMapper 的注册
-    3. 保证“同一目录内名字唯一”这一 POSIX 硬约束，避免 readdir 吐出重复项
-    4. 为新建对象提供“索引宽限期”，适配云盘搜索的最终一致性
+    内存目录树管理器：
+    1. 协调 CloudItem 数据的解析与 InodeMapper 的注册
+    2. 保证“同一目录内名字唯一”这一 POSIX 硬约束，避免 readdir 吐出重复项
+    3. 为新建对象提供“索引宽限期”，适配云盘搜索的最终一致性
+    4. 用墓碑屏蔽已删除的云端对象
     """
 
     def __init__(
         self,
         mapper: InodeMapper,
-        sandbox_root: str = SANDBOX_ROOT,
         tombstones: Optional[TombstoneStore] = None,
         recent_grace_sec: float = RECENT_GRACE_SEC,
     ):
         self.mapper = mapper
-        self.sandbox_root = sandbox_root.rstrip("/")
         self.tombstones = tombstones if tombstones is not None else TombstoneStore(None)
         # 记录已加载/已同步过的目录 inode 集合，避免重复拉取
         self._loaded_dir_inodes: set = set()
@@ -65,32 +63,8 @@ class DirectoryTree:
             return True
 
     # ------------------------------------------------------------------
-    # 路径伪装
+    # 路径拼接
     # ------------------------------------------------------------------
-
-    def to_sandbox_path(self, local_path: str) -> str:
-        """
-        将挂载点本地相对/绝对路径映射为云盘沙箱中的真实绝对路径
-        例: '/' -> '/AI空间/智能体云盘助手'
-        例: '/docs/readme.txt' -> '/AI空间/智能体云盘助手/docs/readme.txt'
-        """
-        clean_path = InodeMapper._normalize_path(local_path)
-        if clean_path == "/":
-            return self.sandbox_root
-        return f"{self.sandbox_root}{clean_path}"
-
-    def to_local_path(self, sandbox_path: str) -> str:
-        """
-        将云盘沙箱路径还原为本地挂载点路径
-        例: '/AI空间/智能体云盘助手' -> '/'
-        例: '/AI空间/智能体云盘助手/docs' -> '/docs'
-        """
-        if sandbox_path == self.sandbox_root:
-            return "/"
-        if sandbox_path.startswith(self.sandbox_root + "/"):
-            local_p = sandbox_path[len(self.sandbox_root):]
-            return local_p if local_p else "/"
-        return sandbox_path
 
     @staticmethod
     def child_path(parent_path: str, name: str) -> str:

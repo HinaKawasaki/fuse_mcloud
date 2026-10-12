@@ -1,5 +1,4 @@
 import sys
-import os
 import time
 import shutil
 from pathlib import Path
@@ -21,13 +20,12 @@ class MockClientWrapper:
 
     def download_file(self, file_id: str, local_save_path: Path) -> Path:
         self.download_calls += 1
-        # 模拟从云端下载数据写到本地 Path
         local_save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(local_save_path, "wb") as f:
             f.write(f"Cloud Content for {file_id}".encode("utf-8"))
         return local_save_path
 
-    def upload_file(self, local_file_path: Path, target_dir_id: str):
+    def upload_file(self, local_file_path: Path, target_dir_id: str, name=None):
         self.upload_calls += 1
 
         class DummyCloudItem:
@@ -37,17 +35,13 @@ class MockClientWrapper:
 
 
 def test_data_cache():
-    print("🚀 开始测试 DataCache 读缓存、上传同步与 LRU 淘汰机制...")
+    print("🚀 开始测试 DataCache 读缓存、写回上传与 LRU 淘汰机制...")
 
-    # 使用独立的测试专用临时缓存目录
-    test_cache_dir = Path("/tmp/cmcloud-fuse-test/cache")
-    test_fallback_dir = Path("/tmp/cmcloud-fuse-test/fallback")
+    test_root = Path("/tmp/cmcloud-fuse-test")
+    test_cache_dir = test_root / "cache"
 
-    # 清理上一次测试留下来的残留数据
-    if test_cache_dir.exists():
-        shutil.rmtree(test_cache_dir)
-    if test_fallback_dir.exists():
-        shutil.rmtree(test_fallback_dir)
+    if test_root.exists():
+        shutil.rmtree(test_root)
 
     mock_wrapper = MockClientWrapper()
 
@@ -55,8 +49,8 @@ def test_data_cache():
     cache = DataCache(
         client_wrapper=mock_wrapper,
         cache_dir=test_cache_dir,
-        fallback_dir=test_fallback_dir,
-        max_size_mb=1  # 限额 1MB
+        write_back_dir=test_root / "wb",
+        max_size_mb=1,  # 限额 1MB
     )
 
     # ------------------ 1. 测试未命中与 API 下载 ------------------
@@ -70,46 +64,42 @@ def test_data_cache():
     # ------------------ 2. 测试缓存命中 (Zero IO) ------------------
     file1_path_again = cache.prepare_file_for_read(file_id="fid_001", file_name="test1.txt")
     assert file1_path_again == file1_path
-    assert mock_wrapper.download_calls == 1  # 下载调用次数不应该增加
+    assert mock_wrapper.download_calls == 1
     print("✅ 二次读取精准命中本地缓存测试成功！")
 
-    # ------------------ 3. 测试上传暂存与同步 ------------------
-    dummy_upload_src = test_cache_dir / "to_upload.txt"
-    with open(dummy_upload_src, "w", encoding="utf-8") as f:
-        f.write("Local new file content")
-
-    uploaded_id = cache.stage_file_for_upload(dummy_upload_src, target_dir_id="dir_root")
-    assert uploaded_id.startswith("uploaded_id_")
+    # ------------------ 3. 测试写回暂存与上传同步 ------------------
+    buffer_path = cache.create_write_buffer(
+        "wb_test", target_dir_id="dir_root", file_name="to_upload.txt"
+    )
+    buffer_path.write_bytes(b"Local new file content")
+    item = cache.commit_write_buffer(
+        "wb_test", target_dir_id="dir_root", file_name="to_upload.txt"
+    )
+    assert item.file_id.startswith("uploaded_id_")
     assert mock_wrapper.upload_calls == 1
-    print("✅ 文件上传回写同步测试成功！")
+    # 上传成功后内容应立即可作为读缓存命中
+    assert cache.get_cache_path(item.file_id) is not None
+    print("✅ 写回暂存 → 上传 → 读缓存登记测试成功！")
 
     # ------------------ 4. 测试 LRU 容量溢出与淘汰 ------------------
-    # 手动写入较大文件来触发 LRU
     large_file_id = "fid_large"
     large_cache_file = test_cache_dir / f"{large_file_id}_large.bin"
-    
-    # 稍微拉开访问时间戳
+
     time.sleep(0.05)
     _ = cache.prepare_file_for_read(file_id="fid_002", file_name="test2.txt")
-    
-    # 手动生成一个超过 1MB (1.5MB) 的文件装填进缓存
+
     with open(large_cache_file, "wb") as f:
         f.write(b"X" * (1024 * 1024 + 512 * 1024))
 
     cache._cache_map[large_file_id] = large_cache_file
     cache._access_time[large_file_id] = time.time()
 
-    # 触发 LRU 检查
     cache._evict_if_needed()
 
-    # 验证最老的文件 (fid_001) 是否被 LRU 剔除
     assert cache.get_cache_path("fid_001") is None
     print("✅ LRU 容量限额与旧缓存淘汰机制测试成功！")
 
-    # 清理测试现场
-    if test_cache_dir.parent.exists():
-        shutil.rmtree(test_cache_dir.parent)
-
+    shutil.rmtree(test_root, ignore_errors=True)
     print("🎉 DataCache 全部测试通过！")
 
 

@@ -2,7 +2,7 @@ import logging
 from pathlib import PurePosixPath
 from typing import Optional
 
-from config import SANDBOX_ROOT, TRASH_BIN_DIR_NAME
+from config import TRASH_BIN_DIR_NAME
 from mapping.id_map import InodeMapper, InodeEntry
 
 logger = logging.getLogger(__name__)
@@ -22,14 +22,12 @@ class TrashBinHandler:
         mapper: InodeMapper,
         tree,
         *,
-        sandbox_root: str = SANDBOX_ROOT,
         trash_name: str = TRASH_BIN_DIR_NAME,
         tombstones=None,
     ):
         self.wrapper = wrapper
         self.mapper = mapper
         self.tree = tree
-        self.sandbox_root = sandbox_root.rstrip("/")
         self.trash_name = trash_name
         self.tombstones = (
             tombstones if tombstones is not None else getattr(tree, "tombstones", None)

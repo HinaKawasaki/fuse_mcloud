@@ -10,17 +10,15 @@ from mapping.tree import DirectoryTree
 
 
 def test_directory_tree():
-    print("🚀 开始测试 DirectoryTree 伪装树与动态解析...")
+    print("🚀 开始测试 DirectoryTree 目录充填与动态解析...")
 
     mapper = InodeMapper(root_file_id="root_id_000")
-    tree = DirectoryTree(mapper=mapper, sandbox_root="/AI空间/智能体云盘助手")
+    tree = DirectoryTree(mapper=mapper)
 
-    # 1. 验证沙箱路径双向伪装转换
-    assert tree.to_sandbox_path("/") == "/AI空间/智能体云盘助手"
-    assert tree.to_sandbox_path("/code/py.py") == "/AI空间/智能体云盘助手/code/py.py"
-    assert tree.to_local_path("/AI空间/智能体云盘助手") == "/"
-    assert tree.to_local_path("/AI空间/智能体云盘助手/code/py.py") == "/code/py.py"
-    print("✅ 沙箱路径 ↔ 本地路径伪装双向转换测试成功！")
+    # 1. 验证父子路径拼接
+    assert tree.child_path("/", "code") == "/code"
+    assert tree.child_path("/code", "py.py") == "/code/py.py"
+    print("✅ 子路径拼接测试成功！")
 
     # 2. 模拟从云盘 API list_directory 返回的数据
     mock_cloud_items = [

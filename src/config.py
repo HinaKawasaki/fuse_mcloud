@@ -11,11 +11,6 @@ from pathlib import Path
 # 内存/临时缓存目录 (默认放在 /tmp 内存文件系统中)
 CACHE_DIR = Path(os.getenv("MCLOUD_CACHE_DIR", "/tmp/cmcloud-fuse/cache"))
 
-# 磁盘落盘/溢出缓存路径 (当内存缓存不足或大文件溢出时使用)
-DISK_FALLBACK_DIR = Path(
-    os.getenv("MCLOUD_FALLBACK_DIR", Path.home() / ".cache" / "cmcloud-fuse" / "fallback")
-)
-
 # 写回缓存的本地暂存目录：write() 先落这里，release()/fsync() 再整文件上传
 WRITE_BACK_DIR = Path(os.getenv("MCLOUD_WRITE_BACK_DIR", "/tmp/cmcloud-fuse/writeback"))
 

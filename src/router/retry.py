@@ -13,7 +13,6 @@ if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
 from cm_cloud_errors import (  # noqa: E402
     ApiError,
     AuthError,
-    CloudError,
     ConfigError,
     NeedAuthError,
     PermissionDeniedError,
