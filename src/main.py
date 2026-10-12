@@ -1,5 +1,8 @@
 import argparse
 import logging
+import os
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,7 +22,14 @@ from cache.data_cache import DataCache
 from cache.meta_cache import MetaCache
 from client.auth_manager import AuthManager
 from client.wrapper import DirectClientWrapper
-from config import CACHE_DIR, META_CACHE_TTL
+from config import (  # noqa: E402
+    CACHE_DIR,
+    CLOUD_ROOT_FILE_ID,
+    META_CACHE_TTL,
+    ROOT_MODE,
+    ROOT_MODE_CLOUD,
+    ROOT_MODE_SANDBOX,
+)
 from fuse.fuse_ops import MCloudFuseOps
 from mapping.id_map import InodeMapper
 from mapping.tombstones import TombstoneStore
@@ -43,7 +53,72 @@ def parse_args():
         default=str(CACHE_DIR),
         help=f"本地缓存目录 (默认: {CACHE_DIR})"
     )
+    parser.add_argument(
+        "--root",
+        type=str,
+        choices=(ROOT_MODE_SANDBOX, ROOT_MODE_CLOUD),
+        default=ROOT_MODE if ROOT_MODE in (ROOT_MODE_SANDBOX, ROOT_MODE_CLOUD)
+        else ROOT_MODE_SANDBOX,
+        help=(
+            "挂载根：sandbox=只暴露沙箱 /AI空间/智能体云盘助手（默认）；"
+            "cloud=暴露整个云盘根，沙箱外文件读取时按需搬进沙箱暂存目录，"
+            "写操作仍只允许落在沙箱内（默认值可用环境变量 MCLOUD_ROOT 指定）"
+        ),
+    )
     return parser.parse_args()
+
+
+def prepare_mountpoint(mountpoint: Path) -> None:
+    """确保挂载点存在且可用。
+
+    挂载进程被强杀（例如 systemd 的 SIGTERM 直接终止进程）后会留下一个
+    ``ENOTCONN`` 的失效 FUSE 挂载点：此时 ``mkdir(exist_ok=True)`` 会先收到
+    ``FileExistsError``，再去 ``is_dir()`` 又撞上 ``ENOTCONN``，最终把
+    ``FileExistsError`` 抛出来——服务于是陷入崩溃重启循环。这里先卸掉残留挂载。
+    """
+    try:
+        mountpoint.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        logger.warning("挂载点 %s 存在但不可用，按残留的失效 FUSE 挂载处理", mountpoint)
+        for flag in ("-u", "-uz"):
+            result = subprocess.run(
+                ["fusermount3", flag, str(mountpoint)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                logger.info("已用 fusermount3 %s 清理残留挂载", flag)
+                break
+        try:
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit(
+                f"挂载点 {mountpoint} 仍不可用：{exc}\n"
+                f"请确认没有进程停留在该目录（先 cd 出去），再执行 "
+                f"`fusermount3 -uz {mountpoint}`"
+            ) from exc
+    except OSError as exc:
+        raise SystemExit(f"无法创建挂载点 {mountpoint}: {exc}") from exc
+
+    if os.path.ismount(mountpoint):
+        raise SystemExit(
+            f"挂载点 {mountpoint} 上已有挂载，请先卸载："
+            f"`fusermount3 -u {mountpoint}`（被占用时用 `-uz`）"
+        )
+
+
+async def _watch_termination_signals() -> None:
+    """收到 SIGTERM / SIGINT 时优雅终止 FUSE 主循环。
+
+    pyfuse3 自己不安装信号处理器，默认动作会直接杀死进程并把挂载点变成
+    失效挂载；因此这里接管信号，让 ``main()`` 正常返回、由 ``close()`` 卸载。
+    """
+    with trio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
+        async for received in signals:
+            logger.info("收到信号 %s，正在优雅卸载 ...", received)
+            pyfuse3.terminate()
+            return
 
 
 async def main():
@@ -51,20 +126,28 @@ async def main():
     mountpoint = Path(args.mountpoint).resolve()
     cache_dir = Path(args.cache_dir).resolve()
 
-    # 确保挂载点与缓存目录存在
-    mountpoint.mkdir(parents=True, exist_ok=True)
+    # 确保挂载点可用（会自动清理残留的失效挂载）与缓存目录存在
+    prepare_mountpoint(mountpoint)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("🚀 正在初始化移动云盘组件...")
     auth_mgr = AuthManager()
     wrapper = DirectClientWrapper(auth_mgr)
 
-    # 获取沙箱根 ID
-    workspace_id = wrapper.ensure_workspace()
-    logger.info(f"✅ 沙箱 Workspace Root ID: {workspace_id}")
+    # 获取沙箱根 ID（挂载云盘根时也要用它来定位 .TrashBin 与暂存目录）
+    workspace_id = wrapper.sandbox_root_file_id()
+    logger.info("✅ 沙箱 Workspace Root ID: %s", workspace_id)
+
+    root_file_id = CLOUD_ROOT_FILE_ID if args.root == ROOT_MODE_CLOUD else workspace_id
+    if args.root == ROOT_MODE_CLOUD:
+        logger.info(
+            "🌐 挂载根 = 云盘根目录（沙箱外文件按需搬运；写操作仍只允许落在沙箱内）"
+        )
+    else:
+        logger.info("📦 挂载根 = 沙箱目录")
 
     # 初始化核心挂载组件
-    mapper = InodeMapper(root_file_id=workspace_id)
+    mapper = InodeMapper(root_file_id=root_file_id)
     # 删除墓碑持久化：重启挂载后已删除的云端对象不会复活
     tombstones = TombstoneStore(cache_dir / ".tombstones")
     tree = DirectoryTree(mapper=mapper, tombstones=tombstones)
@@ -101,8 +184,11 @@ async def main():
     try:
         logger.info("🎉 挂载成功！你现在可以在终端中打开新窗口执行 'ls -la %s' 进行查看。", mountpoint)
         logger.info("按下 Ctrl+C 可停止运行并优雅卸载。")
-        # pyfuse3.main 是 trio 框架下的事件循环回调
-        await pyfuse3.main()
+        # pyfuse3.main 是 trio 框架下的事件循环回调；同时监听退出信号以便干净卸载
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(_watch_termination_signals)
+            await pyfuse3.main()
+            nursery.cancel_scope.cancel()
     finally:
         logger.info("🧹 正在卸载文件系统...")
         pyfuse3.close()

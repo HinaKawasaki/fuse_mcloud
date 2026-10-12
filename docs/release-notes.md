@@ -1,5 +1,35 @@
 # Release Notes
 
+## v0.2.0
+
+### 新功能
+
+- **云盘根挂载**：新增 `--root sandbox|cloud`（或环境变量 `MCLOUD_ROOT`），挂载根可选
+  沙箱目录或整个云盘 `/`；默认仍为 `sandbox`，行为与 v0.1.0 一致。
+- **沙箱外文件懒搬运**：挂载云盘根时，读取沙箱外文件会自动先云内复制进沙箱暂存目录
+  `.MCloudHydrate/<fileId>/` 再下载；重启后按「槽位 + 文件名」复用已有副本，不重复复制。
+  `.TrashBin` 与 `.MCloudHydrate` 在所有层级隐藏。
+  搬运的触发依据是 SDK 抛出的 `PermissionDeniedError`（不额外查询路径），且全程只用
+  `batchCheckExists` / `batchCopy` / `batchGet`，**不依赖最终一致的搜索接口**。
+  注意：首次读取需等一次云端复制任务完成，且副本会占用云盘容量（接口没有真删除）。
+
+### 修复与加固
+
+- **优雅退出**：接管 `SIGTERM` / `SIGINT`，systemd `stop` 时先 `terminate()` 再 `close()`
+  卸载，不再因进程被直接杀死而留下失效 FUSE 挂载。
+- **挂载点自愈**：启动时若发现 `ENOTCONN` 的残留挂载，自动 `fusermount3 -u` / `-uz`
+  清理后重试，不再以 `FileExistsError` 陷入重启循环。
+- **新建对象路径延迟容忍**：`ensure_files_in_sandbox()` 会用 `batchGetPath` 反查目标
+  路径，刚创建 / 刚复制的对象可能还没被收录（报「无法确认 xxx 的云盘路径」，表现为
+  `EACCES`）。搬运时对暂存目录、槽位与副本各做一次有界等待（最多 10×1s）。
+- 回收站 / 暂存目录改为始终使用**真实沙箱根**，与挂载根解耦。
+- systemd 单元新增 `StartLimitIntervalSec` / `StartLimitBurst` 与 `TimeoutStopSec`。
+
+### 测试
+
+- 新增 `tests/test_hydrate.py`、`tests/test_main.py`：懒搬运（含「不得调用搜索接口」硬约束）、
+  重启复用、挂载点自愈与优雅退出。
+
 ## v0.1.0
 
 首个可公开使用版本：把中国移动云盘（个人云 / AI 沙箱）挂载为 Linux 本地目录。

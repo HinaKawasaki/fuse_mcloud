@@ -40,7 +40,15 @@ class TrashBinHandler:
 
     @property
     def sandbox_root_file_id(self) -> str:
-        """挂载根（即沙箱根）对应的云盘 fileId。"""
+        """沙箱根对应的云盘 fileId。
+
+        挂载云盘根（--root cloud）时，挂载根是云盘 root，而回收站仍必须建在
+        沙箱内（官方 Skill 只允许向沙箱写），因此优先向 wrapper 要沙箱根。
+        """
+        getter = getattr(self.wrapper, "sandbox_root_file_id", None)
+        if callable(getter):
+            return getter()
+
         root_entry = self.mapper.get_by_inode(InodeMapper.ROOT_INODE)
         if root_entry is None:
             raise RuntimeError("根节点缺失，无法定位沙箱根目录")

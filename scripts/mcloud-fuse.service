@@ -3,6 +3,9 @@ Description=MCloud FUSE mount (中国移动云盘 POSIX 挂载)
 Documentation=file:///opt/mcloud_fuse/README.md
 After=network-online.target
 Wants=network-online.target
+# 避免在挂载点不可用（如残留失效挂载）时无限重启
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

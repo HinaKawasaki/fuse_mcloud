@@ -3,11 +3,16 @@ import threading
 import time
 from typing import Dict, Iterable, List, Optional
 
-from config import TRASH_BIN_DIR_NAME
+from config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME
 from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
 from mapping.tombstones import TombstoneStore
 
 logger = logging.getLogger(__name__)
+
+# 内部系统目录：不出现在任何一层目录列表里
+# - .TrashBin    删除时复制进去的回收站
+# - .MCloudHydrate 挂载云盘根时，沙箱外文件的懒搬运暂存目录
+HIDDEN_DIR_NAMES = frozenset({TRASH_BIN_DIR_NAME, HYDRATE_DIR_NAME})
 
 # 云盘 search 索引是最终一致的：新建的对象往往几秒内查不到。
 # 这段时间内即使云端列举没返回它，也必须保留在本地树里，否则刚建好的
@@ -103,8 +108,8 @@ class DirectoryTree:
             name = str(item.get("name", "") or "").strip()
             if not name or name in (".", ".."):
                 continue
-            if name == TRASH_BIN_DIR_NAME and parent_inode == InodeMapper.ROOT_INODE:
-                logger.debug("跳过回收站系统目录的直接暴露: %s", name)
+            if name in HIDDEN_DIR_NAMES:
+                logger.debug("跳过内部系统目录: %s", name)
                 continue
             candidate_id = str(
                 item.get("id") or item.get("file_id") or item.get("fileId") or ""

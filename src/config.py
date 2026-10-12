@@ -26,6 +26,20 @@ META_CACHE_TTL = 60        # getattr / readdir 元数据缓存有效时间 (秒)
 SANDBOX_ROOT = "/AI空间/智能体云盘助手"
 TRASH_BIN_DIR_NAME = ".TrashBin"
 
+# 沙箱外文件的懒搬运暂存目录（位于沙箱根下）。
+# 官方接口只允许下载沙箱内文件，因此读取沙箱外文件时先云内复制到这里的
+# 每文件子目录，再走普通下载；该目录与其子项在目录列举中隐藏。
+HYDRATE_DIR_NAME = os.getenv("MCLOUD_HYDRATE_DIR", ".MCloudHydrate")
+
+# 挂载根：
+# - sandbox（默认）：只暴露沙箱 /AI空间/智能体云盘助手，行为与以前一致；
+# - cloud：暴露整个云盘根目录，沙箱外文件读取时按需搬进沙箱暂存目录；
+#   写操作仍只允许落在沙箱内，越界由官方 Skill 拒绝（表现为 EACCES）。
+ROOT_MODE = os.getenv("MCLOUD_ROOT", "sandbox").strip().lower()
+ROOT_MODE_SANDBOX = "sandbox"
+ROOT_MODE_CLOUD = "cloud"
+CLOUD_ROOT_FILE_ID = "root"
+
 # ==================== 4. 并发与限流 ====================
 API_MAX_CONCURRENT = int(os.getenv("MCLOUD_API_MAX_CONCURRENT", "3"))
 API_REQUESTS_PER_SECOND = float(os.getenv("MCLOUD_API_RPS", "5"))

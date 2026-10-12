@@ -3,6 +3,7 @@ import math
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -26,6 +27,7 @@ from cm_cloud_format import sha256_file  # noqa: E402
 
 from client.auth_manager import AuthManager  # noqa: E402
 from config import (  # noqa: E402
+    HYDRATE_DIR_NAME,
     MAX_PARTS,
     MIN_PART_SIZE_BYTES,
     MULTIPART_THRESHOLD_BYTES,
@@ -71,6 +73,11 @@ class DirectClientWrapper:
 
     def __init__(self, auth_manager: AuthManager):
         self.auth = auth_manager
+        # 沙箱根 fileId（懒查询并缓存），挂在云盘根时用于定位 .TrashBin / 暂存目录
+        self._sandbox_root_id: Optional[str] = None
+        self._hydrate_dir_id: Optional[str] = None
+        # 源 fileId -> 暂存副本 fileId（进程内缓存，避免重复搬运）
+        self._staged_by_source: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 统一调用封装：限流 + 退避重试
@@ -191,6 +198,133 @@ class DirectClientWrapper:
             raise MCloudAPIException(f"确保沙箱目录失败: {e}") from e
 
     # ------------------------------------------------------------------
+    # 沙箱外文件懒搬运（挂载云盘根时读取沙箱外文件）
+    #
+    # 注意：这一整段**刻意不使用 list_directory()（=搜索接口）**。
+    # 搜索接口是最终一致的，且会返回「缓存信息失效」这类服务端错误；懒搬运只
+    # 依赖 batchCheckExists（同名检查）、batchCopy（云内复制）与 batchGet（取名）。
+    # ------------------------------------------------------------------
+
+    def sandbox_root_file_id(self) -> str:
+        """沙箱根 fileId；与挂载根解耦（挂载根可能是云盘 root）。"""
+        if self._sandbox_root_id is None:
+            self._sandbox_root_id = self.ensure_workspace()
+        return self._sandbox_root_id
+
+    def ensure_child_folder(self, parent_file_id: str, name: str) -> str:
+        """返回父目录下名为 name 的子目录 fileId，不存在则创建（不依赖搜索接口）。"""
+        existing = self._api(client.api_check_exists, parent_file_id, name)
+        if existing.get("exist") and existing.get("fileId"):
+            return str(existing["fileId"])
+
+        try:
+            return self._api(client.api_create_folder, parent_file_id, name)
+        except (ApiError, ValidationError):
+            # 并发/索引场景下可能已经建好了，再查一次
+            recheck = self._api(client.api_check_exists, parent_file_id, name)
+            if recheck.get("exist") and recheck.get("fileId"):
+                return str(recheck["fileId"])
+            raise
+
+    def ensure_hydrate_dir(self) -> str:
+        """确保沙箱根下存在懒搬运暂存目录，返回其 fileId（进程内缓存）。"""
+        if self._hydrate_dir_id:
+            return self._hydrate_dir_id
+
+        self._hydrate_dir_id = self.ensure_child_folder(
+            self.sandbox_root_file_id(), HYDRATE_DIR_NAME
+        )
+        logger.info("懒搬运暂存目录 %s → %s", HYDRATE_DIR_NAME, self._hydrate_dir_id)
+        self._await_path_visible(self._hydrate_dir_id, label="暂存目录")
+        return self._hydrate_dir_id
+
+    def _await_path_visible(
+        self, file_id: str, *, label: str, attempts: int = 10, pause: float = 1.0
+    ) -> str:
+        """等待新对象的云盘路径可被 batchGetPath 查到，返回查到的路径（超时返回 ""）。
+
+        官方 Skill 的写操作（`batchCopy` 等）在真正提交前会调用
+        `ensure_files_in_sandbox()`，用 batchGetPath 反查目标路径是否在沙箱内。
+        刚创建 / 刚复制出来的对象可能还没被路径索引收录，于是抛
+        「权限拒绝：无法确认 xxx 的云盘路径」——被 FUSE 映射成 EACCES。
+        这里先等路径出现，再让 SDK 去做校验。
+        """
+        for index in range(1, attempts + 1):
+            try:
+                path = self._api(sandbox.resolve_cloud_path, file_id)
+            except CloudError as exc:  # 路径查询本身也可能偶发失败
+                path = ""
+                logger.debug("路径查询失败 %s: %s", file_id, exc)
+            if path:
+                if index > 1:
+                    logger.info("%s 的路径已就绪（第 %s 次）: %s", label, index, path)
+                return str(path)
+            if index == 1:
+                logger.info("%s 的云盘路径尚未就绪，等待索引 ...", label)
+            time.sleep(pause)
+        logger.warning("%s 的云盘路径在 %.0fs 内仍不可见: %s", label, attempts * pause, file_id)
+        return ""
+
+    def file_name(self, file_id: str) -> str:
+        """取云端文件名（batchGet），失败时退回 fileId。"""
+        try:
+            names = self._api(client.api_batch_get_names, [str(file_id)])
+        except CloudError as exc:
+            logger.debug("取文件名失败 %s: %s", file_id, exc)
+            return str(file_id)
+        return str(names.get(str(file_id)) or file_id)
+
+    def hydrate_file(self, file_id: str) -> str:
+        """把沙箱外文件云内复制进沙箱暂存目录，返回副本 fileId。
+
+        每个源文件在暂存目录下占一个以自身 fileId 命名的子目录，因此副本与源
+        文件同名也不会冲突；进程重启后按「槽位 + 文件名」做同名检查即可找回已有
+        副本，不会重复搬运。
+        """
+        key = str(file_id)
+        cached = self._staged_by_source.get(key)
+        if cached:
+            return cached
+
+        slot = self.ensure_child_folder(self.ensure_hydrate_dir(), key)
+        name = self.file_name(key)
+
+        existing = self._api(client.api_check_exists, slot, name)
+        if existing.get("exist") and existing.get("fileId"):
+            new_id = str(existing["fileId"])
+            logger.info("复用已有暂存副本: %s -> %s", key, new_id)
+        else:
+            # 新目录/新对象要等路径索引收录，否则 SDK 的沙箱校验会判「无法确认路径」
+            self._await_path_visible(slot, label="暂存槽位")
+            new_id = self._extract_copied_id(key, self.batch_copy([key], slot))
+            if not new_id:
+                # 接口未回传 newFileId 时，按文件名再查一次（仍然不碰搜索接口）
+                recheck = self._api(client.api_check_exists, slot, name)
+                new_id = str(recheck.get("fileId") or "")
+            if not new_id:
+                raise MCloudAPIException(f"懒搬运失败：{key} 的副本未出现在暂存目录")
+            logger.info("沙箱外文件已搬入暂存目录: %s -> %s", key, new_id)
+            self._await_path_visible(new_id, label="暂存副本")
+
+        self._staged_by_source[key] = new_id
+        return new_id
+
+    @staticmethod
+    def _extract_copied_id(
+        source_id: str, results: Optional[Sequence[Dict[str, Any]]]
+    ) -> str:
+        """从 batch_copy 结果里取出源文件对应的副本 fileId。"""
+        rows = list(results or [])
+        for row in rows:
+            if str(row.get("fileId") or "") == source_id:
+                return str(row.get("newFileId") or "")
+        for row in rows:
+            new_id = str(row.get("newFileId") or "")
+            if new_id:
+                return new_id
+        return ""
+
+    # ------------------------------------------------------------------
     # 批量复制（供回收站等使用）
     # ------------------------------------------------------------------
 
@@ -222,16 +356,26 @@ class DirectClientWrapper:
             raise MCloudAPIException(f"获取下载地址失败: {e}") from e
 
     def download_file(self, file_id: str, local_save_path: Path) -> Path:
-        """把云盘文件下载到本地指定路径，返回本地路径。"""
+        """把云盘文件下载到本地指定路径，返回本地路径。
+
+        沙箱外文件（挂载云盘根时常见）先云内复制进沙箱暂存目录再下载：
+        官方接口只允许下载沙箱内文件，copy 的源则可以是全盘任意位置。
+        「是否在沙箱外」不额外查询路径——取直链时 SDK 会抛出
+        `PermissionDeniedError`，这本身就是最准确的信号，也省掉一次接口调用。
+        """
         self._ensure_auth()
         local_save_path = Path(local_save_path)
         local_save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            urls = self.get_download_urls([file_id])
-        except MCloudAPIException:
-            raise
-        url = urls.get(str(file_id))
+        url, outside_sandbox = self._try_download_url(file_id)
+        if url is None and outside_sandbox:
+            staged = self.hydrate_file(file_id)
+            url, still_denied = self._try_download_url(staged)
+            if url is None and still_denied:
+                raise MCloudAPIException(
+                    f"懒搬运已完成，但暂存副本 {staged} 仍取不到下载地址"
+                    f"（沙箱路径可能还没就绪），原文件 {file_id}"
+                )
         if not url:
             raise MCloudAPIException(f"未能获取文件 {file_id} 的下载地址（可能不在沙箱内）")
 
@@ -242,6 +386,19 @@ class DirectClientWrapper:
 
         logger.debug("下载完成: %s -> %s (%s bytes)", file_id, local_save_path, written)
         return local_save_path
+
+    def _try_download_url(self, file_id: str) -> tuple:
+        """取下载直链，返回 ``(url_or_None, 是否因沙箱权限被拒)``。"""
+        try:
+            result = self._api(client.api_batch_download_urls, [str(file_id)])
+        except PermissionDeniedError:
+            # 官方 Skill 的沙箱校验：目标不在沙箱内 → 需要先搬运
+            logger.info("文件 %s 不在沙箱内，将在云内搬运副本后再下载", file_id)
+            return None, True
+        except CloudError as exc:
+            logger.warning("获取文件 %s 的下载地址失败: %s", file_id, exc)
+            return None, False
+        return result.urls.get(str(file_id)), False
 
     # ------------------------------------------------------------------
     # 上传

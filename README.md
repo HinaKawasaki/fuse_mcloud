@@ -20,6 +20,8 @@
 
 - **正确的目录列举**：`readdir` / `lookup` 只按「当前目录自身的 fileId」调用列举接口并自动翻页，
   同名去重、按 inode 稳定分页，绝不使用全盘搜索（这是早期重复行 / 目录串台的根因）。
+- **可挂载整个云盘**：`--root cloud` 时挂载根就是云盘 `/`，能浏览全盘目录；
+  读沙箱外的文件时自动云内复制进沙箱暂存目录再下载，对上层完全透明。
 - **写回缓存（Write-Back）**：`write` 先落本地暂存文件，`fsync` 可中途推送到云端，
   `release` 时整文件上传；收尾用**改名进读缓存（零拷贝）**，不为同一文件再占一份磁盘。
   适配云盘「整文件上传、无随机写」的语义。
@@ -147,6 +149,20 @@ mkdir -p /mnt/mcloud
 python3 src/main.py --mountpoint /mnt/mcloud --cache-dir ~/.cache/mcloud-fuse
 ```
 
+默认挂载根是沙箱 `/AI空间/智能体云盘助手`。想浏览**整个云盘**，加 `--root cloud`
+（或设 `MCLOUD_ROOT=cloud`）：
+
+```bash
+python3 src/main.py --mountpoint /mnt/mcloud --root cloud --cache-dir ~/.cache/mcloud-fuse
+```
+
+此时 `ls /mnt/mcloud` 就是云盘根目录。官方 Skill 只允许读沙箱内文件，因此读取沙箱外
+文件时，本层会先把云端对象复制到沙箱里的暂存目录 `.MCloudHydrate/<fileId>/` 再下载
+（见[已知限制](#-已知限制)）；写操作仍然只能落在沙箱内，越界的 `mkdir` / 写入会返回 `EACCES`。
+
+首次读取某个沙箱外文件要等一次**云端复制任务**完成（秒级到数十秒，取决于文件大小与云端
+调度），之后走本地读缓存；重启挂载后按「槽位 + 文件名」复用已有副本，不会重复复制。
+
 另一个终端即可操作：
 
 ```bash
@@ -156,6 +172,8 @@ cp ./big.iso /mnt/mcloud/
 ```
 
 卸载：对运行中的进程按 `Ctrl+C`，或执行 `fusermount3 -u /mnt/mcloud`。
+**注意别停在挂载点目录里**执行卸载/重启：`umount` 会因 `EBUSY` 失败，进程被强杀后
+挂载点会变成 `ENOTCONN` 的失效挂载（新版启动时会自动清理，见[排障](#-排障)）。
 
 ### 7.（可选）安装为 systemd 服务
 
@@ -182,6 +200,8 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 | `MCLOUD_MAX_PARTS` | `64` | 最大分片数（据此自动调整分片大小） |
 | `MCLOUD_PART_RETRIES` | `3` | 单个分片上传尝试次数 |
 | `MCLOUD_UPLOAD_KEEP_CACHE` | `1` | 上传后是否把写回文件保留为读缓存（`0` = 上传后删除） |
+| `MCLOUD_ROOT` | `sandbox` | 挂载根：`sandbox` 只暴露沙箱；`cloud` 暴露云盘根（沙箱外文件懒搬运） |
+| `MCLOUD_HYDRATE_DIR` | `.MCloudHydrate` | 沙箱内的懒搬运暂存目录名（挂载云盘根时使用） |
 
 `MAX_CACHE_SIZE_MB` 留 `None` 时按物理内存的 25% 自动设定。
 
@@ -254,6 +274,12 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 
 - **没有真正的删除与重命名**：删除只是移入 `.TrashBin` 并登记墓碑，**不释放云盘容量**；
   文件重命名通过「下载 + 新名上传 + 旧对象进回收站」实现，**目录重命名返回 `ENOSYS`**（跨目录同名移动可用）。
+- **挂载云盘根时沙箱外文件需「懒搬运」**：官方接口只允许下载沙箱内文件，因此第一次读取
+  沙箱外文件会先云内复制到沙箱暂存目录 `.MCloudHydrate/<fileId>/`（对用户隐藏）。
+  副本同样**不释放容量**、会占用云盘空间，同一文件同一进程内只搬一次，重启后按
+  「槽位 + 文件名」复用；写、改名、删除仍只允许发生在沙箱内。
+  首次读延迟取决于云端复制任务；整条搬运链路只用 `batchCheckExists` / `batchCopy` /
+  `batchGet`，不依赖最终一致的搜索接口。
 - **覆盖写会产生同名旧版本**：云盘无 in-place 更新，覆盖写会生成新 fileId，旧对象留在云端（本地用墓碑屏蔽）。
 - **墓碑是本地状态**：换机器 / 清空缓存目录后，之前「删除」过的云端对象会重新出现。
 - **多段上传必须按序**，无法并发加速；跨进程不支持从中间分片续传（崩溃后由写回日志整文件重传）。
@@ -276,6 +302,9 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 | 读文件报 `无法确认 pending-xxx 的云盘路径` | 写回尚未完成；正常路径已同步等待，若仍出现请查看日志中的「写回上传失败」 |
 | `ls` 看不到刚建的文件 | 云盘索引延迟，几秒后重试；本层有宽限期不会误删，但其它客户端需等索引 |
 | 卸载提示 `Device or resource busy` | 仍有进程在使用挂载点，先 `cd` 出去或用 `lsof` 找到占用进程 |
+| `Transport endpoint is not connected`（`ENOTCONN`） | 挂载进程被强杀后留下的失效 FUSE 挂载。常见于**在挂载点目录里**执行 `stop`/`restart`：卸载遭遇 `EBUSY`、systemd 随后强杀进程。先 `cd` 出去，再 `fusermount3 -uz /mnt/mcloud` |
+| 服务反复重启并报 `FileExistsError: [Errno 17] File exists` | 同上，挂载点是失效挂载，`mkdir(exist_ok=True)` 会失败。新版启动时会自动 `fusermount3 -u`/`-uz` 清理残留；手工处理同样是 `cd` 出去 + `fusermount3 -uz /mnt/mcloud` |
+| `systemctl --user stop` 后 `ps` 里还有进程 | 卸载被占用时会等 `TimeoutStopSec`（默认 20s）再强杀；确认没有 shell 停在挂载点里 |
 | 上传大文件很慢 | 多段为按序上传，速度受带宽限制；可调 `MCLOUD_MAX_PARTS` 控制分片数量 |
 
 设置 `MCLOUD_LOG=DEBUG`（配合真机脚本）可看到更详细的调用过程。

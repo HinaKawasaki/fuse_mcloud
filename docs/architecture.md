@@ -80,9 +80,23 @@ open(inode)
   └─ DataCache.prepare_file_for_read(fileId)
        命中缓存 → 直接返回本地文件
        未命中   → wrapper.download_file()（直链 + 流式落盘 + LRU 淘汰）
+                    ├─ 沙箱内文件   → 直接取直链下载
+                    └─ 沙箱外文件（--root cloud）→ hydrate_file() 先云内复制到
+                       .MCloudHydrate/<fileId>/，再对副本取直链下载
 read(fh, off, size)
   └─ 本地文件 seek + read（工作线程）
 ```
+
+官方 Skill 的下载接口带沙箱校验（`ensure_files_in_sandbox`），而 `copy` 的**源**允许是
+全盘任意位置。因此挂载云盘根时，读取沙箱外文件走「云内复制 → 再下载」两步：每个源文件在
+沙箱暂存目录里占一个以自身 fileId 命名的子目录，副本与源同名也不冲突，进程重启后按
+「槽位 + 文件名」做同名检查即可复用、不重复搬运。
+
+搬运的触发点是取直链时的 `PermissionDeniedError`（这已经是最准确的「不在沙箱内」信号，
+无需再查一次路径）；并且整条链路只用 `batchCheckExists` / `batchCopy` / `batchGet`
+这类强一致接口，**不使用搜索接口**——目录列举用的 merge search 是最终一致的，会返回
+「缓存信息失效」之类的服务端错误，不该被懒搬运继承。写路径不做搬运
+（`upload` / `createFolder` 的目标必须在沙箱内），越界写会由 SDK 拒绝并映射为 `EACCES`。
 
 ## 写路径（Write-Back）
 
