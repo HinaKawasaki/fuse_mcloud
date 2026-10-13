@@ -3,9 +3,9 @@ import threading
 import time
 from typing import Dict, Iterable, List, Optional
 
-from config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME
-from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
-from mapping.tombstones import TombstoneStore
+from mcloud_fuse.config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME
+from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
+from mcloud_fuse.mapping.tombstones import TombstoneStore
 
 logger = logging.getLogger(__name__)
 

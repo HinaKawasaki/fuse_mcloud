@@ -3,26 +3,17 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 from pathlib import Path
+from typing import Optional, Sequence
 
 import pyfuse3
 import trio
 
-# 1. 注入 sys.path
-SRC_DIR = Path(__file__).resolve().parent
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-BASEMENT_SCRIPTS_DIR = SRC_DIR.parent / "basement" / "scripts"
-if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(BASEMENT_SCRIPTS_DIR))
-
-from cache.data_cache import DataCache
-from cache.meta_cache import MetaCache
-from client.auth_manager import AuthManager
-from client.wrapper import DirectClientWrapper
-from config import (  # noqa: E402
+from mcloud_fuse.cache.data_cache import DataCache
+from mcloud_fuse.cache.meta_cache import MetaCache
+from mcloud_fuse.client.auth_manager import AuthManager
+from mcloud_fuse.client.wrapper import DirectClientWrapper
+from mcloud_fuse.config import (
     CACHE_DIR,
     CLOUD_ROOT_FILE_ID,
     META_CACHE_TTL,
@@ -30,17 +21,24 @@ from config import (  # noqa: E402
     ROOT_MODE_CLOUD,
     ROOT_MODE_SANDBOX,
 )
-from fuse.fuse_ops import MCloudFuseOps
-from mapping.id_map import InodeMapper
-from mapping.tombstones import TombstoneStore
-from mapping.tree import DirectoryTree
+from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps
+from mcloud_fuse.mapping.id_map import InodeMapper
+from mcloud_fuse.mapping.tombstones import TombstoneStore
+from mcloud_fuse.mapping.tree import DirectoryTree
+from mcloud_fuse.version import __version__
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mcloud_main")
 
 
-def parse_args():
+def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(description="移动云盘 FUSE 文件系统挂载工具")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mcloud-fuse {__version__}",
+        help="打印版本号并退出",
+    )
     parser.add_argument(
         "--mountpoint",
         type=str,
@@ -65,7 +63,7 @@ def parse_args():
             "写操作仍只允许落在沙箱内（默认值可用环境变量 MCLOUD_ROOT 指定）"
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def prepare_mountpoint(mountpoint: Path) -> None:
@@ -121,8 +119,8 @@ async def _watch_termination_signals() -> None:
             return
 
 
-async def main():
-    args = parse_args()
+async def main(argv: Optional[Sequence[str]] = None):
+    args = parse_args(argv)
     mountpoint = Path(args.mountpoint).resolve()
     cache_dir = Path(args.cache_dir).resolve()
 
@@ -195,9 +193,17 @@ async def main():
         logger.info("✅ 卸载完成！")
 
 
-if __name__ == "__main__":
+def cli(argv: Optional[Sequence[str]] = None) -> int:
+    """同步命令行入口（``mcloud-fuse`` / ``python -m mcloud_fuse``）。
+
+    pyfuse3 要求事件循环由 trio 驱动，因此这里用 ``trio.run`` 而不是 asyncio。
+    """
     try:
-        # 使用 trio.run 代替 asyncio.run，匹配 pyfuse3 的事件循环要求
-        trio.run(main)
+        trio.run(main, argv)
     except KeyboardInterrupt:
-        logger.info("\n系统已被用户手动中断。")
+        logger.info("系统已被用户手动中断。")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

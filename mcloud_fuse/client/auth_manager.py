@@ -1,14 +1,12 @@
 import logging
-import sys
-from pathlib import Path
 from typing import Dict, Optional
 
-# 1. 确保将 basement/scripts 注入 sys.path (层级为 parent.parent.parent)
-BASEMENT_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "basement" / "scripts"
-if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(BASEMENT_SCRIPTS_DIR))
+from mcloud_fuse.basement import ensure_basement_on_path
 
-# 2. 导入官方 SDK
+# 官方 Skill 不在本仓库内：导入 cm_cloud_* 之前先定位并注入 sys.path
+ensure_basement_on_path()
+
+# 导入官方 SDK
 import cm_cloud_auth  # noqa: E402
 import cm_cloud_config  # noqa: E402
 from cm_cloud_errors import AuthError, NeedAuthError  # noqa: E402

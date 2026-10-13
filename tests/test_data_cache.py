@@ -4,11 +4,11 @@ import time
 from pathlib import Path
 
 # 确保 src 目录在 sys.path 中
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cache.data_cache import DataCache
+from mcloud_fuse.cache.data_cache import DataCache
 
 
 class MockClientWrapper:

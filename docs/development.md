@@ -8,7 +8,7 @@ cd fuse_mcloud
 
 sudo apt-get install -y fuse3 libfuse3-dev
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt      # 含运行时依赖 + pytest
+pip install -e '.[dev]'                  # 含运行时依赖 + pytest / pytest-cov / ruff
 
 python3 scripts/setup_basement.py        # 拉取官方云盘 Skill 到 basement/
 ```
@@ -22,12 +22,17 @@ python3 scripts/setup_basement.py        # 拉取官方云盘 Skill 到 basement
 - 提交前请确保：
 
 ```bash
-ruff check src tests
-ruff format --check src tests     # 可选：格式化
+ruff check mcloud_fuse tests
+ruff format --check mcloud_fuse tests     # 可选：格式化
 ```
 
-- 目录导入约定：`src/` 是顶层包根（`import config` / `from mapping.id_map import ...`）。
-  `main.py` 与测试脚本需要先注入 `sys.path`，因此这几处允许 E402（已在 pyproject 豁免）。
+- 导入约定：`mcloud_fuse/` 是常规包，内部一律用绝对导入
+  （`from mcloud_fuse.config import ...`）。官方 Skill 是一组顶层模块，
+  统一由 `mcloud_fuse/basement.py` 定位并注入 `sys.path`，因此
+  `mcloud_fuse/client/*.py` 里 `import cm_cloud_*` 之前有代码，这几处允许 E402。
+  测试脚本同样要先注入仓库根，`tests/**` 也豁免 E402。
+- 版本号只写在 `mcloud_fuse/version.py`，`pyproject.toml` 用
+  `dynamic = ["version"]` 读取；`--version` 也取这一处，不要另写死版本。
 
 ## 测试策略
 
@@ -64,7 +69,7 @@ MCLOUD_LIVE_WRITE=1 python3 tests/integration/real_mount_smoke.py
 
 ## 新增一个 FUSE 回调
 
-1. 在 `src/fuse/fuse_ops.py` 的 `MCloudFuseOps` 里实现同名方法（签名参考 `pyfuse3.Operations`）。
+1. 在 `mcloud_fuse/fuse/fuse_ops.py` 的 `MCloudFuseOps` 里实现同名方法（签名参考 `pyfuse3.Operations`）。
 2. 阻塞逻辑写成同步函数，再用 `await trio.to_thread.run_sync(...)` 调用；不要直接在协程里做网络/磁盘 IO。
 3. 需要访问云盘时只使用 `DirectClientWrapper` 的方法（它们自带限流与重试）；
    不要再开新的 HTTP 客户端。
@@ -89,15 +94,20 @@ MCLOUD_LOG=DEBUG python3 tests/integration/real_mount_smoke.py
 - 发布前：
 
 ```bash
-ruff check src tests
+ruff check mcloud_fuse tests
 python3 -m pytest tests -q
+python3 -m pytest tests -q --cov=mcloud_fuse --cov-report=term-missing   # 覆盖率
 python3 tests/integration/fuse_mount_smoke.py
 python3 tests/integration/posix_stress.py
 ```
 
-- 打标签并写 release notes（参考 `docs/release-notes.md`）：
+- 同样的检查已由 GitHub Actions 在 push / PR 时执行（见 `.github/workflows/ci.yml`），
+  本地先跑一遍可以少一轮往返。
+
+- 打标签并写 release notes（参考 `docs/release-notes.md`）。版本号改
+  `mcloud_fuse/version.py`，标签名必须与之一致：
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
+git tag -a v0.3.0 -m "v0.3.0"
 git push origin main --tags
 ```

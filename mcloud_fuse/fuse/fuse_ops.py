@@ -10,14 +10,14 @@ from typing import Dict, Optional
 import pyfuse3
 import trio
 
-from cache.data_cache import DataCache
-from cache.meta_cache import MetaCache
-from client.auth_manager import AuthRequiredException, MCloudAuthException
-from client.wrapper import CloudItem, DirectClientWrapper, MCloudAPIException
-from config import UPLOAD_KEEP_CACHE
-from mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
-from mapping.tree import DirectoryTree
-from utils.trash_bin import TrashBinHandler
+from mcloud_fuse.cache.data_cache import DataCache
+from mcloud_fuse.cache.meta_cache import MetaCache
+from mcloud_fuse.client.auth_manager import AuthRequiredException, MCloudAuthException
+from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper, MCloudAPIException
+from mcloud_fuse.config import UPLOAD_KEEP_CACHE
+from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
+from mcloud_fuse.mapping.tree import DirectoryTree
+from mcloud_fuse.utils.trash_bin import TrashBinHandler
 
 logger = logging.getLogger(__name__)
 

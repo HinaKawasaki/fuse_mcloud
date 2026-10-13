@@ -6,7 +6,7 @@
 
 ```text
                         ┌───────────────────────────────┐
-             VFS 调用 → │  src/fuse/fuse_ops.py         │
+             VFS 调用 → │  mcloud_fuse.fuse.fuse_ops    │
                         │  MCloudFuseOps                │
                         └───────┬───────────┬───────────┘
                                 │           │

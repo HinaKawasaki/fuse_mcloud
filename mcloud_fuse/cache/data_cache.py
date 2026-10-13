@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from client.wrapper import CloudItem, DirectClientWrapper
-from config import (
+from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper
+from mcloud_fuse.config import (
     CACHE_DIR,
     WRITE_BACK_DIR,
     get_effective_cache_limit_mb,

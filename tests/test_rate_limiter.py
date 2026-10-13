@@ -5,8 +5,8 @@ import time
 import pytest
 from cm_cloud_errors import ApiError, PermissionDeniedError
 
-from router.rate_limiter import RateLimiter, global_rate_limiter
-from router.retry import retry_call
+from mcloud_fuse.router.rate_limiter import RateLimiter, global_rate_limiter
+from mcloud_fuse.router.retry import retry_call
 
 
 def test_concurrency_limit():
@@ -89,6 +89,5 @@ def test_non_retryable_not_retried():
 
 
 def test_global_limiter_matches_config():
-    import config
-
+    from mcloud_fuse import config
     assert global_rate_limiter.max_concurrent == config.API_MAX_CONCURRENT

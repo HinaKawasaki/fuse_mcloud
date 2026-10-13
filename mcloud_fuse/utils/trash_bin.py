@@ -2,8 +2,8 @@ import logging
 from pathlib import PurePosixPath
 from typing import Optional
 
-from config import TRASH_BIN_DIR_NAME
-from mapping.id_map import InodeEntry, InodeMapper
+from mcloud_fuse.config import TRASH_BIN_DIR_NAME
+from mcloud_fuse.mapping.id_map import InodeEntry, InodeMapper
 
 logger = logging.getLogger(__name__)
 

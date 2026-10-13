@@ -11,15 +11,15 @@ from pathlib import Path
 import pytest
 import trio
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cache.meta_cache import MetaCache  # noqa: E402
-from client.wrapper import CloudItem, DirectClientWrapper  # noqa: E402
-from fuse.fuse_ops import MCloudFuseOps  # noqa: E402
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
+from mcloud_fuse.cache.meta_cache import MetaCache  # noqa: E402
+from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper  # noqa: E402
+from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mcloud_fuse.mapping.id_map import InodeMapper  # noqa: E402
+from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 测试替身

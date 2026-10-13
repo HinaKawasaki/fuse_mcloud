@@ -43,7 +43,7 @@
         │  VFS
         ▼
 ┌──────────────────────────────────────────────┐
-│ src/fuse/fuse_ops.py   MCloudFuseOps         │  pyfuse3.Operations 回调
+│ mcloud_fuse/fuse/fuse_ops.py   MCloudFuseOps         │  pyfuse3.Operations 回调
 │  getattr / lookup / readdir / open / read     │  阻塞 I/O 全部丢进 trio 线程
 │  create / write / fsync / release / mkdir     │
 │  unlink / rmdir / rename / setattr / statfs   │
@@ -63,19 +63,19 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/main.py` | 挂载入口：取沙箱 fileId、装配组件、`pyfuse3.init` + `trio.run` |
-| `src/config.py` | 路径 / TTL / 限流 / 多段上传参数（支持环境变量覆盖） |
-| `src/fuse/fuse_ops.py` | 所有 FUSE 回调实现、写回状态机、错误码映射 |
-| `src/mapping/id_map.py` | inode ↔ path ↔ fileId 映射与分配器 |
-| `src/mapping/tree.py` | 目录充填、同名去重、陈旧对账、索引宽限期 |
-| `src/mapping/tombstones.py` | 已删除 fileId 的持久化墓碑集合 |
-| `src/cache/meta_cache.py` | `getattr` / `readdir` 的 TTL 缓存 |
-| `src/cache/data_cache.py` | 读缓存 + LRU、写回暂存与写回日志（崩溃恢复） |
-| `src/client/wrapper.py` | 云盘 SDK 封装：列举 / 下载 / 上传（多段）、限流与重试落点 |
-| `src/client/auth_manager.py` | 登录态与 creditToken 生命周期 |
-| `src/router/rate_limiter.py` | 线程安全并发 + RPS 限流 |
-| `src/router/retry.py` | 同步指数退避重试 |
-| `src/utils/trash_bin.py` | 回收站（`.TrashBin`）逻辑 |
+| `mcloud_fuse/main.py` | 挂载入口：取沙箱 fileId、装配组件、`pyfuse3.init` + `trio.run` |
+| `mcloud_fuse/config.py` | 路径 / TTL / 限流 / 多段上传参数（支持环境变量覆盖） |
+| `mcloud_fuse/fuse/fuse_ops.py` | 所有 FUSE 回调实现、写回状态机、错误码映射 |
+| `mcloud_fuse/mapping/id_map.py` | inode ↔ path ↔ fileId 映射与分配器 |
+| `mcloud_fuse/mapping/tree.py` | 目录充填、同名去重、陈旧对账、索引宽限期 |
+| `mcloud_fuse/mapping/tombstones.py` | 已删除 fileId 的持久化墓碑集合 |
+| `mcloud_fuse/cache/meta_cache.py` | `getattr` / `readdir` 的 TTL 缓存 |
+| `mcloud_fuse/cache/data_cache.py` | 读缓存 + LRU、写回暂存与写回日志（崩溃恢复） |
+| `mcloud_fuse/client/wrapper.py` | 云盘 SDK 封装：列举 / 下载 / 上传（多段）、限流与重试落点 |
+| `mcloud_fuse/client/auth_manager.py` | 登录态与 creditToken 生命周期 |
+| `mcloud_fuse/router/rate_limiter.py` | 线程安全并发 + RPS 限流 |
+| `mcloud_fuse/router/retry.py` | 同步指数退避重试 |
+| `mcloud_fuse/utils/trash_bin.py` | 回收站（`.TrashBin`）逻辑 |
 
 ---
 
@@ -113,14 +113,22 @@ sudo apt-get update
 sudo apt-get install -y fuse3 libfuse3-dev
 ```
 
-### 3. 安装 Python 依赖
+### 3. 安装本包
 
 ```bash
-pip3 install -r requirements.txt       # 运行时：pyfuse3 / trio / requests
-pip3 install -r requirements-dev.txt   # 可选：pytest、pytest-trio（跑测试用）
+pip3 install -e .            # 安装 mcloud-fuse 命令与运行时依赖
+pip3 install -e '.[dev]'     # 可选：额外装 pytest / pytest-cov / ruff（跑测试用）
+```
+
+也可以沿用老的 requirements 文件（它们现在只是 `pyproject.toml` 的转发）：
+
+```bash
+pip3 install -r requirements.txt
+pip3 install -r requirements-dev.txt
 ```
 
 > `pyfuse3` 需要编译，若失败请确认已安装 `gcc` 与 `libfuse3-dev`。
+> 依赖清单以 `pyproject.toml` 为唯一来源，`requirements*.txt` 不再单独维护版本。
 
 ### 4. 拉取官方云盘 Skill（必做）
 
@@ -146,14 +154,16 @@ python3 basement/scripts/main.py login
 
 ```bash
 mkdir -p /mnt/mcloud
-python3 src/main.py --mountpoint /mnt/mcloud --cache-dir ~/.cache/mcloud-fuse
+mcloud-fuse --mountpoint /mnt/mcloud --cache-dir ~/.cache/mcloud-fuse
 ```
+
+> 没走 `pip install`（例如直接在仓库里跑）时，用 `python3 -m mcloud_fuse ...` 等价调用。
 
 默认挂载根是沙箱 `/AI空间/智能体云盘助手`。想浏览**整个云盘**，加 `--root cloud`
 （或设 `MCLOUD_ROOT=cloud`）：
 
 ```bash
-python3 src/main.py --mountpoint /mnt/mcloud --root cloud --cache-dir ~/.cache/mcloud-fuse
+mcloud-fuse --mountpoint /mnt/mcloud --root cloud --cache-dir ~/.cache/mcloud-fuse
 ```
 
 此时 `ls /mnt/mcloud` 就是云盘根目录。官方 Skill 只允许读沙箱内文件，因此读取沙箱外
@@ -187,7 +197,7 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 
 ## ⚙️ 配置
 
-运行时参数集中在 `src/config.py`，均可用环境变量覆盖：
+运行时参数集中在 `mcloud_fuse/config.py`，均可用环境变量覆盖：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -202,6 +212,7 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 | `MCLOUD_UPLOAD_KEEP_CACHE` | `1` | 上传后是否把写回文件保留为读缓存（`0` = 上传后删除） |
 | `MCLOUD_ROOT` | `sandbox` | 挂载根：`sandbox` 只暴露沙箱；`cloud` 暴露云盘根（沙箱外文件懒搬运） |
 | `MCLOUD_HYDRATE_DIR` | `.MCloudHydrate` | 沙箱内的懒搬运暂存目录名（挂载云盘根时使用） |
+| `MCLOUD_BASEMENT_DIR` | 自动探测 | 官方 Skill 所在目录（`basement` 或 `basement/scripts`），装在仓库外时用它指定 |
 
 `MAX_CACHE_SIZE_MB` 留 `None` 时按物理内存的 25% 自动设定。
 
@@ -212,7 +223,8 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 ### 离线单元 / 回归测试（不需要登录态）
 
 ```bash
-python3 -m pytest tests -q
+python3 -m pytest tests -q                       # 全部离线用例
+python3 -m pytest tests -q --cov=mcloud_fuse     # 附带覆盖率报告
 ```
 
 覆盖：目录列举去重与稳定分页、按目录列举、陈旧清理、索引延迟、写回上传、覆盖写、截断、
@@ -318,6 +330,8 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 - [x] 第三阶段：只读挂载、写回缓存与上传、回收站删除
 - [x] 第四阶段：崩溃恢复、POSIX 压测、systemd 打包
 - [x] 加固：目录列举修复、异步 release 同步、索引最终一致性、多段上传、限流接入、死代码清理
+- [x] v0.3.0 工程化：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
+      版本单一来源、GitHub Actions CI（ruff + pytest）、覆盖率报告
 
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。

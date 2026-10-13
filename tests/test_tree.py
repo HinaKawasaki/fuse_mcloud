@@ -1,12 +1,12 @@
 import sys
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mapping.id_map import InodeMapper
-from mapping.tree import DirectoryTree
+from mcloud_fuse.mapping.id_map import InodeMapper
+from mcloud_fuse.mapping.tree import DirectoryTree
 
 
 def test_directory_tree():

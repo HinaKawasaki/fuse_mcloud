@@ -35,20 +35,20 @@ if os.getenv("MCLOUD_LOG", "").upper() == "DEBUG":
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent.parent
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "basement" / "scripts"))
 
 import pyfuse3  # noqa: E402
 import trio  # noqa: E402
 
-from cache.data_cache import DataCache  # noqa: E402
-from cache.meta_cache import MetaCache  # noqa: E402
-from client.auth_manager import AuthManager  # noqa: E402
-from client.wrapper import DirectClientWrapper  # noqa: E402
-from fuse.fuse_ops import MCloudFuseOps  # noqa: E402
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tombstones import TombstoneStore  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
+from mcloud_fuse.cache.data_cache import DataCache  # noqa: E402
+from mcloud_fuse.cache.meta_cache import MetaCache  # noqa: E402
+from mcloud_fuse.client.auth_manager import AuthManager  # noqa: E402
+from mcloud_fuse.client.wrapper import DirectClientWrapper  # noqa: E402
+from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mcloud_fuse.mapping.id_map import InodeMapper  # noqa: E402
+from mcloud_fuse.mapping.tombstones import TombstoneStore  # noqa: E402
+from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
 
 TRASH = ".TrashBin"
 PROBE_DIR = "_mcloud_fuse_probe"

@@ -54,8 +54,7 @@ class RateLimiter:
 
 def make_rate_limiter() -> RateLimiter:
     """按 config 中的配置构造限流器。"""
-    import config
-
+    from mcloud_fuse import config
     return RateLimiter(
         max_concurrent=config.API_MAX_CONCURRENT,
         requests_per_second=config.API_REQUESTS_PER_SECOND,

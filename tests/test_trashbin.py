@@ -2,14 +2,14 @@
 import sys
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from client.wrapper import CloudItem  # noqa: E402
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
-from utils.trash_bin import TrashBinHandler  # noqa: E402
+from mcloud_fuse.client.wrapper import CloudItem  # noqa: E402
+from mcloud_fuse.mapping.id_map import InodeMapper  # noqa: E402
+from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
+from mcloud_fuse.utils.trash_bin import TrashBinHandler  # noqa: E402
 
 
 class MockWrapper:

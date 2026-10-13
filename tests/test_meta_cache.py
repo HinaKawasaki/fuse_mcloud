@@ -2,12 +2,12 @@ import sys
 import time
 from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from cache.meta_cache import MetaCache
-from mapping.id_map import InodeEntry
+from mcloud_fuse.cache.meta_cache import MetaCache
+from mcloud_fuse.mapping.id_map import InodeEntry
 
 
 def test_meta_cache():

@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from client.auth_manager import AuthManager  # noqa: E402
-from client.wrapper import DirectClientWrapper  # noqa: E402
+from mcloud_fuse.client.auth_manager import AuthManager  # noqa: E402
+from mcloud_fuse.client.wrapper import DirectClientWrapper  # noqa: E402
 
 
 @pytest.mark.skipif(

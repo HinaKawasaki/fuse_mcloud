@@ -1,19 +1,18 @@
 import logging
 import math
 import shutil
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-# 1. 动态注入 basement/scripts 路径以加载原生底层模块
-BASEMENT_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "basement" / "scripts"
-if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(BASEMENT_SCRIPTS_DIR))
+from mcloud_fuse.basement import ensure_basement_on_path
 
-# 2. 导入底层模块与错误定义
+# 官方 Skill 不在本仓库内：导入 cm_cloud_* 之前先定位并注入 sys.path
+ensure_basement_on_path()
+
+# 导入底层模块与错误定义
 import cm_cloud_client as client  # noqa: E402
 import cm_cloud_sandbox as sandbox  # noqa: E402
 import cm_cloud_transport as transport  # noqa: E402
@@ -25,16 +24,16 @@ from cm_cloud_errors import (  # noqa: E402
 )
 from cm_cloud_format import sha256_file  # noqa: E402
 
-from client.auth_manager import AuthManager  # noqa: E402
-from config import (  # noqa: E402
+from mcloud_fuse.client.auth_manager import AuthManager  # noqa: E402
+from mcloud_fuse.config import (  # noqa: E402
     HYDRATE_DIR_NAME,
     MAX_PARTS,
     MIN_PART_SIZE_BYTES,
     MULTIPART_THRESHOLD_BYTES,
     PART_RETRIES,
 )
-from router.rate_limiter import global_rate_limiter  # noqa: E402
-from router.retry import retry_call  # noqa: E402
+from mcloud_fuse.router.rate_limiter import global_rate_limiter  # noqa: E402
+from mcloud_fuse.router.retry import retry_call  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

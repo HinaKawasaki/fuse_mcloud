@@ -2,7 +2,7 @@
 import uuid
 from pathlib import Path
 
-from client.wrapper import CloudItem
+from mcloud_fuse.client.wrapper import CloudItem
 
 
 class FakeCloud:

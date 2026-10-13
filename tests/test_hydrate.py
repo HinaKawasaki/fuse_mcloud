@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所在目录）
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -23,12 +23,12 @@ import cm_cloud_sandbox as sandbox  # noqa: E402
 import cm_cloud_transport as transport  # noqa: E402
 from cm_cloud_errors import ApiError, PermissionDeniedError  # noqa: E402
 
-import client.wrapper as wrapper_module  # noqa: E402
-from client.wrapper import DirectClientWrapper, MCloudAPIException  # noqa: E402
-from config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME  # noqa: E402
-from mapping.id_map import InodeMapper  # noqa: E402
-from mapping.tree import DirectoryTree  # noqa: E402
-from utils.trash_bin import TrashBinHandler  # noqa: E402
+import mcloud_fuse.client.wrapper as wrapper_module  # noqa: E402
+from mcloud_fuse.client.wrapper import DirectClientWrapper, MCloudAPIException  # noqa: E402
+from mcloud_fuse.config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME  # noqa: E402
+from mcloud_fuse.mapping.id_map import InodeMapper  # noqa: E402
+from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
+from mcloud_fuse.utils.trash_bin import TrashBinHandler  # noqa: E402
 
 ROOT = "ROOT"
 AI = "AI"

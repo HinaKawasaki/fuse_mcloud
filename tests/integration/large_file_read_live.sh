@@ -24,7 +24,7 @@ echo "expect sha : $EXPECT_SHA"
 echo "cache dir  : $CACHE (全新空目录)"
 
 : > "$MOUNT_LOG"
-"$PY" "$PROJECT/src/main.py" --mountpoint "$MNT" --cache-dir "$CACHE" >>"$MOUNT_LOG" 2>&1 &
+PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m mcloud_fuse --mountpoint "$MNT" --cache-dir "$CACHE" >>"$MOUNT_LOG" 2>&1 &
 MOUNT_PID=$!
 mounted=0
 for _ in $(seq 1 90); do mountpoint -q "$MNT" && { mounted=1; break; }; sleep 1; done

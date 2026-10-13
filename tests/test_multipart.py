@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 from cm_cloud_errors import ApiError
 
-import client.wrapper as wrapper_mod
-from client.wrapper import DirectClientWrapper
-from router.retry import retry_call
+import mcloud_fuse.client.wrapper as wrapper_mod
+from mcloud_fuse.client.wrapper import DirectClientWrapper
+from mcloud_fuse.router.retry import retry_call
 
 
 class DummyAuth:

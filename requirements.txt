@@ -1,4 +1,3 @@
-# 运行时依赖
-pyfuse3>=3.4
-trio>=0.25
-requests>=2.31.0,<3.0.0
+# 运行时依赖的单一来源是 pyproject.toml 的 [project.dependencies]。
+# 保留本文件以兼容 `pip install -r requirements.txt` 的既有文档与习惯。
+-e .

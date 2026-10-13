@@ -4,8 +4,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from config import META_CACHE_TTL
-from mapping.id_map import InodeEntry
+from mcloud_fuse.config import META_CACHE_TTL
+from mcloud_fuse.mapping.id_map import InodeEntry
 
 logger = logging.getLogger(__name__)
 

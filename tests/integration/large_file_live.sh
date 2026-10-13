@@ -33,7 +33,7 @@ echo "source sha256: $SRC_SHA"
 
 echo "--- 启动挂载 ---"
 : > "$MOUNT_LOG"
-"$PY" "$PROJECT/src/main.py" --mountpoint "$MNT" --cache-dir "$CACHE" >>"$MOUNT_LOG" 2>&1 &
+PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m mcloud_fuse --mountpoint "$MNT" --cache-dir "$CACHE" >>"$MOUNT_LOG" 2>&1 &
 MOUNT_PID=$!
 echo "mount pid: $MOUNT_PID"
 
