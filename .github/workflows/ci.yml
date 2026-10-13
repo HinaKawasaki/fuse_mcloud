@@ -43,6 +43,10 @@ jobs:
           cache: pip
       - name: 安装 libfuse3（pyfuse3 编译与导入都需要）
         run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
+      - name: 拉取官方云盘 Skill（basement/ 不入库，版本必须锁 1.x）
+        env:
+          MCLOUD_SKILL_VERSION: "1.0.4"
+        run: python3 scripts/setup_basement.py
       - name: 安装本包与开发依赖
         run: |
           python -m pip install --upgrade pip
@@ -67,6 +71,10 @@ jobs:
           cache: pip
       - name: 安装 FUSE
         run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse3-dev
+      - name: 拉取官方云盘 Skill（basement/ 不入库，版本必须锁 1.x）
+        env:
+          MCLOUD_SKILL_VERSION: "1.0.4"
+        run: python3 scripts/setup_basement.py
       - name: 安装本包与开发依赖
         run: |
           python -m pip install --upgrade pip
