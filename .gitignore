@@ -19,3 +19,9 @@ venv/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+
+# 覆盖率产物
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
