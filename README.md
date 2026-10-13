@@ -27,8 +27,10 @@
   适配云盘「整文件上传、无随机写」的语义。
 - **异步 release 同步**：FUSE 的 `release` 不阻塞 `close()`，因此对「上传在途」做了事件同步，
   `close()` 之后立刻读文件不会读到占位 ID。
-- **删除进回收站 + 持久化墓碑**：`unlink` / `rmdir` 改写为复制进 `.TrashBin/` 并登记墓碑，
-  避免云端旧对象在下次列举时「复活」；墓碑落盘，重启仍生效。
+- **删除 = 墓碑 + 本地摘除（不再复制副本）**：云盘接口**没有任何删除能力**，因此
+  `unlink` / `rmdir` 登记持久化墓碑并摘除本地节点，对用户表现为「已删除」。
+  不再额外把对象复制进 `.TrashBin/`——原对象本来就没消失，副本只会让被删对象占双倍容量，
+  而 `.TrashBin` 在本挂载里是隐藏目录（`MCLOUD_TRASH_COPY=1` 可恢复旧的复制行为）。
 - **索引最终一致性处理**：云盘搜索索引有延迟，新建对象会进入「索引宽限期」，不会被对账清理误删。
 - **大文件多段上传**：超过阈值自动切分（≥5MiB/片）按序上传，分片级重试，失败自动回退单段上传。
 - **大文件按需读取**：超过阈值（默认 256MiB）的文件不再「打开即整文件下载」，
@@ -77,7 +79,7 @@
 | `mcloud_fuse/client/auth_manager.py` | 登录态与 creditToken 生命周期 |
 | `mcloud_fuse/router/rate_limiter.py` | 线程安全并发 + RPS 限流 |
 | `mcloud_fuse/router/retry.py` | 同步指数退避重试 |
-| `mcloud_fuse/utils/trash_bin.py` | 回收站（`.TrashBin`）逻辑 |
+| `mcloud_fuse/utils/trash_bin.py` | 删除策略：墓碑 + 本地摘除（`MCLOUD_TRASH_COPY=1` 时才复制副本） |
 
 ---
 
@@ -215,6 +217,7 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 | `MCLOUD_ROOT` | `sandbox` | 挂载根：`sandbox` 只暴露沙箱；`cloud` 暴露云盘根（沙箱外文件懒搬运） |
 | `MCLOUD_HYDRATE_DIR` | `.MCloudHydrate` | 沙箱内的懒搬运暂存目录名（挂载云盘根时使用） |
 | `MCLOUD_BASEMENT_DIR` | 自动探测 | 官方 Skill 所在目录（`basement` 或 `basement/scripts`），装在仓库外时用它指定 |
+| `MCLOUD_TRASH_COPY` | `0` | 删除时是否额外把对象复制进 `.TrashBin`（`1` = 旧行为，会让被删对象占双倍容量） |
 | `MCLOUD_EAGER_DOWNLOAD_LIMIT` | `268435456`（256MiB） | 超过该大小的文件走按需（Range）读取；`0` = 关闭，总是整文件下载 |
 | `MCLOUD_RANGE_CHUNK` | `4194304`（4MiB） | 按需读的单次预取粒度 |
 | `MCLOUD_RANGE_TIMEOUT` | `60` | 单个分片请求的超时秒数 |
@@ -233,7 +236,8 @@ python3 -m pytest tests -q --cov=mcloud_fuse     # 附带覆盖率报告
 ```
 
 覆盖：目录列举去重与稳定分页、按目录列举、陈旧清理、索引延迟、写回上传、覆盖写、截断、
-删除进回收站且不复活、墓碑持久化、多段上传规划与字节重组、限流并发上限与退避重试、写回崩溃恢复。
+删除后不复活、墓碑持久化、删除默认不产生云端副本、按需（Range）读取、多段上传规划与字节重组、
+限流并发上限与退避重试、写回崩溃恢复。
 
 ### 真实 FUSE 挂载冒烟（内存假云盘，不需要登录态）
 
@@ -251,7 +255,7 @@ python3 scripts/check_range_support.py
 # 只读校验：官方 CLI 与本地列举一致、cat 字节一致
 python3 tests/integration/real_mount_smoke.py
 
-# 追加写入校验（会在云盘留下 _mcloud_fuse_probe 目录与 .TrashBin 副本）
+# 追加写入校验（会在云盘留下 _mcloud_fuse_probe 目录；接口无删除能力，残留只能去 App 清）
 MCLOUD_LIVE_WRITE=1 python3 tests/integration/real_mount_smoke.py
 
 # 大文件上传（cp 走写回 + 多段）与空缓存强制下载
@@ -283,7 +287,8 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 淘汰只会摘掉缓存映射，真正的删除推迟到最后一个句柄 `close()`，与 POSIX 语义一致。
 
 **删除为什么需要墓碑？**
-云盘接口没有删除。删除 = 复制进 `.TrashBin` + 本地摘除节点，但云端原对象仍在，下次列举会「复活」。
+云盘接口没有删除。删除 = 登记墓碑 + 本地摘除节点，但云端原对象仍在，下次列举会「复活」。
+（默认不再往 `.TrashBin` 复制副本：原对象没消失，复制只是白占一倍容量。）
 墓碑记录已删除的 fileId，充填目录时屏蔽它们；墓碑落盘，重启后依然有效。
 
 **索引最终一致怎么办？**
@@ -298,8 +303,15 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 
 ## ⚠️ 已知限制
 
-- **没有真正的删除与重命名**：删除只是移入 `.TrashBin` 并登记墓碑，**不释放云盘容量**；
-  文件重命名通过「下载 + 新名上传 + 旧对象进回收站」实现，**目录重命名返回 `ENOSYS`**（跨目录同名移动可用）。
+- **没有真正的删除与重命名**：官方 Skill 只有 create / search / copy / download 一类接口，
+  **不存在删除或回收站接口**，所以：
+  - `unlink` / `rmdir` = 登记墓碑 + 本地摘除。**不释放云盘容量**，但也**不再产生额外副本**
+    （默认 `MCLOUD_TRASH_COPY=0`）：原对象留在原处并被墓碑隐藏，在官方 App 里它依然存在。
+  - 想让被删对象「回来」：删掉对应的墓碑记录即可（原对象从未移动）。
+    想真正腾出容量：只能在官方 App / 网页端删除——App 会把它放进云盘自己的回收站，本层做不到。
+  - 历史版本或用 `MCLOUD_TRASH_COPY=1` 时产生的 `.TrashBin` 副本同样只能去 App 里清；
+    本挂载既看不到（隐藏目录）也删不掉它们。
+  - 文件重命名通过「下载 + 新名上传 + 旧对象登记墓碑」实现，**目录重命名返回 `ENOSYS`**（跨目录同名移动可用）。
 - **挂载云盘根时沙箱外文件需「懒搬运」**：官方接口只允许下载沙箱内文件，因此第一次读取
   沙箱外文件会先云内复制到沙箱暂存目录 `.MCloudHydrate/<fileId>/`（对用户隐藏）。
   副本同样**不释放容量**、会占用云盘空间，同一文件同一进程内只搬一次，重启后按
@@ -353,11 +365,14 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
       修复读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除）
 - [x] v0.4.0 大文件按需读取：超过阈值不再整文件下载，`read` 按 Range 分片拉取；
       服务端不支持 Range 时自动降级；新增 `scripts/check_range_support.py` 探测直链能力
+- [x] v0.5.0 删除不再烧双倍容量：确认 Skill 无任何删除接口，删除改为「墓碑 + 本地摘除」，
+      不再往 `.TrashBin` 复制副本（`MCLOUD_TRASH_COPY=1` 保留旧行为）
 
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。
 
-后续可做：回收站可视化与一键清理、`rename` 语义增强、`allow_other` 多用户与文件锁支持、Grafana 风格指标。
+后续可做：墓碑管理（列出/恢复被删对象，代替删不掉的回收站）、`rename` 语义增强、
+`allow_other` 多用户与文件锁支持、Grafana 风格指标。
 
 ---
 

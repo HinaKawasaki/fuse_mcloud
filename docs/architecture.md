@@ -148,17 +148,24 @@ release(fh)
 
 ## 删除与墓碑
 
-云盘接口没有删除能力，因此：
+官方 Skill 只有 create / search / copy / download 一类接口，**没有任何删除或回收站接口**，
+因此「删除」在云端是做不到的，本层只能让它在挂载里消失：
 
 ```text
 unlink/rmdir
   └─ TrashBinHandler.move_to_trash(entry)
-       1) copy <fileId> → .TrashBin/<fileId>
+       1) tombstones.add(fileId)   ← 落盘 cache_dir/.tombstones（删除语义的唯一实现）
        2) mapper 摘除该节点
-       3) tombstones.add(fileId)   ← 落盘 cache_dir/.tombstones
+       3) tree.mark_directory_stale(parent)
+      （MCLOUD_TRASH_COPY=1 时才会额外 copy <fileId> → .TrashBin/<fileId>）
 ```
 
-墓碑在目录充填时过滤对应 fileId。它是**本地状态**：换机器/清缓存后，云端旧对象会重新出现。
+- 墓碑在目录充填时过滤对应 fileId。它是**本地状态**：换机器/清缓存后，云端旧对象会重新出现。
+- **为什么默认不再复制一份进 `.TrashBin`**：原对象并没有被删掉，复制只会让被删对象占双倍容量
+  （目录移动时更是 `batch_copy` 整棵子树）；而 `.TrashBin` 属于 `HIDDEN_DIR_NAMES`，
+  用户在挂载里看不到、也无法通过接口删除它，副本没有任何收益。
+- 想恢复被删对象：从墓碑里移除该 fileId 即可（云端原对象从未移动）。
+  想真正腾出容量：只能在官方 App / 网页端删除，本层无能为力。
 
 ## 崩溃恢复
 

@@ -75,6 +75,16 @@ RANGE_CHUNK_BYTES = int(os.getenv("MCLOUD_RANGE_CHUNK", str(4 * 1024 * 1024)))
 # 单个分片请求的超时（与 SDK 的整文件下载超时分开：分片更小、应当更快返回）
 RANGE_TIMEOUT_SEC = float(os.getenv("MCLOUD_RANGE_TIMEOUT", "60"))
 
+# ==================== 8. 删除（回收站）策略 ====================
+# 云盘接口没有任何删除能力，unlink/rmdir 只能「本地摘除 + 登记墓碑」。
+# 旧实现会额外把对象云内复制一份到 .TrashBin：原对象并未消失，于是被删对象
+# 要占用双倍容量；而 .TrashBin 在本挂载里是隐藏目录（用户既看不到、也无法通过
+# 接口删除），副本没有任何用户可见价值。因此默认不再复制。
+# 置 1 恢复旧行为，便于在官方 App 的同一个目录里集中查看被删对象。
+TRASH_COPY_ENABLED = os.getenv("MCLOUD_TRASH_COPY", "0").strip().lower() in (
+    "1", "true", "yes",
+)
+
 
 def get_effective_cache_limit_mb() -> int:
     """获取实际生效的缓存容量限额 (MB)。

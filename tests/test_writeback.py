@@ -136,16 +136,35 @@ def test_mkdir_creates_cloud_folder(env):
     assert mapper.get_by_path("/docs") is entry
 
 
-def test_unlink_moves_to_trash(env):
-    ops, cloud, mapper, _ = env
+def test_unlink_tombstones_without_cloud_copy(env):
+    """默认删除策略：只登记墓碑 + 本地摘除，云端不产生任何副本。
+
+    接口删不掉原对象，副本只会让被删对象占双倍容量，而 .TrashBin 在本挂载里
+    是隐藏目录，用户既看不到也删不掉——所以默认不复制。
+    """
+    ops, cloud, mapper, tree = env
     mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
         "f_a", "/a.txt", False, parent_inode=1, size=3
     )
     trio.run(ops.unlink, 1, b"a.txt", None)
+
     assert mapper.get_by_path("/a.txt") is None
-    assert cloud.copies == [("f_a", "dir_.TrashBin")] or (
-        len(cloud.copies) == 1 and cloud.copies[0][0] == "f_a"
+    assert cloud.copies == [], "默认不应在云端产生回收站副本"
+    assert "f_a" in tree.tombstones, "必须登记墓碑，否则下次列举会复活"
+
+
+def test_unlink_copies_when_trash_copy_enabled(env, monkeypatch):
+    """显式打开 MCLOUD_TRASH_COPY=1 时保留旧的「复制进 .TrashBin」行为。"""
+    monkeypatch.setattr("mcloud_fuse.utils.trash_bin.TRASH_COPY_ENABLED", True)
+    ops, cloud, mapper, tree = env
+    mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
+        "f_a", "/a.txt", False, parent_inode=1, size=3
     )
+    trio.run(ops.unlink, 1, b"a.txt", None)
+
+    assert mapper.get_by_path("/a.txt") is None
+    assert cloud.copies and cloud.copies[0][0] == "f_a"
+    assert "f_a" in tree.tombstones
 
 
 def test_deleted_file_does_not_resurrect(env):

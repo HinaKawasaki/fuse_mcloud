@@ -5,7 +5,7 @@
 1. 只读：ls 无重复、子目录不串台、cat 内容正确（对应 debug/log_repeat_location.log）；
 2. 写回：create/write/release 后整文件上传，内容可读；
 3. 目录：mkdir 后 ls 可见；
-4. 删除：unlink 改写为复制到 .TrashBin，本地消失；
+4. 删除：unlink 登记墓碑并摘除本地节点（不复制云端副本），本地消失、且不复活；
 5. 覆盖写：改写已有文件后内容更新。
 
 运行： /home/dsh-ssh/venvs/mcloud/bin/python tests/integration/fuse_mount_smoke.py
@@ -248,13 +248,17 @@ def main() -> int:
         run(["bash", "-c", f"echo -n 'replaced' > {mountpoint}/a.txt"])
         check("覆盖写后内容", run(["cat", str(mountpoint / "a.txt")]).stdout, "replaced")
 
-        print("🚀 5. 删除：移入回收站")
+        print("🚀 5. 删除：登记墓碑并本地摘除（接口无删除能力，默认不复制副本）")
         run(["rm", str(mountpoint / "b.txt")])
         check("删除后本地消失", "b.txt" in ls(mountpoint), False)
         trash_ids = [i["id"] for i in cloud.dirs.get(ROOT_ID, []) if i["name"] == ".TrashBin"]
-        check("云端创建了 .TrashBin", len(trash_ids) == 1, True)
-        trash_children = cloud.dirs.get(trash_ids[0], []) if trash_ids else []
-        check("原文件已复制进回收站", any(i["name"] == "b.txt" for i in trash_children), True)
+        check("默认不再创建 .TrashBin 副本", trash_ids, [])
+        # 接口没有删除能力：原对象仍在云端，只是被墓碑屏蔽（这正是它不额外占容量的原因）
+        check(
+            "云端仍保留原对象（由墓碑隐藏）",
+            any(i["name"] == "b.txt" for i in cloud.dirs.get(ROOT_ID, [])),
+            True,
+        )
     finally:
         token = state.get("token")
         try:

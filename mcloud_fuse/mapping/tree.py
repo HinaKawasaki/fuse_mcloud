@@ -10,7 +10,7 @@ from mcloud_fuse.mapping.tombstones import TombstoneStore
 logger = logging.getLogger(__name__)
 
 # 内部系统目录：不出现在任何一层目录列表里
-# - .TrashBin    删除时复制进去的回收站
+# - .TrashBin    历史遗留的回收站目录（仅 MCLOUD_TRASH_COPY=1 的旧行为会写入）
 # - .MCloudHydrate 挂载云盘根时，沙箱外文件的懒搬运暂存目录
 HIDDEN_DIR_NAMES = frozenset({TRASH_BIN_DIR_NAME, HYDRATE_DIR_NAME})
 

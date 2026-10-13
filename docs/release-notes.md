@@ -1,5 +1,39 @@
 # Release Notes
 
+## v0.5.0
+
+### 修复
+
+- **删除不再额外占用一倍云盘容量**。核实了整个官方 Skill 的接口面：只有
+  `api_file_create / api_file_complete / api_search_files / api_create_folder /
+  api_check_exists / api_batch_get_names / api_batch_download_urls / api_batch_copy /
+  api_task_get`，**不存在任何删除或回收站接口**。也就是说原对象永远删不掉，
+  而旧实现还会在删除/改名/目录移动时把对象云内复制一份到 `.TrashBin`：
+  - 被删对象占用**双倍**容量；
+  - 目录移动会 `batch_copy` **整棵子树**再复制一次；
+  - `.TrashBin` 属于 `HIDDEN_DIR_NAMES`，用户在挂载里既看不到也删不掉，副本收益为零。
+
+  现在 `unlink` / `rmdir` / 改名 / 移动改为**只登记墓碑 + 本地摘除**：
+  云端原对象留在原处（本来也没法删），墓碑负责让它不复活。
+  `MCLOUD_TRASH_COPY=1` 可恢复旧的复制行为。
+
+  顺带澄清了能力边界：想真正腾容量只能在官方 App / 网页端删除；
+  历史遗留的 `.TrashBin` 副本同样只能在 App 里清；本层提供不了「回收站一键清理」。
+
+### 文档
+
+- README「已知限制」重写删除相关条目：说明「删除 = 墓碑」「怎么恢复被删对象」
+  「哪些事只能在 App 做」，不再让人误以为本层能释放云盘容量。
+
+### 测试
+
+- `tests/test_trashbin.py` 覆盖两种删除策略：默认**不碰云端**（不建目录、不复制、
+  只登记墓碑、摘除节点），以及 `MCLOUD_TRASH_COPY=1` 时保留旧行为。
+- `tests/test_writeback.py` 的 unlink 用例改为断言「默认无副本 + 墓碑生效」，
+  并新增复制模式的对照用例。
+- `tests/integration/fuse_mount_smoke.py` 的删除阶段改为校验新语义：
+  不创建 `.TrashBin`、云端仍保留原对象、本地不再可见。
+
 ## v0.4.0
 
 ### 新功能
