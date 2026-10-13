@@ -49,17 +49,16 @@ jobs:
           python -m pip install -e '.[dev]'
       - name: 离线单元 / 回归测试
         run: python -m pytest tests -q
-      - name: 覆盖率（仅 3.12 出报告）
-        if: matrix.python-version == '3.12'
-        run: python -m pytest tests -q --cov=mcloud_fuse --cov-report=term-missing
       - name: 命令入口冒烟
         run: mcloud-fuse --version
 
-  fuse-smoke:
-    name: 真实内核挂载冒烟（假云盘）
+  coverage:
+    # 覆盖率把「离线单测」和「真实内核挂载的假云盘用例」合在一起统计：
+    # 只跑单测会低估 fuse_ops（大量回调只有真挂载才走到）。
+    # 这里也顺带当 FUSE 冒烟：需要可用的 /dev/fuse 与 setuid 的 fusermount3，
+    # GitHub 托管 runner 满足；自建 runner 不可用时请调整本 job。
+    name: 覆盖率 + 真实挂载冒烟
     runs-on: ubuntu-latest
-    # 需要一个可用的 /dev/fuse 与 setuid 的 fusermount3；GitHub 托管 runner 满足。
-    # 若在自建 runner 上不可用，可把本 job 删掉或改成 continue-on-error。
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,7 +71,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
-      - name: 只读 / 写回 / 删除全链路
-        run: python tests/integration/fuse_mount_smoke.py
-      - name: 大目录一致性与批量读写删
-        run: python tests/integration/posix_stress.py
+      - name: 离线单测
+        run: coverage run --source=mcloud_fuse -m pytest tests -q
+      - name: 真实挂载：只读 / 写回 / 删除全链路
+        run: coverage run --append --source=mcloud_fuse tests/integration/fuse_mount_smoke.py
+      - name: 真实挂载：大目录一致性与批量读写删
+        run: coverage run --append --source=mcloud_fuse tests/integration/posix_stress.py
+      - name: 覆盖率报告（门槛见 pyproject 的 fail_under）
+        run: coverage report --skip-covered
