@@ -5,7 +5,9 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import requests
 
 from mcloud_fuse.basement import ensure_basement_on_path
 
@@ -31,6 +33,7 @@ from mcloud_fuse.config import (  # noqa: E402
     MIN_PART_SIZE_BYTES,
     MULTIPART_THRESHOLD_BYTES,
     PART_RETRIES,
+    RANGE_TIMEOUT_SEC,
 )
 from mcloud_fuse.router.rate_limiter import global_rate_limiter  # noqa: E402
 from mcloud_fuse.router.retry import retry_call  # noqa: E402
@@ -61,6 +64,18 @@ class CloudItem:
 class MCloudAPIException(Exception):
     """底层 API 统一封装异常"""
     pass
+
+
+def _parse_content_range(value: str) -> Optional[Tuple[int, int, Optional[int]]]:
+    """解析 ``bytes 1024-2047/8192``，返回 ``(start, end, total)``；解析不了返回 ``None``。"""
+    if not value or not value.startswith("bytes "):
+        return None
+    span, _, total_text = value[6:].partition("/")
+    start_text, _, end_text = span.partition("-")
+    if not start_text.strip().isdigit() or not end_text.strip().isdigit():
+        return None
+    total = int(total_text.strip()) if total_text.strip().isdigit() else None
+    return int(start_text), int(end_text), total
 
 
 class DirectClientWrapper:
@@ -354,21 +369,14 @@ class DirectClientWrapper:
         except CloudError as e:
             raise MCloudAPIException(f"获取下载地址失败: {e}") from e
 
-    def download_file(self, file_id: str, local_save_path: Path) -> Path:
-        """把云盘文件下载到本地指定路径，返回本地路径。
-
-        沙箱外文件（挂载云盘根时常见）先云内复制进沙箱暂存目录再下载：
-        官方接口只允许下载沙箱内文件，copy 的源则可以是全盘任意位置。
+    def _resolve_download_url(self, file_id: str) -> str:
+        """取下载直链；沙箱外文件先云内搬运。``download_file`` / ``download_range`` 共用。
 
         注意 `PermissionDeniedError` 有**两种成因**，不能一律当成「在沙箱外」：
         - 目标确实不在沙箱内 → 需要懒搬运；
         - 目标就在沙箱内，只是**刚创建 / 刚上传，路径索引还没收录** →
           稍等重试即可，绝不能送去搬运（否则搬运自己会失败，用户看到 EACCES）。
         """
-        self._ensure_auth()
-        local_save_path = Path(local_save_path)
-        local_save_path.parent.mkdir(parents=True, exist_ok=True)
-
         url, denied = self._try_download_url(file_id)
         if url is None and denied:
             verdict = self._classify_sandbox_denial(file_id)
@@ -385,7 +393,15 @@ class DirectClientWrapper:
                     )
         if not url:
             raise MCloudAPIException(f"未能获取文件 {file_id} 的下载地址（可能不在沙箱内）")
+        return url
 
+    def download_file(self, file_id: str, local_save_path: Path) -> Path:
+        """把云盘文件整文件下载到本地指定路径，返回本地路径。"""
+        self._ensure_auth()
+        local_save_path = Path(local_save_path)
+        local_save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        url = self._resolve_download_url(file_id)
         try:
             written = self._api(transport.stream_download, url, str(local_save_path))
         except (ApiError, OSError) as e:
@@ -393,6 +409,104 @@ class DirectClientWrapper:
 
         logger.debug("下载完成: %s -> %s (%s bytes)", file_id, local_save_path, written)
         return local_save_path
+
+    def download_range(
+        self,
+        file_id: str,
+        local_save_path: Path,
+        offset: int,
+        length: int,
+        expected_total: Optional[int] = None,
+    ) -> Optional[int]:
+        """按 HTTP Range 把 ``[offset, offset+length)`` 写进本地文件的对应位置。
+
+        :param expected_total: 云端元数据里的大小，用于校验分片/整文件是否完整；
+                               不一致时宁可报错，也不留下「半截却看起来完整」的本地文件。
+        :return: 实际写入的字节数；**返回 ``None`` 表示服务端忽略了 Range**（回了 200），
+                 此时整个响应体已经从头写进本地文件，调用方应把该文件当作完整文件。
+        """
+        if length <= 0:
+            return 0
+        self._ensure_auth()
+        local_save_path = Path(local_save_path)
+        local_save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        url = self._resolve_download_url(file_id)
+        return self._api(
+            self._range_get,
+            url,
+            str(local_save_path),
+            int(offset),
+            int(length),
+            expected_total,
+        )
+
+    @staticmethod
+    def _range_get(
+        url: str,
+        dest_path: str,
+        offset: int,
+        length: int,
+        expected_total: Optional[int] = None,
+    ) -> Optional[int]:
+        """下载一个分片并落盘：206 → 写在 offset；200 → 整文件写在 0。
+
+        宁可报错也不猜：``Content-Range`` 起点对不上、总长与元数据不符、或整文件长度
+        不足时都抛异常——否则会留下一个被截断、却被上层当成完整文件的本地副本。
+        """
+        headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+        try:
+            with requests.get(
+                url, headers=headers, stream=True, timeout=RANGE_TIMEOUT_SEC
+            ) as resp:
+                if resp.status_code == 416:
+                    logger.debug("分片 %s+%s 超出文件末尾（HTTP 416）", offset, length)
+                    return 0
+                if resp.status_code not in (200, 206):
+                    raise MCloudAPIException(f"分片下载失败：HTTP {resp.status_code}")
+
+                full_body = resp.status_code == 200
+                if not full_body:
+                    content_range = resp.headers.get("Content-Range", "")
+                    parsed = _parse_content_range(content_range)
+                    if parsed is None or parsed[0] != offset:
+                        raise MCloudAPIException(
+                            "分片响应 Content-Range 异常（无法确认写入位置）: "
+                            f"{content_range!r}，期望 offset={offset}"
+                        )
+                    total = parsed[2]
+                    if (
+                        expected_total is not None
+                        and total is not None
+                        and total != expected_total
+                    ):
+                        raise MCloudAPIException(
+                            f"云端文件大小与元数据不一致：Content-Range 总长 {total}，"
+                            f"元数据 {expected_total}"
+                        )
+
+                mode = "wb" if full_body else "r+b"
+                written = 0
+                with open(dest_path, mode) as sink:
+                    if not full_body:
+                        sink.seek(offset)
+                    for chunk in resp.iter_content(1 << 20):
+                        if chunk:
+                            sink.write(chunk)
+                            written += len(chunk)
+
+                if full_body:
+                    if expected_total is not None and written != expected_total:
+                        raise MCloudAPIException(
+                            f"整文件下载不完整：收到 {written} 字节，期望 {expected_total}"
+                        )
+                    logger.info("服务端不支持 Range（HTTP 200），已整文件下载 %s 字节", written)
+                    return None
+                return written
+        except requests.RequestException as exc:
+            raise MCloudAPIException(f"分片下载失败：网络异常: {exc}") from exc
+        except OSError as exc:
+            raise MCloudAPIException(f"分片下载写盘失败: {exc}") from exc
 
     def _try_download_url(self, file_id: str) -> tuple:
         """取下载直链，返回 ``(url_or_None, 是否被沙箱校验拒绝)``。"""

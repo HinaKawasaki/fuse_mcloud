@@ -45,6 +45,33 @@ class DummyDataCache:
         return Path("/tmp/fuse_ops_test") / file_name
 
 
+class RangeDownloadingWrapper(DownloadingWrapper):
+    """在假云盘上再补一个支持 Range 的 download_range。"""
+
+    def __init__(self, contents, supports_range=True):
+        super().__init__(contents)
+        self.supports_range = supports_range
+        self.range_calls = []
+        self.full_calls = []
+
+    def download_file(self, file_id, local_save_path):
+        self.full_calls.append(file_id)
+        return super().download_file(file_id, local_save_path)
+
+    def download_range(self, file_id, local_save_path, offset, length, expected_total=None):
+        self.range_calls.append((offset, length))
+        path = Path(local_save_path)
+        payload = self.contents[file_id]
+        if not self.supports_range:
+            path.write_bytes(payload)
+            return None
+        chunk = payload[offset : offset + length]
+        with open(path, "r+b") as handle:
+            handle.seek(offset)
+            handle.write(chunk)
+        return len(chunk)
+
+
 def build_ops(data_cache=None, wrapper=None):
     mapper = InodeMapper(root_file_id="root_123")
     tree = DirectoryTree(mapper=mapper)
@@ -142,3 +169,62 @@ def test_concurrent_read_opens_get_independent_handles(tmp_path):
 
     trio.run(ops.release, second.fh)
     assert cache.pinned_count("fid_test") == 0
+
+
+def _make_lazy_read_ops(tmp_path, payload, supports_range=True):
+    wrapper = RangeDownloadingWrapper({"fid_test": payload}, supports_range=supports_range)
+    cache = DataCache(
+        client_wrapper=wrapper,
+        cache_dir=tmp_path / "cache",
+        write_back_dir=tmp_path / "wb",
+        max_size_mb=64,
+        eager_download_limit_bytes=64,  # 让 128 字节的测试文件走按需读
+        range_chunk_bytes=64,
+    )
+    ops = build_ops(data_cache=cache, wrapper=wrapper)
+    doc_attr = trio.run(ops.lookup, 1, b"doc")
+    file_attr = trio.run(ops.lookup, doc_attr.st_ino, b"test.txt")
+    return ops, cache, wrapper, file_attr.st_ino
+
+
+def test_large_file_is_read_on_demand(tmp_path):
+    """超过阈值的文件 open 时不应整文件下载，read 只按需取分片。"""
+    payload = bytes(range(128))
+    ops, cache, wrapper, inode = _make_lazy_read_ops(tmp_path, payload)
+
+    finfo = trio.run(ops.open, inode, os.O_RDONLY)
+    assert wrapper.full_calls == [], "open 不应触发整文件下载"
+    assert cache.is_partial("fid_test") is True
+
+    assert trio.run(ops.read, finfo.fh, 0, 16) == payload[:16]
+    assert wrapper.range_calls == [(0, 64)]
+
+    assert trio.run(ops.read, finfo.fh, 64, 16) == payload[64:80]
+    assert wrapper.range_calls == [(0, 64), (64, 64)]
+
+    # 已覆盖的分片不再重复请求
+    assert trio.run(ops.read, finfo.fh, 0, 16) == payload[:16]
+    assert len(wrapper.range_calls) == 2
+
+    trio.run(ops.release, finfo.fh)
+    assert cache.pinned_count("fid_test") == 0
+
+
+def test_lazy_read_falls_back_when_server_ignores_range(tmp_path):
+    """服务端忽略 Range 时，一次读就把整文件落盘并转为完整缓存。"""
+    payload = bytes(range(128))
+    ops, cache, wrapper, inode = _make_lazy_read_ops(
+        tmp_path, payload, supports_range=False
+    )
+
+    finfo = trio.run(ops.open, inode, os.O_RDONLY)
+    assert trio.run(ops.read, finfo.fh, 0, 16) == payload[:16]
+
+    assert cache.is_partial("fid_test") is False
+    assert wrapper.full_calls == []  # 走的是 download_range 的 200 分支
+    assert wrapper.range_calls == [(0, 64)]
+    # 后续读取直接命中本地完整缓存
+    assert trio.run(ops.read, finfo.fh, 64, 16) == payload[64:80]
+    assert len(wrapper.range_calls) == 1
+
+    trio.run(ops.release, finfo.fh)

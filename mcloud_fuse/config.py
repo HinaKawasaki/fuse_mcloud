@@ -64,6 +64,17 @@ UPLOAD_KEEP_CACHE = os.getenv("MCLOUD_UPLOAD_KEEP_CACHE", "1").strip().lower() n
     "0", "false", "no",
 )
 
+# ==================== 7. 按需（Range）读取大文件 ====================
+# 大于该大小的文件不再「打开即整文件下载」，而是在 read 时按块拉取；
+# 置 0 关闭按需读（总是整文件下载，行为与 v0.3.0 一致）。
+EAGER_DOWNLOAD_LIMIT_BYTES = int(
+    os.getenv("MCLOUD_EAGER_DOWNLOAD_LIMIT", str(256 * 1024 * 1024))
+)
+# 按需读的单次预取粒度（实际请求会向上取整到该大小的整数倍）
+RANGE_CHUNK_BYTES = int(os.getenv("MCLOUD_RANGE_CHUNK", str(4 * 1024 * 1024)))
+# 单个分片请求的超时（与 SDK 的整文件下载超时分开：分片更小、应当更快返回）
+RANGE_TIMEOUT_SEC = float(os.getenv("MCLOUD_RANGE_TIMEOUT", "60"))
+
 
 def get_effective_cache_limit_mb() -> int:
     """获取实际生效的缓存容量限额 (MB)。

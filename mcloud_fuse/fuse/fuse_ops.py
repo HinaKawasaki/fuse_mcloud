@@ -62,6 +62,8 @@ class MCloudFuseOps(pyfuse3.Operations):
         # fh 从 2**32 起另行分配：同一 inode 被并发打开多次时，若复用 inode 当 fh，
         # 句柄会互相覆盖、release 还可能关掉别人的 fd。
         self._read_fds: Dict[int, int] = {}
+        # 按需读句柄 fh -> file_id（大文件不持有 fd，靠钉住 + 每次按 Range 补齐）
+        self._read_lazy: Dict[int, str] = {}
         # 读句柄 fh -> 被钉住的缓存 file_id
         self._read_pins: Dict[int, str] = {}
         self._next_read_fh = 1 << 32
@@ -347,10 +349,12 @@ class MCloudFuseOps(pyfuse3.Operations):
         return buffer_path, size
 
     def _open_read_handle_sync(self, inode: int) -> tuple:
-        """准备本地文件并打开一个持续持有的读 fd，返回 ``(fd, 被钉住的 file_id)``。
+        """准备本地文件，返回 ``(fd, 被钉住的 file_id, 按需读的 file_id)``。
 
-        钉住（``acquire_for_read``）保证该缓存条目在 ``release_read`` 之前不会被
-        LRU 淘汰；返回 ``None`` 表示读的是未关闭写句柄的暂存文件，无需钉住。
+        - 普通文件：整文件下载/复用缓存，持有 fd（``pread`` 读取）；
+        - 大文件（超过 ``MCLOUD_EAGER_DOWNLOAD_LIMIT``）：只建一个大小已知的空壳，
+          不下载内容，read 时按 Range 拉取。此时没有 fd，靠钉住保证路径稳定；
+        - 未关闭写句柄的暂存文件：直接读它，无需钉住，也没有按需读。
         """
         entry = self.mapper.get_by_inode(inode)
         if entry is None:
@@ -361,21 +365,23 @@ class MCloudFuseOps(pyfuse3.Operations):
         # 若有未关闭的写句柄，直接读它的暂存文件（此时云端还是占位 fileId）
         state = self._write_state.get(inode)
         if state is not None:
-            pinned: Optional[str] = None
             local_path = state["buffer"]
-        else:
-            pinned = entry.file_id
-            local_path = self.data_cache.acquire_for_read(
-                pinned, entry.path.rstrip("/").rsplit("/", 1)[-1]
-            )
+            return os.open(local_path, os.O_RDONLY), None, None
 
+        file_name = entry.path.rstrip("/").rsplit("/", 1)[-1]
+        if self.data_cache.should_read_lazily(entry.size):
+            # 大文件：不下载，交给 read 按需拉取
+            self.data_cache.open_lazy(entry.file_id, file_name, entry.size)
+            return None, entry.file_id, entry.file_id
+
+        pinned = entry.file_id
+        local_path = self.data_cache.acquire_for_read(pinned, file_name)
         try:
             fd = os.open(local_path, os.O_RDONLY)
         except OSError:
-            if pinned is not None:
-                self.data_cache.release_read(pinned)
+            self.data_cache.release_read(pinned)
             raise
-        return fd, pinned
+        return fd, pinned, None
 
     async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:
         """[FUSE System Call] 打开文件；写模式准备写回缓存。"""
@@ -400,13 +406,16 @@ class MCloudFuseOps(pyfuse3.Operations):
                 }
                 self._fh_map[inode] = buffer_path
             else:
-                fd, pinned = await trio.to_thread.run_sync(
+                fd, pinned, lazy = await trio.to_thread.run_sync(
                     self._open_read_handle_sync, inode
                 )
                 fh = self._alloc_read_fh()
-                self._read_fds[fh] = fd
+                if fd is not None:
+                    self._read_fds[fh] = fd
                 if pinned is not None:
                     self._read_pins[fh] = pinned
+                if lazy is not None:
+                    self._read_lazy[fh] = lazy
         except pyfuse3.FUSEError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -424,6 +433,14 @@ class MCloudFuseOps(pyfuse3.Operations):
     async def read(self, fh: int, off: int, size: int) -> bytes:
         """[FUSE System Call] 读取文件内容 (Offset & Size)"""
         def _read():
+            lazy_file_id = self._read_lazy.get(fh)
+            if lazy_file_id is not None:
+                # 按需读：先确保这一段落盘，路径可能因升级为完整缓存而变化
+                local_path = self.data_cache.ensure_range(lazy_file_id, off, size)
+                with open(local_path, "rb") as handle:
+                    handle.seek(off)
+                    return handle.read(size)
+
             fd = self._read_fds.get(fh)
             if fd is not None:
                 # pread 不改文件偏移，多个并发 read 也不需要加锁
@@ -478,6 +495,13 @@ class MCloudFuseOps(pyfuse3.Operations):
 
     async def release(self, fh: int) -> None:
         """[FUSE System Call] 关闭文件：上传（如需要）并把写回暂存收尾为读缓存。"""
+        lazy = self._read_lazy.pop(fh, None)
+        if lazy is not None:
+            # 按需读句柄没有 fd，只需解除钉住（此时才会真正删除被淘汰的部分文件）
+            self._read_pins.pop(fh, None)
+            self.data_cache.release_read(lazy)
+            return
+
         fd = self._read_fds.pop(fh, None)
         if fd is not None:
             # 读句柄：关掉 fd 并释放对缓存条目的钉住（此时才会真正删除被淘汰的文件）

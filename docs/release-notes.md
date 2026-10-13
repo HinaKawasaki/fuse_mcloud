@@ -1,5 +1,33 @@
 # Release Notes
 
+## v0.4.0
+
+### 新功能
+
+- **大文件按需（Range）读取**：超过 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（默认 256MiB）的文件
+  在 `open()` 时不再整文件下载，而是建一个大小已知的本地空壳，`read()` 时按
+  `MCLOUD_RANGE_CHUNK`（默认 4MiB）对齐拉取缺口，重复读不再重复下载。
+  只读大文件（例如查看日志尾部、读取媒体头尾）不再付出「整文件下载 + 整文件磁盘占用」的成本。
+  - **服务端不支持 Range 时自动降级**：若下载直链忽略 `Range` 并返回 200，本次响应体
+    会整文件落盘并立即升级为完整缓存，行为与旧版一致，不会退化成「每次读都重下整文件」。
+  - **部分文件绝不冒充完整文件**：部分内容只对 `ensure_range` 可见；覆盖写、`truncate`、
+    `rename`（需要上传整文件）等路径一律先经 `ensure_complete` 补齐，避免把半截文件传上云。
+  - 新增 `scripts/check_range_support.py`：探测下载直链是否真的支持 Range。
+- 新增环境变量 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（`0` = 关闭按需读，回到整文件下载）、
+  `MCLOUD_RANGE_CHUNK`、`MCLOUD_RANGE_TIMEOUT`。
+
+### 工程化
+
+- CI 的 `ruff` 检查扩展到 `scripts/`；顺带修掉 `scripts/setup_basement.py` 的
+  未用导入、导入排序与结尾换行。
+
+### 测试
+
+- 新增 `tests/test_range_read.py`：只取缺口、重复读不重复下载、服务端忽略 Range 时
+  只下载一次且转为完整缓存、越界分片只取到文件末尾、`MCLOUD_EAGER_DOWNLOAD_LIMIT=0`
+  时退回整文件下载，以及「写路径必须拿到完整文件」。
+- `tests/test_fuse_ops.py` 增加按需读的端到端用例（open 不下载 → read 分片 → release 解除钉住）。
+
 ## v0.3.0
 
 本次是**工程化版本**：用户可见功能与 v0.2.1 一致，重点是把仓库从「clone 下来改源码跑」

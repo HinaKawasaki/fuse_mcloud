@@ -31,6 +31,8 @@
   避免云端旧对象在下次列举时「复活」；墓碑落盘，重启仍生效。
 - **索引最终一致性处理**：云盘搜索索引有延迟，新建对象会进入「索引宽限期」，不会被对账清理误删。
 - **大文件多段上传**：超过阈值自动切分（≥5MiB/片）按序上传，分片级重试，失败自动回退单段上传。
+- **大文件按需读取**：超过阈值（默认 256MiB）的文件不再「打开即整文件下载」，
+  `read` 时按 4MiB 分片对齐拉取，重复读不重下；服务端若不支持 HTTP Range 会自动降级为整文件下载。
 - **统一限流与退避重试**：所有云盘请求经过线程安全的并发 / RPS 限流与指数退避；权限与入参错误不重试。
 - **崩溃恢复**：写回操作登记持久化日志，进程异常退出后，下次启动自动补传未完成的文件。
 
@@ -213,6 +215,9 @@ sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mc
 | `MCLOUD_ROOT` | `sandbox` | 挂载根：`sandbox` 只暴露沙箱；`cloud` 暴露云盘根（沙箱外文件懒搬运） |
 | `MCLOUD_HYDRATE_DIR` | `.MCloudHydrate` | 沙箱内的懒搬运暂存目录名（挂载云盘根时使用） |
 | `MCLOUD_BASEMENT_DIR` | 自动探测 | 官方 Skill 所在目录（`basement` 或 `basement/scripts`），装在仓库外时用它指定 |
+| `MCLOUD_EAGER_DOWNLOAD_LIMIT` | `268435456`（256MiB） | 超过该大小的文件走按需（Range）读取；`0` = 关闭，总是整文件下载 |
+| `MCLOUD_RANGE_CHUNK` | `4194304`（4MiB） | 按需读的单次预取粒度 |
+| `MCLOUD_RANGE_TIMEOUT` | `60` | 单个分片请求的超时秒数 |
 
 `MAX_CACHE_SIZE_MB` 留 `None` 时按物理内存的 25% 自动设定。
 
@@ -240,6 +245,9 @@ python3 tests/integration/posix_stress.py       # 大目录一致性、递归遍
 ### 真实云盘端到端（需要登录态）
 
 ```bash
+# 探测下载直链是否支持 HTTP Range（决定大文件按需读能否真正生效；只发两次 1KiB 请求）
+python3 scripts/check_range_support.py
+
 # 只读校验：官方 CLI 与本地列举一致、cat 字节一致
 python3 tests/integration/real_mount_smoke.py
 
@@ -306,6 +314,10 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
   `MCLOUD_UPLOAD_KEEP_CACHE=0` 可在上传后直接删除本地副本。
 - **POSIX 语义不完整**：`chmod` / `chown` / 时间戳设置被静默忽略；不支持 `flock` / `fcntl` 锁、xattr、
   符号链接 / 硬链接、`allow_other` 多用户。
+- **按需读取只覆盖「纯读」**：大文件按需拉取分片，但一旦发生覆盖写 / `truncate` / `rename`
+  （需要整文件上传）或读取的文件不足阈值，就会退回整文件下载——这是云盘接口的语义限制。
+  另外按需读的本地空壳会按文件大小计入缓存容量（`MCLOUD_EAGER_DOWNLOAD_LIMIT=0` 可关闭）。
+  分片长度会与元数据 `size` 校验：不一致时直接报错，而不是留下一个被截断的本地副本。
 - **元数据 TTL 60s**：远端改动最长约 1 分钟才可见；索引宽限期内远端删除也可能被暂时隐藏。
 - 文件大小以云端元数据为准；若云端 size 不准，读取会被内核按 `st_size` 截断。
 
@@ -339,6 +351,8 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 - [x] v0.3.0 工程化：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
       版本单一来源、GitHub Actions CI（ruff + pytest + 覆盖率门槛）、
       修复读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除）
+- [x] v0.4.0 大文件按需读取：超过阈值不再整文件下载，`read` 按 Range 分片拉取；
+      服务端不支持 Range 时自动降级；新增 `scripts/check_range_support.py` 探测直链能力
 
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。

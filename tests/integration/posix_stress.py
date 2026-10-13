@@ -87,6 +87,16 @@ class StressCloud:
         path.write_bytes(self.content[file_id])
         return path
 
+    def download_range(self, file_id, local_save_path, offset, length, expected_total=None):
+        """模拟支持 HTTP Range 的下载直链（按需读取路径会用到这里）。"""
+        payload = self.content[file_id]
+        chunk = payload[offset : offset + length]
+        path = Path(local_save_path)
+        with open(path, "r+b") as handle:
+            handle.seek(offset)
+            handle.write(chunk)
+        return len(chunk)
+
     def upload_file(self, local_file_path, target_dir_id, name=None):
         import uuid
 
@@ -138,11 +148,16 @@ def main() -> int:
     # 缓存限额可用环境变量调小（如 MCLOUD_STRESS_CACHE_MB=1）来强制在读的过程中
     # 触发 LRU 淘汰，用来复现「淘汰把正在读的文件删掉」这类竞态。
     cache_mb = int(os.environ.get("MCLOUD_STRESS_CACHE_MB", "128"))
+    # 按需读阈值同样可用环境变量压小（如 MCLOUD_STRESS_EAGER_LIMIT=1024），
+    # 让所有文件都走 Range 分片读取，从而真实内核下覆盖按需读路径。
+    eager_raw = os.environ.get("MCLOUD_STRESS_EAGER_LIMIT", "").strip()
+    eager_limit = int(eager_raw) if eager_raw else None
     cache = DataCache(
         client_wrapper=cloud,
         cache_dir=workdir / "cache",
         write_back_dir=workdir / "wb",
         max_size_mb=cache_mb,
+        eager_download_limit_bytes=eager_limit,
     )
     ops = MCloudFuseOps(mapper, tree, MetaCache(ttl=5.0), cache, cloud)
 

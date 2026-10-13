@@ -4,12 +4,15 @@ import os
 import shutil
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper
 from mcloud_fuse.config import (
     CACHE_DIR,
+    EAGER_DOWNLOAD_LIMIT_BYTES,
+    RANGE_CHUNK_BYTES,
     WRITE_BACK_DIR,
     get_effective_cache_limit_mb,
 )
@@ -21,6 +24,38 @@ def _safe_component(name: str) -> str:
     """把云端文件名清洗成可安全用作本地缓存文件名的片段。"""
     cleaned = str(name or "").replace("/", "_").replace("\\", "_").strip()
     return cleaned or "unnamed"
+
+
+@dataclass
+class _PartialFile:
+    """按需读取中的「部分文件」：大小已知，内容按块填充。
+
+    只有 :meth:`DataCache.ensure_range` 会读它。所有需要完整内容的地方
+    （覆盖写、截断、rename 上传）必须走 :meth:`DataCache.ensure_complete`，
+    绝不能把部分文件当完整文件用——否则会静默截断数据。
+    """
+
+    path: Path
+    name: str
+    size: int
+    covered: List[Tuple[int, int]] = field(default_factory=list)
+
+    def covers(self, start: int, end: int) -> bool:
+        for begin, stop in self.covered:
+            if begin <= start and end <= stop:
+                return True
+        return False
+
+    def add(self, start: int, end: int) -> None:
+        if end <= start:
+            return
+        merged: List[Tuple[int, int]] = []
+        for begin, stop in sorted(self.covered + [(start, end)]):
+            if merged and begin <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+            else:
+                merged.append((begin, stop))
+        self.covered = merged
 
 
 class DataCache:
@@ -35,12 +70,23 @@ class DataCache:
         cache_dir: Path = CACHE_DIR,
         write_back_dir: Path = WRITE_BACK_DIR,
         max_size_mb: Optional[int] = None,
+        eager_download_limit_bytes: Optional[int] = None,
+        range_chunk_bytes: Optional[int] = None,
     ):
         self.wrapper = client_wrapper
         self.cache_dir = Path(cache_dir)
         self.write_back_dir = Path(write_back_dir)
         limit_mb = max_size_mb if max_size_mb is not None else get_effective_cache_limit_mb()
         self.max_bytes = max(1, int(limit_mb)) * 1024 * 1024
+        # 大于该大小的文件走按需（Range）读取；0 表示关闭该特性
+        self.eager_download_limit_bytes = (
+            EAGER_DOWNLOAD_LIMIT_BYTES
+            if eager_download_limit_bytes is None
+            else int(eager_download_limit_bytes)
+        )
+        self.range_chunk_bytes = max(
+            1, RANGE_CHUNK_BYTES if range_chunk_bytes is None else int(range_chunk_bytes)
+        )
 
         self._lock = threading.RLock()
         # 维护 file_id -> 本地缓存 Path
@@ -54,6 +100,8 @@ class DataCache:
         self._pinned: Dict[str, int] = {}
         # 被淘汰/作废、但因仍有句柄占用而推迟删除的本地文件
         self._deferred_deletes: Dict[str, list] = {}
+        # 按需读取中的部分文件 file_id -> _PartialFile
+        self._partial_paths: Dict[str, _PartialFile] = {}
         # 写回暂存 key -> 本地路径
         self._write_paths: Dict[str, Path] = {}
         # 写回日志：崩溃恢复时用来把未上传的暂存文件补传回云盘
@@ -127,6 +175,12 @@ class DataCache:
 
     def _acquire_read_path(self, file_id: str, file_name: str, *, pin: bool) -> Path:
         with self._lock:
+            is_partial = file_id in self._partial_paths
+        if is_partial:
+            # 需要完整内容（覆盖写 / 截断 / rename 上传）→ 先把部分文件补齐
+            return self.ensure_complete(file_id, pin=pin)
+
+        with self._lock:
             existing = self._cached_path_nolock(file_id)
             if existing is not None:
                 self._access_time[file_id] = time.time()
@@ -164,23 +218,26 @@ class DataCache:
             self._access_time[file_id] = time.time()
 
     def invalidate_file_cache(self, file_id: str):
-        """主动删除某文件的本地缓存。
+        """主动删除某文件的本地缓存（完整文件或按需读的部分文件）。
 
         若该条目仍被打开的读句柄占用，则只摘掉缓存映射、把删除推迟到最后一个
         句柄 :meth:`release_read` 之后执行（POSIX 语义：已打开的文件不会凭空消失）。
         """
         with self._lock:
             path = self._cache_map.pop(file_id, None)
+            partial = self._partial_paths.pop(file_id, None)
             self._access_time.pop(file_id, None)
-            if path is not None and self._pinned.get(file_id, 0) > 0:
-                self._deferred_deletes.setdefault(file_id, []).append(path)
+            doomed = [item for item in (path, partial.path if partial else None) if item]
+            if doomed and self._pinned.get(file_id, 0) > 0:
+                self._deferred_deletes.setdefault(file_id, []).extend(doomed)
                 logger.debug(
                     "缓存条目仍被 %s 个句柄占用，延迟删除: %s",
                     self._pinned.get(file_id, 0),
-                    path,
+                    doomed,
                 )
                 return
-        self._unlink_quietly(path)
+        for item in doomed:
+            self._unlink_quietly(item)
 
     @staticmethod
     def _unlink_quietly(path: Optional[Path]) -> None:
@@ -193,9 +250,10 @@ class DataCache:
             logger.warning("删除本地缓存失败: %s", exc)
 
     def _get_current_cache_size(self) -> int:
-        """计算当前缓存占用的总字节数"""
+        """计算当前缓存占用的总字节数（完整文件 + 按需读的部分文件）"""
         with self._lock:
             paths = list(self._cache_map.values())
+            paths.extend(partial.path for partial in self._partial_paths.values())
         total = 0
         for path in paths:
             try:
@@ -226,6 +284,159 @@ class DataCache:
                 oldest_file_id = min(candidates, key=self._access_time.get)
             logger.info("缓存超出限额，触发 LRU 淘汰旧文件: file_id=%s", oldest_file_id)
             self.invalidate_file_cache(oldest_file_id)
+
+    # ------------------------------------------------------------------
+    # 按需（Range）读取
+    # ------------------------------------------------------------------
+
+    def should_read_lazily(self, size: int) -> bool:
+        """该大小的文件是否值得走按需读取（``eager_download_limit_bytes`` 为 0 时关闭）。"""
+        return (
+            self.eager_download_limit_bytes > 0
+            and int(size) > self.eager_download_limit_bytes
+        )
+
+    def is_partial(self, file_id: str) -> bool:
+        """该 file_id 当前是否为「只落了一部分」的按需读文件。"""
+        with self._lock:
+            return file_id in self._partial_paths
+
+    def open_lazy(self, file_id: str, file_name: str, size: int) -> Path:
+        """为按需读准备一个「大小已知、内容待填充」的本地文件，并钉住该条目。
+
+        与 :meth:`acquire_for_read` 一样，句柄关闭时必须调用 :meth:`release_read`。
+        返回的路径**只保证**在句柄存续期间可用；需要完整内容请用 :meth:`ensure_complete`。
+        """
+        size = max(0, int(size))
+        with self._lock:
+            partial = self._partial_paths.get(file_id)
+            if partial is not None:
+                partial.size = max(partial.size, size)
+                self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+                self._access_time[file_id] = time.time()
+                return partial.path
+
+        path = self.cache_dir / f"{file_id}_{_safe_component(file_name)}.partial"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(size)
+
+        with self._lock:
+            self._partial_paths[file_id] = _PartialFile(path=path, name=file_name, size=size)
+            self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+            self._access_time[file_id] = time.time()
+        logger.info("文件 %s 启用按需读取（%s bytes，不再整文件下载）", file_id, size)
+        return path
+
+    def ensure_range(self, file_id: str, offset: int, length: int) -> Path:
+        """确保 ``[offset, offset+length)`` 已落盘，返回当前可读路径。
+
+        返回值可能是被升级后的完整缓存文件（服务端不支持 Range 时），因此调用方
+        每次都应使用新返回的路径，而不是自己缓存 open 时的路径。
+        """
+        offset = max(0, int(offset))
+        length = max(0, int(length))
+
+        with self._lock:
+            complete = self._cached_path_nolock(file_id)
+            if complete is not None:
+                return complete
+            partial = self._partial_paths.get(file_id)
+
+        if partial is None:
+            raise FileNotFoundError(f"按需读文件不存在: {file_id}")
+        if length == 0 or offset >= partial.size:
+            return partial.path
+
+        end = min(partial.size, offset + length)
+        chunk = self.range_chunk_bytes
+        cursor = (offset // chunk) * chunk
+        while cursor < end:
+            block_end = min(partial.size, cursor + chunk)
+            if not partial.covers(cursor, block_end):
+                promoted = self._fetch_block(file_id, partial, cursor, block_end)
+                if promoted is not None:
+                    return promoted
+            cursor = block_end
+        return partial.path
+
+    def _fetch_block(
+        self, file_id: str, partial: "_PartialFile", start: int, end: int
+    ) -> Optional[Path]:
+        """拉取一个分片。返回 ``None`` = 仍是部分文件；返回 Path = 已升级为完整文件。"""
+        with self._download_lock(file_id):
+            if partial.covers(start, end):
+                return None
+            logger.debug("按需读取分片: %s [%s, %s)", file_id, start, end)
+            written = self.wrapper.download_range(
+                file_id, partial.path, start, end - start, partial.size
+            )
+            if written is None:
+                # 服务端忽略了 Range（HTTP 200）：整个文件已经从头写进本地
+                logger.info(
+                    "文件 %s 的下载直链不支持 Range，已整文件落盘并转为完整缓存", file_id
+                )
+                return self._promote_partial(file_id, partial)
+            partial.add(start, start + max(0, int(written)))
+            if partial.covers(0, partial.size):
+                return self._promote_partial(file_id, partial)
+            return None
+
+    def _promote_partial(self, file_id: str, partial: "_PartialFile") -> Path:
+        """把部分文件升级为完整读缓存条目（保留原有的钉住计数）。"""
+        final = self.cache_dir / f"{file_id}_{_safe_component(partial.name)}"
+        try:
+            os.replace(partial.path, final)
+        except OSError as exc:
+            logger.warning("部分文件转完整缓存失败（继续使用原路径）: %s", exc)
+            final = partial.path
+        with self._lock:
+            self._partial_paths.pop(file_id, None)
+            self._cache_map[file_id] = final
+            self._access_time[file_id] = time.time()
+        return final
+
+    def ensure_complete(self, file_id: str, *, pin: bool = False) -> Path:
+        """把按需读的部分文件补齐为完整本地缓存。
+
+        覆盖写 / 截断 / rename 上传等需要完整内容的地方都必须经过这里，
+        否则会把只有前几 MB 的部分文件当真文件上传，静默截断数据。
+        """
+        with self._lock:
+            complete = self._cached_path_nolock(file_id)
+            if complete is not None:
+                self._access_time[file_id] = time.time()
+                if pin:
+                    self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+                return complete
+            partial = self._partial_paths.get(file_id)
+            name = partial.name if partial is not None else file_id
+
+        with self._download_lock(file_id):
+            with self._lock:
+                complete = self._cached_path_nolock(file_id)
+                if complete is not None:
+                    self._access_time[file_id] = time.time()
+                    if pin:
+                        self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+                    return complete
+                partial = self._partial_paths.get(file_id)
+                if partial is not None:
+                    name = partial.name
+
+            final = self.cache_dir / f"{file_id}_{_safe_component(name)}"
+            logger.info("按需读文件需要完整内容，改为整文件下载: %s", file_id)
+            self.wrapper.download_file(file_id=file_id, local_save_path=final)
+
+            with self._lock:
+                self._partial_paths.pop(file_id, None)
+                self._cache_map[file_id] = final
+                self._access_time[file_id] = time.time()
+                if pin:
+                    self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+            if partial is not None:
+                self._unlink_quietly(partial.path)
+            return final
 
     # ------------------------------------------------------------------
     # 写回暂存 (write-back)
