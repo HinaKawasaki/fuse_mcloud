@@ -50,6 +50,8 @@ python3 -m pytest tests -q
 # 2) 假后端真实挂载
 python3 tests/integration/fuse_mount_smoke.py
 python3 tests/integration/posix_stress.py
+# 小缓存强制 LRU 淘汰：回归「淘汰把正在读的文件删掉」的竞态（见 tests/integration/posix_stress.py 阶段 3c）
+MCLOUD_STRESS_CACHE_MB=1 MCLOUD_STRESS_FILE_BYTES=16384 python3 tests/integration/posix_stress.py
 
 # 3) 真机（先登录）
 python3 basement/scripts/main.py login

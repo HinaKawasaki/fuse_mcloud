@@ -53,8 +53,19 @@ class MCloudFuseOps(pyfuse3.Operations):
         # 已删除 fileId 的墓碑集合（由 DirectoryTree 持有，可持久化）
         self.tombstones = tree.tombstones
 
-        # 已打开文件句柄 inode -> 本地读缓存 Path
+        # 已打开文件句柄 inode -> 本地读缓存 Path（仅写句柄使用，读句柄见 _read_fds）
         self._fh_map: Dict[int, "os.PathLike"] = {}
+        # 读句柄 fh -> 已打开的本地 fd。
+        # 为什么 open 时就持有 fd：read() 原先每次按路径重新 open，一旦 LRU 淘汰
+        # 把该路径删掉（下载另一个文件就可能触发），正在读的文件会突然报 EBADF。
+        # 持有 fd 后即使路径被 unlink，数据仍随句柄存活，符合 POSIX 语义。
+        # fh 从 2**32 起另行分配：同一 inode 被并发打开多次时，若复用 inode 当 fh，
+        # 句柄会互相覆盖、release 还可能关掉别人的 fd。
+        self._read_fds: Dict[int, int] = {}
+        # 读句柄 fh -> 被钉住的缓存 file_id
+        self._read_pins: Dict[int, str] = {}
+        self._next_read_fh = 1 << 32
+        self._fh_lock = threading.Lock()
         # 写回状态：inode -> {buffer, dirty, size, base_file_id, target_dir_inode, name}
         self._write_state: Dict[int, dict] = {}
         # 正在进行的写回上传：inode -> Event。
@@ -298,20 +309,11 @@ class MCloudFuseOps(pyfuse3.Operations):
     # 打开 / 读取 / 写回
     # ==================================================================
 
-    def _open_read_sync(self, inode: int):
-        entry = self.mapper.get_by_inode(inode)
-        if entry is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-        if entry.is_dir:
-            raise pyfuse3.FUSEError(errno.EISDIR)
-        # 若有未关闭的写句柄，直接读它的暂存文件（此时云端还是占位 fileId）
-        state = self._write_state.get(inode)
-        if state is not None:
-            return state["buffer"]
-        return self.data_cache.prepare_file_for_read(
-            file_id=entry.file_id,
-            file_name=entry.path.rstrip("/").rsplit("/", 1)[-1],
-        )
+    def _alloc_read_fh(self) -> int:
+        with self._fh_lock:
+            fh = self._next_read_fh
+            self._next_read_fh += 1
+            return fh
 
     def _open_write_sync(self, inode: int, flags: int):
         entry = self.mapper.get_by_inode(inode)
@@ -330,15 +332,50 @@ class MCloudFuseOps(pyfuse3.Operations):
             )
             size = 0
         else:
-            read_path = self.data_cache.prepare_file_for_read(entry.file_id, name)
-            buffer_path = self.data_cache.create_write_buffer(
-                f"inode-{inode}",
-                initial_path=read_path,
-                target_dir_id=target_dir_id,
-                file_name=name,
-            )
+            # 复制旧内容到写回暂存期间必须钉住缓存，否则并发的 LRU 淘汰会把源文件删掉
+            read_path = self.data_cache.acquire_for_read(entry.file_id, name)
+            try:
+                buffer_path = self.data_cache.create_write_buffer(
+                    f"inode-{inode}",
+                    initial_path=read_path,
+                    target_dir_id=target_dir_id,
+                    file_name=name,
+                )
+            finally:
+                self.data_cache.release_read(entry.file_id)
             size = entry.size
         return buffer_path, size
+
+    def _open_read_handle_sync(self, inode: int) -> tuple:
+        """准备本地文件并打开一个持续持有的读 fd，返回 ``(fd, 被钉住的 file_id)``。
+
+        钉住（``acquire_for_read``）保证该缓存条目在 ``release_read`` 之前不会被
+        LRU 淘汰；返回 ``None`` 表示读的是未关闭写句柄的暂存文件，无需钉住。
+        """
+        entry = self.mapper.get_by_inode(inode)
+        if entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if entry.is_dir:
+            raise pyfuse3.FUSEError(errno.EISDIR)
+
+        # 若有未关闭的写句柄，直接读它的暂存文件（此时云端还是占位 fileId）
+        state = self._write_state.get(inode)
+        if state is not None:
+            pinned: Optional[str] = None
+            local_path = state["buffer"]
+        else:
+            pinned = entry.file_id
+            local_path = self.data_cache.acquire_for_read(
+                pinned, entry.path.rstrip("/").rsplit("/", 1)[-1]
+            )
+
+        try:
+            fd = os.open(local_path, os.O_RDONLY)
+        except OSError:
+            if pinned is not None:
+                self.data_cache.release_read(pinned)
+            raise
+        return fd, pinned
 
     async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:
         """[FUSE System Call] 打开文件；写模式准备写回缓存。"""
@@ -361,9 +398,15 @@ class MCloudFuseOps(pyfuse3.Operations):
                     "target_dir_inode": entry.parent_inode,
                     "name": name,
                 }
-                local_path = buffer_path
+                self._fh_map[inode] = buffer_path
             else:
-                local_path = await trio.to_thread.run_sync(self._open_read_sync, inode)
+                fd, pinned = await trio.to_thread.run_sync(
+                    self._open_read_handle_sync, inode
+                )
+                fh = self._alloc_read_fh()
+                self._read_fds[fh] = fd
+                if pinned is not None:
+                    self._read_pins[fh] = pinned
         except pyfuse3.FUSEError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -371,19 +414,23 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise self._to_fuse_error(exc) from exc
 
         fi = pyfuse3.FileInfo()
-        fi.fh = inode
+        if writable:
+            fi.fh = inode
+        else:
+            fi.fh = fh
         fi.keep_cache = False
-        self._fh_map[inode] = local_path
         return fi
 
     async def read(self, fh: int, off: int, size: int) -> bytes:
         """[FUSE System Call] 读取文件内容 (Offset & Size)"""
-        local_path = self._fh_map.get(fh)
-        if local_path is None:
-            raise pyfuse3.FUSEError(errno.EBADF)
-
         def _read():
-            if not local_path.exists():
+            fd = self._read_fds.get(fh)
+            if fd is not None:
+                # pread 不改文件偏移，多个并发 read 也不需要加锁
+                return os.pread(fd, size, off)
+            # 写句柄（fh == inode）：直接读写回暂存文件
+            local_path = self._fh_map.get(fh)
+            if local_path is None or not local_path.exists():
                 raise pyfuse3.FUSEError(errno.EBADF)
             with open(local_path, "rb") as handle:
                 handle.seek(off)
@@ -431,6 +478,18 @@ class MCloudFuseOps(pyfuse3.Operations):
 
     async def release(self, fh: int) -> None:
         """[FUSE System Call] 关闭文件：上传（如需要）并把写回暂存收尾为读缓存。"""
+        fd = self._read_fds.pop(fh, None)
+        if fd is not None:
+            # 读句柄：关掉 fd 并释放对缓存条目的钉住（此时才会真正删除被淘汰的文件）
+            pinned = self._read_pins.pop(fh, None)
+            try:
+                await trio.to_thread.run_sync(os.close, fd)
+            except OSError as exc:  # noqa: BLE001 - 关不掉不应让 release 失败
+                logger.warning("关闭读句柄 fd=%s 失败: %s", fd, exc)
+            if pinned is not None:
+                self.data_cache.release_read(pinned)
+            return
+
         state = self._write_state.get(fh)
         logger.debug("release fh=%s has_state=%s dirty=%s base=%s",
                      fh, state is not None, state and state.get("dirty"),
@@ -691,12 +750,16 @@ class MCloudFuseOps(pyfuse3.Operations):
 
     def _rename_file_sync(self, entry: InodeEntry, new_parent: InodeEntry, new_name: str) -> InodeEntry:
         old_name = entry.path.rstrip("/").rsplit("/", 1)[-1]
-        local_path = self.data_cache.prepare_file_for_read(entry.file_id, old_name)
-        item = self.wrapper.upload_file(
-            local_file_path=local_path,
-            target_dir_id=new_parent.file_id,
-            name=new_name,
-        )
+        # 上传期间钉住缓存，否则并发的 LRU 淘汰可能在上传中途把源文件删掉
+        local_path = self.data_cache.acquire_for_read(entry.file_id, old_name)
+        try:
+            item = self.wrapper.upload_file(
+                local_file_path=local_path,
+                target_dir_id=new_parent.file_id,
+                name=new_name,
+            )
+        finally:
+            self.data_cache.release_read(entry.file_id)
         try:
             self.trash.move_to_trash(entry)
         except Exception as exc:  # noqa: BLE001 - 新副本已就绪，旧文件回收失败不致命
@@ -777,13 +840,17 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EISDIR if entry else errno.ENOENT)
         name = entry.path.rstrip("/").rsplit("/", 1)[-1]
         parent_entry = self.mapper.get_by_inode(entry.parent_inode)
-        read_path = self.data_cache.prepare_file_for_read(entry.file_id, name)
-        buffer_path = self.data_cache.create_write_buffer(
-            f"inode-{inode}",
-            initial_path=read_path,
-            target_dir_id=parent_entry.file_id if parent_entry else None,
-            file_name=name,
-        )
+        # 复制旧内容进写回暂存期间钉住缓存，避免并发 LRU 淘汰删掉源文件
+        read_path = self.data_cache.acquire_for_read(entry.file_id, name)
+        try:
+            buffer_path = self.data_cache.create_write_buffer(
+                f"inode-{inode}",
+                initial_path=read_path,
+                target_dir_id=parent_entry.file_id if parent_entry else None,
+                file_name=name,
+            )
+        finally:
+            self.data_cache.release_read(entry.file_id)
         with open(buffer_path, "r+b") as handle:
             handle.truncate(size)
         self._write_state[inode] = {

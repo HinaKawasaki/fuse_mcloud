@@ -1,5 +1,51 @@
 # Release Notes
 
+## v0.3.0
+
+本次是**工程化版本**：用户可见功能与 v0.2.1 一致，重点是把仓库从「clone 下来改源码跑」
+变成「可安装、有 CI、有回归保护」的包，并修掉一个读缓存的并发缺陷。
+
+### 打包与入口
+
+- `src/` 改为可安装包 `mcloud_fuse`，内部统一绝对导入；顺带消除 `src/fuse/` 与 PyPI
+  `fuse` 包的命名冲突。
+- 新增命令入口：`pip install -e .` 后可用 `mcloud-fuse --mountpoint ...`，
+  等价写法 `python3 -m mcloud_fuse`；新增 `--version`。
+- `pyproject.toml` 补齐 `[build-system]`、`[project.scripts]`、license、classifiers、urls
+  与 `dev` extra；`requirements*.txt` 改为转发 pyproject，依赖清单不再双份维护。
+- 版本号单一来源：`mcloud_fuse/version.py`，pyproject 用 `dynamic = ["version"]` 读取。
+- 官方 Skill 的定位集中到 `mcloud_fuse/basement.py`，支持 `MCLOUD_BASEMENT_DIR`，
+  找不到时直接提示运行 `scripts/setup_basement.py`（而不是 `ModuleNotFoundError`）。
+- systemd 单元改为 `WorkingDirectory=... + -m mcloud_fuse`；真机脚本同步更新。
+
+### 修复
+
+- **读缓存 LRU 淘汰会把正在读的文件删掉**：`read()` 原先每次按路径重新 `open`，
+  而 LRU 淘汰直接 `unlink`。常见触发场景是「`open` 之后隔一会儿才读」的程序：
+  期间另一个文件的下载触发淘汰，读操作就报 `EBADF`/`ENOENT`。
+  现在 `open(O_RDONLY)` 即持有 fd、`read` 走 `os.pread`，同时 `DataCache.acquire_for_read()`
+  在句柄存续期间钉住缓存条目，淘汰改为「摘映射 + 延迟删除」，最后一个句柄关闭时才真正 unlink。
+- **同一 inode 并发打开会互相覆盖句柄**：读句柄的 fh 改为独立分配（从 `2**32` 起），
+  不再复用 inode；否则 `release` 可能关掉别人的 fd、或泄漏 fd。
+
+### 测试与 CI
+
+- 新增 GitHub Actions（`.github/workflows/ci.yml`）：`ruff` + Python 3.10~3.13 矩阵跑离线用例，
+  另有一个「覆盖率 + 真实内核挂载」job（`/dev/fuse` + `fusermount3`）。
+- 覆盖率把离线单测与真实挂载脚本合并统计，门槛 `fail_under = 69`（当前 71%）。
+- `tests/integration/posix_stress.py` 增加：顺序读全部根文件、16 路并发读的字节数校验，
+  以及**确定性复现淘汰竞态**的「打开后延迟读取」用例；可用
+  `MCLOUD_STRESS_CACHE_MB=1 MCLOUD_STRESS_FILE_BYTES=16384` 强制小缓存触发淘汰。
+  该用例在修复前代码上会失败、修复后通过。
+- 新增回归用例：钉住条目不被淘汰、嵌套句柄只在最后一次释放后删除、
+  读句柄在条目作废后仍能读完、并发打开的句柄相互独立。
+
+### 已验证
+
+- `ruff check` 通过；`pytest tests -q` 58 项通过（2 项 live 用例按环境变量跳过）。
+- `pip install -e .` 后 `mcloud-fuse --version` → `mcloud-fuse 0.3.0`；wheel 构建包含全部子包与 entry_points。
+- 真实内核挂载：`fuse_mount_smoke.py`、`posix_stress.py`（含 1MiB 缓存 / 16KiB 文件的强制淘汰场景）全部通过。
+
 ## v0.2.1
 
 ### 修复

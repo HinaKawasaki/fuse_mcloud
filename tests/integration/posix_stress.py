@@ -37,22 +37,35 @@ N_DIRS = 20
 N_FILES_PER_DIR = 30
 N_ROOT_FILES = 200
 
+# 把每个文件的体积填充到该字节数（默认 0 = 保持原始的小内容）。
+# 配合 MCLOUD_STRESS_CACHE_MB=1 使用，可以强制在读的过程中反复触发 LRU 淘汰，
+# 用来回归「淘汰把正在读的文件删掉」这类竞态。
+PAD_BYTES = int(os.environ.get("MCLOUD_STRESS_FILE_BYTES", "0"))
+
+
+def file_text(base: str) -> str:
+    if PAD_BYTES <= len(base):
+        return base
+    return (base * (PAD_BYTES // len(base) + 1))[:PAD_BYTES]
+
 
 def build_tree():
     dirs = {ROOT_ID: []}
     content = {}
     for i in range(N_ROOT_FILES):
         fid = f"root_file_{i}"
-        dirs[ROOT_ID].append({"id": fid, "name": f"root_{i}.txt", "size": len(f"content-{i}")})
-        content[fid] = f"content-{i}".encode()
+        text = file_text(f"content-{i}")
+        dirs[ROOT_ID].append({"id": fid, "name": f"root_{i}.txt", "size": len(text)})
+        content[fid] = text.encode()
     for d in range(N_DIRS):
         did = f"dir_{d}"
         dirs[ROOT_ID].append({"id": did, "name": f"目录{d:03d}", "isDir": True})
         dirs[did] = []
         for f in range(N_FILES_PER_DIR):
             fid = f"file_{d}_{f}"
-            dirs[did].append({"id": fid, "name": f"f{f:03d}.txt", "size": len(f"{d}-{f}")})
-            content[fid] = f"{d}-{f}".encode()
+            text = file_text(f"{d}-{f}")
+            dirs[did].append({"id": fid, "name": f"f{f:03d}.txt", "size": len(text)})
+            content[fid] = text.encode()
     return dirs, content
 
 
@@ -122,11 +135,14 @@ def main() -> int:
     cloud = StressCloud()
     mapper = InodeMapper(root_file_id=ROOT_ID)
     tree = DirectoryTree(mapper=mapper)
+    # 缓存限额可用环境变量调小（如 MCLOUD_STRESS_CACHE_MB=1）来强制在读的过程中
+    # 触发 LRU 淘汰，用来复现「淘汰把正在读的文件删掉」这类竞态。
+    cache_mb = int(os.environ.get("MCLOUD_STRESS_CACHE_MB", "128"))
     cache = DataCache(
         client_wrapper=cloud,
         cache_dir=workdir / "cache",
         write_back_dir=workdir / "wb",
-        max_size_mb=128,
+        max_size_mb=cache_mb,
     )
     ops = MCloudFuseOps(mapper, tree, MetaCache(ttl=5.0), cache, cloud)
 
@@ -205,12 +221,76 @@ def main() -> int:
         print("🚀 3. 批量读取校验")
         t0 = time.monotonic()
         ok = True
-        for i in range(0, N_ROOT_FILES, 25):
+        # 逐个读完全部根文件：配合小缓存限额时，会在读的过程中反复触发 LRU 淘汰
+        for i in range(N_ROOT_FILES):
             got = run(["cat", str(mountpoint / f"root_{i}.txt")]).stdout
-            if got != f"content-{i}":
+            if got != file_text(f"content-{i}"):
                 ok = False
                 break
-        check("随机抽样 cat 内容正确", ok, f"({time.monotonic()-t0:.2f}s)")
+        check("顺序 cat 全部根文件内容正确", ok, f"({time.monotonic()-t0:.2f}s)")
+
+        print("🚀 3b. 并发读取（小缓存下会边读边淘汰）")
+        t0 = time.monotonic()
+        total_expected = sum(len(file_text(f"content-{i}")) for i in range(N_ROOT_FILES))
+        proc = run(
+            [
+                "bash",
+                "-c",
+                f"ls {mountpoint}/root_*.txt | xargs -P 16 -n 1 cat | wc -c",
+            ]
+        )
+        got_bytes = int(proc.stdout.strip() or 0)
+        # 并发 cat 的输出顺序不确定，但字节总数是确定的：
+        # 只要有一个读被 LRU 淘汰打断（旧实现会报 EBADF），总数就会少。
+        check(
+            "并发 cat 全部根文件字节数一致",
+            proc.returncode == 0 and got_bytes == total_expected,
+            f"({got_bytes}/{total_expected} bytes, {time.monotonic()-t0:.2f}s)",
+        )
+
+        print("🚀 3c. 打开后延迟读取（复现淘汰竞态）")
+        t0 = time.monotonic()
+        # 真实应用常常是 open() 之后先干点别的再 read()。此时若缓存被其它下载挤爆，
+        # 旧实现（read 时按路径重新 open）会撞上 ENOENT/EBADF；持有 fd 的实现不受影响。
+        reader_code = (
+            "import sys, time\n"
+            "with open(sys.argv[1], 'rb') as fh:\n"
+            "    time.sleep(float(sys.argv[2]))\n"
+            "    data = fh.read()\n"
+            "print(len(data))\n"
+        )
+        readers = [
+            subprocess.Popen(
+                [sys.executable, "-c", reader_code, str(mountpoint / f"root_{i}.txt"), "2.0"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for i in range(4)
+        ]
+        time.sleep(0.4)
+        # 淘汰压力：只读 root_100~root_199（1.6MiB > 1MiB 限额），刻意避开上面 4 个
+        # 读者持有的 root_0~root_3——否则它们被淘汰后又会被压力重新下载回同一路径，
+        # 旧实现反而「侥幸」通过，复现不出问题。
+        run([
+            "bash",
+            "-c",
+            f"ls {mountpoint}/root_1[0-9][0-9].txt | xargs -P 16 -n 1 cat > /dev/null",
+        ])
+
+        reader_ok = True
+        detail = []
+        for index, proc in enumerate(readers):
+            out, err = proc.communicate(timeout=60)
+            expected_len = len(file_text(f"content-{index}"))
+            if proc.returncode != 0 or out.strip() != str(expected_len):
+                reader_ok = False
+                detail.append(f"#{index} rc={proc.returncode} out={out.strip()!r} {err.strip()[:80]}")
+        check(
+            "延迟读取的 4 个句柄仍能读完",
+            reader_ok,
+            detail[0] if detail else f"({time.monotonic()-t0:.2f}s)",
+        )
 
         print("🚀 4. 批量新建文件")
         t0 = time.monotonic()

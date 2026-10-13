@@ -268,6 +268,12 @@ MCLOUD_LIVE_TESTS=1 python3 -m pytest tests/test_wrapper.py tests/test_auth.py -
 FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进行。此时若立即 `open` / `read`，
 会读到尚未替换的占位 fileId。实现里用「在途上传事件」让后续操作等待；未关闭的写句柄直接读本地暂存。
 
+**为什么读要一直拿着 fd，还要「钉住」缓存？**
+读缓存是 LRU 的，下载另一个文件就可能触发淘汰。如果 `read` 每次都按路径重新 `open`，被淘汰的
+文件会从正在读的句柄脚下消失（表现为 `EBADF`/`ENOENT`）——尤其常见于「`open` 之后隔一会儿才读」
+的程序。现在 `open` 就把文件描述符拿在手上、并用 `pread` 读取，同时把缓存条目标记为「占用中」：
+淘汰只会摘掉缓存映射，真正的删除推迟到最后一个句柄 `close()`，与 POSIX 语义一致。
+
 **删除为什么需要墓碑？**
 云盘接口没有删除。删除 = 复制进 `.TrashBin` + 本地摘除节点，但云端原对象仍在，下次列举会「复活」。
 墓碑记录已删除的 fileId，充填目录时屏蔽它们；墓碑落盘，重启后依然有效。
@@ -331,7 +337,8 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 - [x] 第四阶段：崩溃恢复、POSIX 压测、systemd 打包
 - [x] 加固：目录列举修复、异步 release 同步、索引最终一致性、多段上传、限流接入、死代码清理
 - [x] v0.3.0 工程化：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
-      版本单一来源、GitHub Actions CI（ruff + pytest）、覆盖率报告
+      版本单一来源、GitHub Actions CI（ruff + pytest + 覆盖率门槛）、
+      修复读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除）
 
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。

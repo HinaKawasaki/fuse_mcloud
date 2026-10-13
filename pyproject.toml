@@ -78,6 +78,6 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-# 基线（2026-10，单测 69% / 单测+真实挂载 70%）略降一点设门槛；
+# 基线（合并单测 + 真实挂载用例）：71%。门槛留 2 个百分点余量；
 # 新增可测代码时应同步上调，避免覆盖率悄悄回退。
-fail_under = 68
+fail_under = 69

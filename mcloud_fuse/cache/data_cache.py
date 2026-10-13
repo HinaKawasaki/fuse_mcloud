@@ -49,6 +49,11 @@ class DataCache:
         self._access_time: Dict[str, float] = {}
         # 每个 file_id 一把锁，避免同一文件被并发重复下载
         self._download_locks: Dict[str, threading.Lock] = {}
+        # 正在被打开的读句柄占用的 file_id 计数。
+        # LRU 淘汰必须绕开它们：把文件从正在 read() 的句柄底下删掉会让读操作报 EBADF。
+        self._pinned: Dict[str, int] = {}
+        # 被淘汰/作废、但因仍有句柄占用而推迟删除的本地文件
+        self._deferred_deletes: Dict[str, list] = {}
         # 写回暂存 key -> 本地路径
         self._write_paths: Dict[str, Path] = {}
         # 写回日志：崩溃恢复时用来把未上传的暂存文件补传回云盘
@@ -66,11 +71,17 @@ class DataCache:
     def get_cache_path(self, file_id: str) -> Optional[Path]:
         """检查文件是否已缓存在本地 tmpfs 或 Fallback 磁盘"""
         with self._lock:
-            path = self._cache_map.get(file_id)
-            if path and path.exists():
+            path = self._cached_path_nolock(file_id)
+            if path is not None:
                 self._access_time[file_id] = time.time()
-                return path
-            return None
+            return path
+
+    def _cached_path_nolock(self, file_id: str) -> Optional[Path]:
+        """取已落盘且仍存在的缓存路径（调用方需持有 ``self._lock``）。"""
+        path = self._cache_map.get(file_id)
+        if path and path.exists():
+            return path
+        return None
 
     def _download_lock(self, file_id: str) -> threading.Lock:
         with self._lock:
@@ -81,17 +92,57 @@ class DataCache:
         [关键 I/O API] 为读操作准备文件：
         若本地已有缓存则直接复用，否则从移动云盘下载到本地缓存。
         下载过程不持有全局锁，避免阻塞其他文件的缓存命中。
+
+        注意：本方法**不**保护返回的路径不被 LRU 淘汰。凡是「拿到路径后还要
+        继续用它」的调用方（打开句柄、复制进写回暂存、上传走 rename），都应改用
+        :meth:`acquire_for_read` + :meth:`release_read` 把文件钉住。
         """
-        existing_path = self.get_cache_path(file_id)
-        if existing_path:
-            logger.debug("命中本地文件缓存: %s", existing_path)
-            return existing_path
+        return self._acquire_read_path(file_id, file_name, pin=False)
+
+    def acquire_for_read(self, file_id: str, file_name: str) -> Path:
+        """获取读路径并钉住它，直到调用 :meth:`release_read` 为止。
+
+        与 :meth:`prepare_file_for_read` 的区别是：钉住期间 LRU 淘汰会跳过该条目，
+        即使缓存已超限也只会清掉其它可淘汰项，绝不会把这个文件从使用者的脚下删掉。
+        """
+        return self._acquire_read_path(file_id, file_name, pin=True)
+
+    def release_read(self, file_id: str) -> None:
+        """释放一次 :meth:`acquire_for_read`；最后一个句柄关闭时执行延迟删除。"""
+        with self._lock:
+            count = self._pinned.get(file_id, 0)
+            if count > 1:
+                self._pinned[file_id] = count - 1
+                return
+            self._pinned.pop(file_id, None)
+            pending = self._deferred_deletes.pop(file_id, [])
+
+        for path in pending:
+            self._unlink_quietly(path)
+
+    def pinned_count(self, file_id: str) -> int:
+        """当前占用该缓存条目的读句柄数量（诊断 / 测试用）。"""
+        with self._lock:
+            return self._pinned.get(file_id, 0)
+
+    def _acquire_read_path(self, file_id: str, file_name: str, *, pin: bool) -> Path:
+        with self._lock:
+            existing = self._cached_path_nolock(file_id)
+            if existing is not None:
+                self._access_time[file_id] = time.time()
+                if pin:
+                    self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+                return existing
 
         with self._download_lock(file_id):
             # 双重检查：等待下载锁期间可能已被其他线程下载完成
-            existing_path = self.get_cache_path(file_id)
-            if existing_path:
-                return existing_path
+            with self._lock:
+                existing = self._cached_path_nolock(file_id)
+                if existing is not None:
+                    self._access_time[file_id] = time.time()
+                    if pin:
+                        self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
+                    return existing
 
             self._evict_if_needed()
 
@@ -102,6 +153,8 @@ class DataCache:
             with self._lock:
                 self._cache_map[file_id] = local_path
                 self._access_time[file_id] = time.time()
+                if pin:
+                    self._pinned[file_id] = self._pinned.get(file_id, 0) + 1
             return local_path
 
     def register_cache_file(self, file_id: str, local_path: Path) -> None:
@@ -111,15 +164,33 @@ class DataCache:
             self._access_time[file_id] = time.time()
 
     def invalidate_file_cache(self, file_id: str):
-        """主动删除某文件的本地缓存"""
+        """主动删除某文件的本地缓存。
+
+        若该条目仍被打开的读句柄占用，则只摘掉缓存映射、把删除推迟到最后一个
+        句柄 :meth:`release_read` 之后执行（POSIX 语义：已打开的文件不会凭空消失）。
+        """
         with self._lock:
             path = self._cache_map.pop(file_id, None)
             self._access_time.pop(file_id, None)
-        if path and path.exists():
-            try:
+            if path is not None and self._pinned.get(file_id, 0) > 0:
+                self._deferred_deletes.setdefault(file_id, []).append(path)
+                logger.debug(
+                    "缓存条目仍被 %s 个句柄占用，延迟删除: %s",
+                    self._pinned.get(file_id, 0),
+                    path,
+                )
+                return
+        self._unlink_quietly(path)
+
+    @staticmethod
+    def _unlink_quietly(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            if path.exists():
                 path.unlink()
-            except OSError as e:
-                logger.warning("删除本地缓存失败: %s", e)
+        except OSError as exc:
+            logger.warning("删除本地缓存失败: %s", exc)
 
     def _get_current_cache_size(self) -> int:
         """计算当前缓存占用的总字节数"""
@@ -135,12 +206,24 @@ class DataCache:
         return total
 
     def _evict_if_needed(self):
-        """根据 LRU 算法剔除最老的文件，保持缓存容量在上限以内"""
+        """根据 LRU 算法剔除最老的文件，保持缓存容量在上限以内。
+
+        被读句柄钉住的条目一律跳过：宁可暂时超出上限，也不把正在读的文件删掉。
+        若全部条目都被占用，直接返回（下次有句柄释放时会再次触发淘汰）。
+        """
         while self._get_current_cache_size() >= self.max_bytes:
             with self._lock:
-                if not self._access_time:
+                candidates = [
+                    file_id
+                    for file_id in self._access_time
+                    if self._pinned.get(file_id, 0) == 0
+                ]
+                if not candidates:
+                    logger.warning(
+                        "缓存已达上限，但所有条目都被打开的句柄占用，暂缓淘汰"
+                    )
                     return
-                oldest_file_id = min(self._access_time, key=self._access_time.get)
+                oldest_file_id = min(candidates, key=self._access_time.get)
             logger.info("缓存超出限额，触发 LRU 淘汰旧文件: file_id=%s", oldest_file_id)
             self.invalidate_file_cache(oldest_file_id)
 

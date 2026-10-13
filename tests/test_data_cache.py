@@ -110,6 +110,65 @@ def test_data_cache():
     print("🎉 DataCache 全部测试通过！")
 
 
+def test_pinned_entry_survives_eviction_until_release(tmp_path):
+    """被读句柄钉住的缓存条目不得被 LRU 淘汰，删除要推迟到最后一个句柄关闭。
+
+    回归背景：``read()`` 原先每次按路径 open，LRU 直接 unlink 会让正在读的文件
+    报 EBADF。这里验证「钉住 → 跳过淘汰 → 延迟删除」三个环节。
+    """
+    wrapper = MockClientWrapper()
+    cache = DataCache(
+        client_wrapper=wrapper,
+        cache_dir=tmp_path / "cache",
+        write_back_dir=tmp_path / "wb",
+        max_size_mb=1,
+    )
+
+    pinned_path = cache.acquire_for_read("fid_a", "a.bin")
+    pinned_path.write_bytes(b"A" * (1024 * 1024 + 512 * 1024))  # 单项就超限
+    assert cache.pinned_count("fid_a") == 1
+
+    disposable_path = cache.acquire_for_read("fid_b", "b.bin")
+    cache.release_read("fid_b")
+
+    cache._evict_if_needed()
+
+    assert cache.get_cache_path("fid_a") == pinned_path, "钉住的条目不得被淘汰"
+    assert pinned_path.exists()
+    assert cache.get_cache_path("fid_b") is None
+    assert not disposable_path.exists()
+
+    cache.invalidate_file_cache("fid_a")
+    assert pinned_path.exists(), "仍有句柄占用时只能延迟删除"
+
+    cache.release_read("fid_a")
+    assert not pinned_path.exists()
+    assert cache.pinned_count("fid_a") == 0
+
+
+def test_nested_pins_delete_only_after_last_release(tmp_path):
+    """同一文件被打开两次时，只有最后一个句柄释放才真正删除。"""
+    wrapper = MockClientWrapper()
+    cache = DataCache(
+        client_wrapper=wrapper,
+        cache_dir=tmp_path / "cache",
+        write_back_dir=tmp_path / "wb",
+        max_size_mb=1,
+    )
+
+    path = cache.acquire_for_read("fid_a", "a.bin")
+    cache.acquire_for_read("fid_a", "a.bin")
+    assert cache.pinned_count("fid_a") == 2
+
+    cache.invalidate_file_cache("fid_a")
+    cache.release_read("fid_a")
+    assert path.exists(), "还有 1 个句柄，不能删"
+
+    cache.release_read("fid_a")
+    assert not path.exists()
+    assert cache.pinned_count("fid_a") == 0
+
+
 def test_finalize_can_discard_local_copy(tmp_path):
     """UPLOAD_KEEP_CACHE=0 场景：上传后不保留本地副本。"""
     wrapper = MockClientWrapper()

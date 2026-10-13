@@ -77,5 +77,10 @@ jobs:
         run: coverage run --append --source=mcloud_fuse tests/integration/fuse_mount_smoke.py
       - name: 真实挂载：大目录一致性与批量读写删
         run: coverage run --append --source=mcloud_fuse tests/integration/posix_stress.py
+      - name: 真实挂载：小缓存强制淘汰（回归 LRU 淘汰 vs 在途读竞态）
+        env:
+          MCLOUD_STRESS_CACHE_MB: "1"
+          MCLOUD_STRESS_FILE_BYTES: "16384"
+        run: coverage run --append --source=mcloud_fuse tests/integration/posix_stress.py
       - name: 覆盖率报告（门槛见 pyproject 的 fail_under）
         run: coverage report --skip-covered

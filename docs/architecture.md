@@ -45,6 +45,14 @@
   - `TombstoneStore`（墓碑）
 - **限流器**（`router/rate_limiter.py`）用 `threading.BoundedSemaphore` + 单调时钟实现。之所以不用
   asyncio/trio 原语，是因为调用发生在工作线程里，且 `DirectClientWrapper` 也会被脚本同步调用。
+- **读句柄持有真实 fd**：`open(O_RDONLY)` 时就把本地缓存文件 `open(2)` 出来、把 fd 记在
+  `_read_fds[fh]` 上，`read` 用 `os.pread`（不改偏移，天然可并发）。fh 从 `2**32` 起分配，
+  与 inode 区分开：同一个 inode 被并发打开多次时，若复用 inode 当 fh，句柄会互相覆盖、
+  `release` 还可能关掉别人的 fd。
+- **缓存条目会被「钉住」**：`DataCache.acquire_for_read()` 在读句柄存续期间给条目计数，
+  LRU 淘汰跳过它们。淘汰一个仍被占用的条目时只摘掉缓存映射，真正的 `unlink` 推迟到最后一个
+  `release_read()`（POSIX 语义：已打开的文件不会凭空消失）。这条路径修复了
+  「下载 A 触发淘汰，把正在读的 B 删掉 → `read` 报 EBADF」的竞态。
 
 ## inode / 路径 / fileId 映射
 
