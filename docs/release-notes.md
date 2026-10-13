@@ -1,112 +1,89 @@
 # Release Notes
 
-## v0.5.0
-
-### 修复
-
-- **删除不再额外占用一倍云盘容量**。核实了整个官方 Skill 的接口面：只有
-  `api_file_create / api_file_complete / api_search_files / api_create_folder /
-  api_check_exists / api_batch_get_names / api_batch_download_urls / api_batch_copy /
-  api_task_get`，**不存在任何删除或回收站接口**。也就是说原对象永远删不掉，
-  而旧实现还会在删除/改名/目录移动时把对象云内复制一份到 `.TrashBin`：
-  - 被删对象占用**双倍**容量；
-  - 目录移动会 `batch_copy` **整棵子树**再复制一次；
-  - `.TrashBin` 属于 `HIDDEN_DIR_NAMES`，用户在挂载里既看不到也删不掉，副本收益为零。
-
-  现在 `unlink` / `rmdir` / 改名 / 移动改为**只登记墓碑 + 本地摘除**：
-  云端原对象留在原处（本来也没法删），墓碑负责让它不复活。
-  `MCLOUD_TRASH_COPY=1` 可恢复旧的复制行为。
-
-  顺带澄清了能力边界：想真正腾容量只能在官方 App / 网页端删除；
-  历史遗留的 `.TrashBin` 副本同样只能在 App 里清；本层提供不了「回收站一键清理」。
-
-### 文档
-
-- README「已知限制」重写删除相关条目：说明「删除 = 墓碑」「怎么恢复被删对象」
-  「哪些事只能在 App 做」，不再让人误以为本层能释放云盘容量。
-
-### 测试
-
-- `tests/test_trashbin.py` 覆盖两种删除策略：默认**不碰云端**（不建目录、不复制、
-  只登记墓碑、摘除节点），以及 `MCLOUD_TRASH_COPY=1` 时保留旧行为。
-- `tests/test_writeback.py` 的 unlink 用例改为断言「默认无副本 + 墓碑生效」，
-  并新增复制模式的对照用例。
-- `tests/integration/fuse_mount_smoke.py` 的删除阶段改为校验新语义：
-  不创建 `.TrashBin`、云端仍保留原对象、本地不再可见。
-
-## v0.4.0
-
-### 新功能
-
-- **大文件按需（Range）读取**：超过 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（默认 256MiB）的文件
-  在 `open()` 时不再整文件下载，而是建一个大小已知的本地空壳，`read()` 时按
-  `MCLOUD_RANGE_CHUNK`（默认 4MiB）对齐拉取缺口，重复读不再重复下载。
-  只读大文件（例如查看日志尾部、读取媒体头尾）不再付出「整文件下载 + 整文件磁盘占用」的成本。
-  - **服务端不支持 Range 时自动降级**：若下载直链忽略 `Range` 并返回 200，本次响应体
-    会整文件落盘并立即升级为完整缓存，行为与旧版一致，不会退化成「每次读都重下整文件」。
-  - **部分文件绝不冒充完整文件**：部分内容只对 `ensure_range` 可见；覆盖写、`truncate`、
-    `rename`（需要上传整文件）等路径一律先经 `ensure_complete` 补齐，避免把半截文件传上云。
-  - 新增 `scripts/check_range_support.py`：探测下载直链是否真的支持 Range。
-- 新增环境变量 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（`0` = 关闭按需读，回到整文件下载）、
-  `MCLOUD_RANGE_CHUNK`、`MCLOUD_RANGE_TIMEOUT`。
-
-### 工程化
-
-- CI 的 `ruff` 检查扩展到 `scripts/`；顺带修掉 `scripts/setup_basement.py` 的
-  未用导入、导入排序与结尾换行。
-
-### 测试
-
-- 新增 `tests/test_range_read.py`：只取缺口、重复读不重复下载、服务端忽略 Range 时
-  只下载一次且转为完整缓存、越界分片只取到文件末尾、`MCLOUD_EAGER_DOWNLOAD_LIMIT=0`
-  时退回整文件下载，以及「写路径必须拿到完整文件」。
-- `tests/test_fuse_ops.py` 增加按需读的端到端用例（open 不下载 → read 分片 → release 解除钉住）。
-
 ## v0.3.0
 
-本次是**工程化版本**：用户可见功能与 v0.2.1 一致，重点是把仓库从「clone 下来改源码跑」
-变成「可安装、有 CI、有回归保护」的包，并修掉一个读缓存的并发缺陷。
+把 v0.2.1 之后的三块工作（工程化、读路径修复、两项行为改进）合并为同一个版本发布。
 
-### 打包与入口
+### 打包与入口：从「clone 下来改源码跑」到「可安装的包」
 
-- `src/` 改为可安装包 `mcloud_fuse`，内部统一绝对导入；顺带消除 `src/fuse/` 与 PyPI
-  `fuse` 包的命名冲突。
-- 新增命令入口：`pip install -e .` 后可用 `mcloud-fuse --mountpoint ...`，
+- `src/` 改为可安装包 `mcloud_fuse`，内部统一绝对导入；顺带消除 `src/fuse/`
+  与 PyPI `fuse` 包的命名冲突。
+- 新增命令入口：`pip install -e .` 后 `mcloud-fuse --mountpoint ...`，
   等价写法 `python3 -m mcloud_fuse`；新增 `--version`。
-- `pyproject.toml` 补齐 `[build-system]`、`[project.scripts]`、license、classifiers、urls
-  与 `dev` extra；`requirements*.txt` 改为转发 pyproject，依赖清单不再双份维护。
-- 版本号单一来源：`mcloud_fuse/version.py`，pyproject 用 `dynamic = ["version"]` 读取。
-- 官方 Skill 的定位集中到 `mcloud_fuse/basement.py`，支持 `MCLOUD_BASEMENT_DIR`，
-  找不到时直接提示运行 `scripts/setup_basement.py`（而不是 `ModuleNotFoundError`）。
+- `pyproject.toml` 补齐 `[build-system]`、`[project.scripts]`、license、classifiers、
+  urls 与 `dev` extra；`requirements*.txt` 改为转发 pyproject，依赖清单不再双份维护。
+- 版本号单一来源 `mcloud_fuse/version.py`，pyproject 用 `dynamic = ["version"]` 读取。
+- 官方 Skill 的定位集中到 `mcloud_fuse/basement.py`，支持 `MCLOUD_BASEMENT_DIR`；
+  找不到时提示运行 `scripts/setup_basement.py`，而不是抛 `ModuleNotFoundError`。
 - systemd 单元改为 `WorkingDirectory=... + -m mcloud_fuse`；真机脚本同步更新。
 
-### 修复
+### 修复：读缓存的并发缺陷
 
-- **读缓存 LRU 淘汰会把正在读的文件删掉**：`read()` 原先每次按路径重新 `open`，
-  而 LRU 淘汰直接 `unlink`。常见触发场景是「`open` 之后隔一会儿才读」的程序：
+- **LRU 淘汰会把正在读的文件删掉**：`read()` 原先每次按路径重新 `open`，
+  而 LRU 淘汰直接 `unlink`。典型触发是「`open` 之后隔一会儿才读」的程序：
   期间另一个文件的下载触发淘汰，读操作就报 `EBADF`/`ENOENT`。
-  现在 `open(O_RDONLY)` 即持有 fd、`read` 走 `os.pread`，同时 `DataCache.acquire_for_read()`
-  在句柄存续期间钉住缓存条目，淘汰改为「摘映射 + 延迟删除」，最后一个句柄关闭时才真正 unlink。
+  现在 `open(O_RDONLY)` 即持有 fd、`read` 走 `os.pread`，同时缓存条目在读句柄
+  存续期间被「钉住」，淘汰改为「摘映射 + 延迟删除」，最后一个句柄关闭才真正 unlink。
 - **同一 inode 并发打开会互相覆盖句柄**：读句柄的 fh 改为独立分配（从 `2**32` 起），
   不再复用 inode；否则 `release` 可能关掉别人的 fd、或泄漏 fd。
 
+### 新功能：大文件按需（Range）读取
+
+- 超过 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（默认 256MiB）的文件在 `open()` 时不再整文件下载，
+  而是建一个大小已知的本地空壳，`read()` 按 `MCLOUD_RANGE_CHUNK`（默认 4MiB）对齐拉取缺口，
+  重复读不重下。读大文件的头尾（日志、媒体）不再付出整文件下载 + 整文件磁盘占用。
+- **服务端不支持 Range 时自动降级**：若直链忽略 `Range` 返回 200，本次响应体整文件落盘
+  并立即升级为完整缓存，行为与旧版一致，不会退化成「每次读都重下整文件」。
+- **部分文件绝不冒充完整文件**：部分内容只对 `ensure_range` 可见；覆盖写、`truncate`、
+  `rename`（需要整文件上传）一律先经 `ensure_complete` 补齐。
+- **宁可报错也不猜**：`Content-Range` 起点对不上、总长与元数据 `size` 不符、
+  200 的整文件长度不足时一律报错，避免留下「被截断却看起来完整」的副本被上传回云盘。
+- 新增 `scripts/check_range_support.py`：探测下载直链是否真的支持 Range。
+- 新增环境变量 `MCLOUD_EAGER_DOWNLOAD_LIMIT`（`0` = 关闭按需读）、`MCLOUD_RANGE_CHUNK`、
+  `MCLOUD_RANGE_TIMEOUT`。
+
+### 行为改进：删除不再白烧一倍云盘容量
+
+- 核实了整个官方 Skill 的接口面（只有 create / search / copy / download 一类），
+  **不存在任何删除或回收站接口**：原对象永远删不掉。
+- 旧实现还会把对象云内复制一份进 `.TrashBin`，于是被删对象占**双倍**容量；
+  目录移动更会 `batch_copy` **整棵子树**；而 `.TrashBin` 属于隐藏目录，
+  用户既看不到也删不掉，副本收益为零。
+- 现在 `unlink` / `rmdir` / 改名 / 移动改为**只登记墓碑 + 本地摘除**（默认
+  `MCLOUD_TRASH_COPY=0`），连 `.TrashBin` 目录都不创建；`=1` 可恢复旧的复制行为。
+- 副作用是恢复变得可行：原对象从未移动，移除墓碑即可让它回来。
+- 能力边界写进文档：想真正腾容量、想清理历史 `.TrashBin` 副本，只能在官方 App / 网页端删除。
+
 ### 测试与 CI
 
-- 新增 GitHub Actions（`.github/workflows/ci.yml`）：`ruff` + Python 3.10~3.13 矩阵跑离线用例，
-  另有一个「覆盖率 + 真实内核挂载」job（`/dev/fuse` + `fusermount3`）。
-- 覆盖率把离线单测与真实挂载脚本合并统计，门槛 `fail_under = 69`（当前 71%）。
-- `tests/integration/posix_stress.py` 增加：顺序读全部根文件、16 路并发读的字节数校验，
-  以及**确定性复现淘汰竞态**的「打开后延迟读取」用例；可用
-  `MCLOUD_STRESS_CACHE_MB=1 MCLOUD_STRESS_FILE_BYTES=16384` 强制小缓存触发淘汰。
-  该用例在修复前代码上会失败、修复后通过。
-- 新增回归用例：钉住条目不被淘汰、嵌套句柄只在最后一次释放后删除、
-  读句柄在条目作废后仍能读完、并发打开的句柄相互独立。
+- 新增 GitHub Actions：`ruff` + Python 3.10~3.13 矩阵跑离线用例；另有
+  「覆盖率 + 真实内核挂载」job（`/dev/fuse` + `fusermount3`）。
+- 覆盖率把离线单测与真实挂载脚本合并统计，门槛 `fail_under = 70`（当前 73%）。
+- CI 额外用两种极端参数跑真实内核压测：`MCLOUD_STRESS_CACHE_MB=1`（强制 LRU 淘汰，
+  回归「淘汰删掉正在读的文件」）与 `MCLOUD_STRESS_EAGER_LIMIT=1024`（全量走 Range 按需读）。
+- `posix_stress.py` 新增：顺序读全部根文件、16 路并发读字节数校验，以及**确定性复现淘汰竞态**
+  的「打开后延迟读取」阶段——该用例在修复前代码上会失败、修复后通过。
+- 新增离线用例：钉住条目不被淘汰、嵌套句柄最后释放才删、条目作废后仍可读完、
+  并发打开句柄独立、按需读只取缺口/降级/越界/写路径必须补齐，
+  以及按需读 HTTP 层的 206/200/416/短包/总长不符/Content-Range 错位/5xx 七个分支。
+- `ruff` 检查纳入 `scripts/`，顺带修掉 `scripts/setup_basement.py` 的未用导入等问题；
+  修正三个文档要求直接执行、却缺可执行位的脚本。
 
 ### 已验证
 
-- `ruff check` 通过；`pytest tests -q` 58 项通过（2 项 live 用例按环境变量跳过）。
-- `pip install -e .` 后 `mcloud-fuse --version` → `mcloud-fuse 0.3.0`；wheel 构建包含全部子包与 entry_points。
-- 真实内核挂载：`fuse_mount_smoke.py`、`posix_stress.py`（含 1MiB 缓存 / 16KiB 文件的强制淘汰场景）全部通过。
+- `ruff check` 通过；`pytest tests -q` 69 项通过（2 项 live 用例按环境变量跳过）。
+- `pip install -e .` 后 `mcloud-fuse --version` 正常；wheel 包含全部子包与 entry_points。
+- 真实内核挂载：`fuse_mount_smoke.py` 与 `posix_stress.py`（默认 / 1MiB 缓存强制淘汰 /
+  全量 Range + 16 路并发）全部通过。
+- 历史基线仍有效：真实云盘上官方 CLI 与本地列举一致、`cat` 字节一致、
+  756MiB 多段上传（133s）与空缓存下载（21s，sha256 一致）。
+
+### 升级注意
+
+- 调用方式变化：`python3 src/main.py ...` → `mcloud-fuse ...` 或 `python3 -m mcloud_fuse ...`。
+- 删除语义变化：默认不再产生 `.TrashBin` 副本；旧版本留下的副本只能在官方 App 清理。
+- 建议登录后跑一次 `python3 scripts/check_range_support.py`，确认按需读是否真正生效
+  （不支持时功能不受影响，只是没有收益）。
 
 ## v0.2.1
 

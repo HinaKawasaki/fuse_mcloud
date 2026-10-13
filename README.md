@@ -360,13 +360,15 @@ FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进
 - [x] 第三阶段：只读挂载、写回缓存与上传、回收站删除
 - [x] 第四阶段：崩溃恢复、POSIX 压测、systemd 打包
 - [x] 加固：目录列举修复、异步 release 同步、索引最终一致性、多段上传、限流接入、死代码清理
-- [x] v0.3.0 工程化：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
-      版本单一来源、GitHub Actions CI（ruff + pytest + 覆盖率门槛）、
-      修复读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除）
-- [x] v0.4.0 大文件按需读取：超过阈值不再整文件下载，`read` 按 Range 分片拉取；
-      服务端不支持 Range 时自动降级；新增 `scripts/check_range_support.py` 探测直链能力
-- [x] v0.5.0 删除不再烧双倍容量：确认 Skill 无任何删除接口，删除改为「墓碑 + 本地摘除」，
-      不再往 `.TrashBin` 复制副本（`MCLOUD_TRASH_COPY=1` 保留旧行为）
+- [x] v0.3.0：
+  - **工程化**：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
+    版本单一来源、GitHub Actions CI（ruff + pytest 矩阵 + 真实挂载 + 覆盖率门槛）
+  - **修复**：读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除），
+    以及同一 inode 并发打开互相覆盖句柄
+  - **大文件按需读取**：超过阈值不再整文件下载，`read` 按 Range 分片拉取；服务端不支持
+    Range 时自动降级；`scripts/check_range_support.py` 可探测直链能力
+  - **删除不再烧双倍容量**：确认 Skill 无任何删除接口，删除改为「墓碑 + 本地摘除」，
+    不再往 `.TrashBin` 复制副本（`MCLOUD_TRASH_COPY=1` 保留旧行为）
 
 已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
 756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。
