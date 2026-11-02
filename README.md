@@ -1,388 +1,323 @@
-# mcloud_FUSE
+# mcloud-fuse
 
-> 把中国移动云盘（个人云 / AI 沙箱）挂载成 Linux 本地目录的 FUSE 中间层。
+> 把中国移动云盘（yun.139.com）挂载成 Linux 本地目录，用 `ls` / `cp` / `vim` / `rsync` 直接操作。
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20FUSE3-lightgrey)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 
-`mcloud_FUSE` 基于 [`pyfuse3`](https://github.com/libfuse/pyfuse3) + [`trio`](https://trio.readthedocs.io/)，
-直接导入中国移动云盘官方 Agent Skill 的 Python SDK，在进程内维护「inode ↔ 本地路径 ↔ 云盘 fileId」三向映射、
-元数据 TTL 缓存、本地读缓存与写回缓存，从而把云盘沙箱变成一个可以用 `ls` / `cp` / `vim` / `rsync` 直接操作的 POSIX 目录。
+基于 [`pyfuse3`](https://github.com/libfuse/pyfuse3) + [`trio`](https://trio.readthedocs.io/)。
+v0.4.0 换成网页端 `/file/*`、`/recyclebin/*` 接口，因此 `rm` 是真删除、目录可以改名、
+跨目录移动是原语，不再受 AI 沙箱限制。
 
-> 目前项目已在**真实云盘**上完成只读、写入、删除，以及 756MiB 大文件的上传 / 下载验证；
-> 但受云盘接口能力限制，它并不是一个「完整语义」的文件系统，动手前请先阅读 [已知限制](#-已知限制)。
-
----
-
-## ✨ 特性
-
-- **正确的目录列举**：`readdir` / `lookup` 只按「当前目录自身的 fileId」调用列举接口并自动翻页，
-  同名去重、按 inode 稳定分页，绝不使用全盘搜索（这是早期重复行 / 目录串台的根因）。
-- **可挂载整个云盘**：`--root cloud` 时挂载根就是云盘 `/`，能浏览全盘目录；
-  读沙箱外的文件时自动云内复制进沙箱暂存目录再下载，对上层完全透明。
-- **写回缓存（Write-Back）**：`write` 先落本地暂存文件，`fsync` 可中途推送到云端，
-  `release` 时整文件上传；收尾用**改名进读缓存（零拷贝）**，不为同一文件再占一份磁盘。
-  适配云盘「整文件上传、无随机写」的语义。
-- **异步 release 同步**：FUSE 的 `release` 不阻塞 `close()`，因此对「上传在途」做了事件同步，
-  `close()` 之后立刻读文件不会读到占位 ID。
-- **删除 = 墓碑 + 本地摘除（不再复制副本）**：云盘接口**没有任何删除能力**，因此
-  `unlink` / `rmdir` 登记持久化墓碑并摘除本地节点，对用户表现为「已删除」。
-  不再额外把对象复制进 `.TrashBin/`——原对象本来就没消失，副本只会让被删对象占双倍容量，
-  而 `.TrashBin` 在本挂载里是隐藏目录（`MCLOUD_TRASH_COPY=1` 可恢复旧的复制行为）。
-- **索引最终一致性处理**：云盘搜索索引有延迟，新建对象会进入「索引宽限期」，不会被对账清理误删。
-- **大文件多段上传**：超过阈值自动切分（≥5MiB/片）按序上传，分片级重试，失败自动回退单段上传。
-- **大文件按需读取**：超过阈值（默认 256MiB）的文件不再「打开即整文件下载」，
-  `read` 时按 4MiB 分片对齐拉取，重复读不重下；服务端若不支持 HTTP Range 会自动降级为整文件下载。
-- **统一限流与退避重试**：所有云盘请求经过线程安全的并发 / RPS 限流与指数退避；权限与入参错误不重试。
-- **崩溃恢复**：写回操作登记持久化日志，进程异常退出后，下次启动自动补传未完成的文件。
+> **风险提示**：Web 端接口是第三方逆向接口，不在厂商授权范围内。账号风控与接口漂移
+> 风险由使用者承担。启用前请阅读 [ADR-0002](docs/adr/0002-web-api-optin.md)。
 
 ---
 
-## 🏗 架构
+## 30 秒上手
+
+需要 Linux、Python 3.10+、FUSE3（`/dev/fuse` 与 `fusermount3`），以及一个已登录
+`yun.139.com` 的浏览器。
+
+```bash
+# 1. 系统依赖
+sudo apt-get install -y fuse3 libfuse3-dev
+
+# 2. 安装（在仓库根目录）
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .
+
+# 3. 首次设置
+mcloud-fuse
+```
+
+`mcloud-fuse` 第一次运行会打开**全屏设置向导**：粘贴 token、选挂载点、写配置、
+可选安装 `systemd --user` 服务。设置完成后再运行一次 `mcloud-fuse` 就是挂载。
+
+已经 clone 好仓库、想一条命令装完：
+
+```bash
+./scripts/bootstrap.sh --deps
+```
+
+它会建 venv、装依赖，然后交给同一个设置向导。
+
+---
+
+## 首次设置向导
+
+```
+┌ mcloud-fuse 首次设置 ───────────────────────────── 步骤 2/7 ┐
+│                                                              │
+│  访问令牌                                                    │
+│  令牌等同于账号访问权，只保存在本机 0600 文件里。            │
+│                                                              │
+│  › 使用已保存的令牌                                          │
+│    账号 138****8000；2026-12-02 到期（剩余 29.8 天）         │
+│    重新粘贴令牌                                              │
+│    从浏览器重新复制 Authorization，或整段 cURL               │
+│                                                              │
+│  ↑↓ 选择   Enter 确认   Esc 上一步   q 退出                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+| 步骤 | 会问什么 | 默认 |
+| --- | --- | --- |
+| 1 | 访问令牌：浏览器里的 `Authorization: Basic ...` 或整段 cURL | 已有则复用 |
+| 2 | 挂载点：云盘内容出现在哪个目录 | `~/mnt/mcloud` |
+| 3 | 云盘范围：整个云盘，或某个目录的 `parentFileId` | 整个云盘 |
+| 4 | 缓存目录：读缓存与写回暂存 | `/tmp/cmcloud-fuse` |
+| 5 | 删除方式：永久删除 / 移入回收站 | 永久删除 |
+| 6 | 覆盖写冲突：另存副本 / 报错 | 另存副本 |
+| 7 | 启动方式：systemd 用户服务 / 仅保存配置 | 安装服务 |
+
+**怎么拿 token**：
+
+1. 打开 <https://yun.139.com/> 并确认已登录；
+2. `F12` → **Network** → 过滤 `file/list` → 点任意一条请求；
+3. 右侧 **Request Headers** → 复制 `Authorization: Basic ...` 整行；
+   或右键请求 → **Copy → Copy as cURL**。
+
+粘贴时按 `Ctrl-D` 结束。向导只显示脱敏账号与到期时间，不显示 token 明文。
+不要复制 Cookie 里的 `skey` / `auth_token` / `ud_id`，它们不是 Authorization。
+
+非交互环境用行模式：
+
+```bash
+mcloud-fuse setup --no-tui --yes \
+  --mountpoint ~/mnt/cloud --cache-dir ~/.cache/mcloud-fuse --no-service
+```
+
+---
+
+## 懒加载：不访问就不下载
+
+挂载点空闲时，本地只有**元数据映射**，没有云盘文件的副本：
+
+- `ls` / `stat`：只拉当前目录的元数据（带 TTL 缓存），不下载内容；
+- `open()`：只建一个大小已知的稀疏空壳，不下载；
+- `read()`：才按 4MiB 分片发起 Range 请求，只保留读过的块；
+- `write()`：才创建写回暂存 `.wb`，`close` / `fsync` 时才上传；
+- 没有后台预取、没有全盘同步、没有启动时列举整棵树。
+
+所以「挂上一个 1TB 云盘」不会先占 1TB 本地空间；只有真正读写的文件才产生缓存。
+`MCLOUD_LAZY_READ=0` 可以退回旧的整文件下载行为（不推荐）。
+
+---
+
+## 日常使用
+
+| 命令 | 作用 |
+| --- | --- |
+| `mcloud-fuse` | 挂载（未配置或 token 失效时自动进入向导） |
+| `mcloud-fuse mount` | 显式挂载；可临时覆盖 `--mountpoint` / `--root` / `--cache-dir` |
+| `mcloud-fuse unmount` | 卸载；必要时先停 systemd 用户服务 |
+| `mcloud-fuse status` | 配置、挂载状态、token 到期时间、服务状态 |
+| `mcloud-fuse setup` | 重新运行设置向导 |
+| `mcloud-fuse journal list \| forget \| gc \| retry` | 写回日志查看 / 清理 / 补传 |
+| `mcloud-fuse doctor` | 环境、网络、配额自检 |
+| `mcloud-fuse trash list \| restore \| empty` | 回收站查看 / 恢复 / 清空 |
+
+```bash
+mcloud-fuse                 # 挂载，前台运行；Ctrl+C 卸载
+mcloud-fuse status          # 看是否挂上了
+ls ~/mnt/mcloud             # 像本地目录一样用
+mcloud-fuse unmount         # 卸载
+```
+
+`Ctrl+C` 是优雅卸载：会等删除队列提交完、补传未完成的写回，再 `pyfuse3.close()`。
+不要在挂载点目录里执行 `unmount`，先 `cd` 出去。
+
+---
+
+## 配置文件
+
+路径：`~/.config/mcloud-fuse/config.json`（0600，向导自动生成）
+
+```json
+{
+  "mountpoint": "/home/you/mnt/mcloud",
+  "cache_dir": "/home/you/.cache/mcloud-fuse",
+  "root": "/",
+  "rm_mode": "delete",
+  "conflict": "copy",
+  "install_service": true,
+  "version": 1
+}
+```
+
+环境变量优先于配置文件，常用覆盖：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MCLOUD_CACHE_DIR` | `/tmp/cmcloud-fuse` | 读缓存 / 写回文件（tmpfs） |
+| `MCLOUD_MAX_CACHE_MB` | 自动（128~512） | 读缓存上限 |
+| `MCLOUD_WRITE_BACK_DIR` | `<缓存目录>/writeback` | 待上传文件；指到持久盘可跨重启保留 |
+| `MCLOUD_MAX_WRITE_BACK_MB` | 自动（256~1024） | 待上传文件上限；超过返回 ENOSPC |
+| `MCLOUD_MIN_FREE_MB` | `64` | 缓存目录保留空间 |
+| `MCLOUD_LAZY_READ` | `1` | 所有文件默认按需读；`0` 退回整文件下载 |
+| `MCLOUD_META_CACHE_ENTRIES` | `4096` | 元数据缓存条数上限 |
+| `MCLOUD_WEB_TOKEN_FILE` | `~/.config/mcloud-fuse/web_token` | token 文件（0600） |
+| `MCLOUD_JOURNAL_DB` | `~/.local/state/mcloud-fuse/writeback-<hash>.sqlite3` | 写回日志（SQLite，持久化；按缓存目录分库） |
+| `MCLOUD_STATE_DIR` | `~/.local/state/mcloud-fuse` | 状态目录（放日志） |
+| `MCLOUD_JOURNAL_SYNC` | `NORMAL` | SQLite 同步级别；payload 放持久盘且要抗断电时设 `FULL` |
+| `MCLOUD_RESCUE_ON_SHUTDOWN` | `1` | 关机时把 tmpfs 里的待上传文件抢救到持久盘 |
+| `MCLOUD_RESCUE_MAX_MB` | `1024` | 单次关机抢救总量上限 |
+| `MCLOUD_RESCUE_FILE_MAX_MB` | `512` | 单文件超过该大小直接跳过 |
+| `MCLOUD_RESCUE_TIMEOUT_SEC` | `20` | 抢救总超时，超时立即停止 |
+| `MCLOUD_RESCUE_MIN_FREE_MB` | `256` | 目标盘保留空间 |
+| `MCLOUD_STOP_EXTEND_MAX_SEC` | `30` | 关机时向 systemd 申请延长停止超时的上限 |
+| `MCLOUD_RM_MODE` | `delete` | `delete`=真删；`trash`=进回收站 |
+| `MCLOUD_CONFLICT` | `copy` | 覆盖写冲突：`copy` 另存副本；`error` 返回 ESTALE |
+| `MCLOUD_API_MAX_CONCURRENT` | `3` | API 最大并发 |
+| `MCLOUD_API_RPS` | `5` | 每秒请求上限 |
+| `MCLOUD_EAGER_DOWNLOAD_LIMIT` | `0` | `0`=所有文件按需读；>0 时只对大文件按需读 |
+| `MCLOUD_RANGE_CHUNK` | `4194304` | 按需读分片大小 |
+| `MCLOUD_WEB_PART_SIZE` | `104857600` | 上传分片大小 |
+| `MCLOUD_LOG` | `INFO` | 设为 `DEBUG` 看详细调用 |
+
+完整列表见 `mcloud_fuse/config.py`；临时调试可以直接
+`MCLOUD_CACHE_DIR=/tmp/cache mcloud-fuse mount`。
+
+---
+
+## 写回日志与重启：为什么日志不在 `/tmp`
+
+读写缓存和待上传文件都放在 `/tmp/cmcloud-fuse`（tmpfs，内存盘）：
 
 ```text
-用户态应用 (ls / cp / vim / rsync ...)
-        │  VFS
-        ▼
-┌──────────────────────────────────────────────┐
-│ mcloud_fuse/fuse/fuse_ops.py   MCloudFuseOps         │  pyfuse3.Operations 回调
-│  getattr / lookup / readdir / open / read     │  阻塞 I/O 全部丢进 trio 线程
-│  create / write / fsync / release / mkdir     │
-│  unlink / rmdir / rename / setattr / statfs   │
-└───────┬───────────────┬───────────────┬───────┘
-        ▼               ▼               ▼
-  mapping/          cache/          utils/ + client/
-  id_map.py         meta_cache.py   wrapper.py (DirectClientWrapper)
-  tree.py           data_cache.py   trash_bin.py
-  tombstones.py                      └── router/rate_limiter.py, retry.py
-        │
-        ▼
-  官方 Skill SDK（basement/scripts/*，Direct Import，不走 subprocess）
-        │  HTTPS
-        ▼
-  中国移动云盘开放接口
+/tmp/cmcloud-fuse             读缓存，丢了可以重新下载
+/tmp/cmcloud-fuse/writeback   待上传文件（.wb），重启后会消失
 ```
 
-| 模块 | 职责 |
+但「哪些文件还没上传」这份**元数据**不能也放 tmpfs，否则进程崩溃后连线索都没了。
+所以 v0.4.0 拆成两层：
+
+```text
+~/.local/state/mcloud-fuse/writeback-<hash>.sqlite3   SQLite 日志（几 KB，持久化）
+/tmp/cmcloud-fuse/writeback/*.wb               文件内容（大，tmpfs）
+```
+
+- 进程崩溃 / 被 kill：payload 还在，下次启动按 SQLite 日志补传；
+- **正常关机（SIGTERM）**：先通过 `sd_notify` 向 systemd 申请最多 30 秒停止延时，
+  再把 `pending` / `uploading` 的 payload 抢救到
+  `~/.local/state/mcloud-fuse/rescue/`；下次启动从持久盘补传。`building` 半成品不抢救；
+- 整机重启 / 断电：payload 没了，日志条目会标成 `lost`，`mcloud-fuse status`
+  和 `doctor` 会显示数量，不会假装补传成功；
+- 想连整机重启也保住待上传内容：把 `MCLOUD_WRITE_BACK_DIR` 指到持久化磁盘
+  （例如 `~/.cache/mcloud-fuse/writeback`），日志仍然单独放 state 目录。
+
+这是「内存换速度」的明确取舍，不是静默行为。
+
+### 实际使用中要注意
+
+- **待上传文件不参与读缓存 LRU**：`cp` 一个大文件进挂载点时，`.wb` 会一直占着
+  tmpfs，直到 `close` 后上传完成；tmpfs 被写满会报 `ENOSPC`，严重时影响整机内存。
+  大文件写入建议把 `MCLOUD_CACHE_DIR` 指到持久化磁盘。
+- **补传在挂载后后台进行**：进程崩溃后若有大量待传文件，挂载点会先可用，
+  补传在后台逐个进行；`status` 的“待传”数量会逐步下降。
+- **只有 `fsync` / `close` 之后才进入可恢复状态**：只 `write` 没 `fsync` 就崩溃，
+  按 POSIX 不保证数据；系统会把条目标成 `lost`，而不是上传半成品。
+- **默认就是懒加载**：`open()` 不下载内容，`read()` 才按 4MiB 分片拉取；`ls` / `stat`
+  只访问元数据。想恢复旧的整文件下载，设 `MCLOUD_LAZY_READ=0`。
+- **写回有硬上限**：默认 256~1024MiB（随内存），超过直接 `ENOSPC`，不会把 tmpfs
+  写满；大文件写入前可以先调大上限或把写回目录指到磁盘。
+- **多账号要分开缓存目录**：不同账号共用同一个 `/tmp/cmcloud-fuse` 可能发生
+  fileId 撞车；每个账号用独立的 `--cache-dir`（日志也会按目录自动分库）。
+  同一缓存目录同一时间只允许一个挂载进程（`flock` 锁），第二个会直接报错。
+
+### 写回日志操作
+
+```bash
+mcloud-fuse journal list                 # 待传 / building / lost
+mcloud-fuse journal list --lost --json   # 只看看丢了什么
+mcloud-fuse journal forget --lost --purge  # 清掉 lost 记录和 payload
+mcloud-fuse journal gc                   # 清理孤儿 .wb 和过期 building
+mcloud-fuse journal retry                # 未挂载时手动补传 pending
+```
+
+`forget` / `gc` 默认拒绝在挂载运行时执行（避免删掉在途写回）；确认要操作时加
+`--force`。
+
+---
+
+## 常见问题
+
+| 现象 | 处理 |
 | --- | --- |
-| `mcloud_fuse/main.py` | 挂载入口：取沙箱 fileId、装配组件、`pyfuse3.init` + `trio.run` |
-| `mcloud_fuse/config.py` | 路径 / TTL / 限流 / 多段上传参数（支持环境变量覆盖） |
-| `mcloud_fuse/fuse/fuse_ops.py` | 所有 FUSE 回调实现、写回状态机、错误码映射 |
-| `mcloud_fuse/mapping/id_map.py` | inode ↔ path ↔ fileId 映射与分配器 |
-| `mcloud_fuse/mapping/tree.py` | 目录充填、同名去重、陈旧对账、索引宽限期 |
-| `mcloud_fuse/mapping/tombstones.py` | 已删除 fileId 的持久化墓碑集合 |
-| `mcloud_fuse/cache/meta_cache.py` | `getattr` / `readdir` 的 TTL 缓存 |
-| `mcloud_fuse/cache/data_cache.py` | 读缓存 + LRU、写回暂存与写回日志（崩溃恢复） |
-| `mcloud_fuse/client/wrapper.py` | 云盘 SDK 封装：列举 / 下载 / 上传（多段）、限流与重试落点 |
-| `mcloud_fuse/client/auth_manager.py` | 登录态与 creditToken 生命周期 |
-| `mcloud_fuse/router/rate_limiter.py` | 线程安全并发 + RPS 限流 |
-| `mcloud_fuse/router/retry.py` | 同步指数退避重试 |
-| `mcloud_fuse/utils/trash_bin.py` | 删除策略：墓碑 + 本地摘除（`MCLOUD_TRASH_COPY=1` 时才复制副本） |
+| `未找到 Web token` | 运行 `mcloud-fuse setup`，重新粘贴 token |
+| `token 已过期` / 401 | 浏览器刷新云盘页面后重新复制；确认是 `file/list` 的 Authorization |
+| `token 续期被拒绝` | 续期接口可能需要设备指纹，直接重新导入 token |
+| 找不到 `fusermount3` | `sudo apt-get install -y fuse3 libfuse3-dev` |
+| `Device or resource busy` | 有进程停在挂载点，先 `cd` 出去再 `mcloud-fuse unmount` |
+| `Transport endpoint is not connected` | 进程被强杀后的失效挂载：`fusermount3 -uz <挂载点>` |
+| `df -i` 显示 `-` | 云盘没有 inode 概念，`statfs` 按约定报 0 |
+| `ls` 很慢 | 首次列举要拉全目录；检查 `MCLOUD_API_RPS` 与网络 |
+| 服务没起来 | `systemctl --user status mcloud-fuse`；`mcloud-fuse doctor` |
+
+自检顺序：`mcloud-fuse doctor` → 看 token 是否有效 → 看 `/dev/fuse` 权限 →
+`mcloud-fuse status` 看服务与挂载点。
 
 ---
 
-## 📚 文档
+## 安全与边界
 
-- [架构详解](docs/architecture.md)：模块划分、并发模型、读/写/删/恢复四条数据流。
-- [开发指南](docs/development.md)：环境搭建、测试策略、如何新增 FUSE 回调、调试与发布。
-- [事故复盘：目录列举重复与串台](docs/postmortem-readdir.md)：问题、根因、修复与教训。
-- [Release Notes](docs/release-notes.md)。
-
----
-
-## 📋 环境要求
-
-- Linux，内核支持 FUSE3（需要 `/dev/fuse` 与 `fusermount3`）
-- Python 3.10+（开发环境为 3.14）
-- 一个中国移动云盘账号
-
----
-
-## 🚀 安装
-
-### 1. 克隆仓库
-
-```bash
-git clone https://github.com/HinaKawasaki/fuse_mcloud.git
-cd fuse_mcloud
-```
-
-### 2. 安装系统依赖
-
-```bash
-# Debian / Ubuntu
-sudo apt-get update
-sudo apt-get install -y fuse3 libfuse3-dev
-```
-
-### 3. 安装本包
-
-```bash
-pip3 install -e .            # 安装 mcloud-fuse 命令与运行时依赖
-pip3 install -e '.[dev]'     # 可选：额外装 pytest / pytest-cov / ruff（跑测试用）
-```
-
-也可以沿用老的 requirements 文件（它们现在只是 `pyproject.toml` 的转发）：
-
-```bash
-pip3 install -r requirements.txt
-pip3 install -r requirements-dev.txt
-```
-
-> `pyfuse3` 需要编译，若失败请确认已安装 `gcc` 与 `libfuse3-dev`。
-> 依赖清单以 `pyproject.toml` 为唯一来源，`requirements*.txt` 不再单独维护版本。
-
-### 4. 拉取官方云盘 Skill（必做）
-
-官方 Agent Skill 不在本仓库内（`basement/` 已被 `.gitignore` 排除），需单独下载：
-
-```bash
-python3 scripts/setup_basement.py
-```
-
-该脚本会从 SkillHub 下载官方 Skill，并把其中的 `scripts/*.py` 复制到 `basement/scripts/`。
-官方 Skill 的运行时配置（`config.json`、`.env`，含接口地址与鉴权参数）不在被复制的脚本目录里，
-需按官方说明补齐到 `basement/` 下，缺失时命令会提示缺哪些键。
-
-### 5. 登录授权
-
-```bash
-python3 basement/scripts/main.py login
-```
-
-按输出提示在浏览器完成授权；登录态保存在 `basement/auth_info.json`（**请勿提交到仓库**）。
-
-### 6. 挂载
-
-```bash
-mkdir -p /mnt/mcloud
-mcloud-fuse --mountpoint /mnt/mcloud --cache-dir ~/.cache/mcloud-fuse
-```
-
-> 没走 `pip install`（例如直接在仓库里跑）时，用 `python3 -m mcloud_fuse ...` 等价调用。
-
-默认挂载根是沙箱 `/AI空间/智能体云盘助手`。想浏览**整个云盘**，加 `--root cloud`
-（或设 `MCLOUD_ROOT=cloud`）：
-
-```bash
-mcloud-fuse --mountpoint /mnt/mcloud --root cloud --cache-dir ~/.cache/mcloud-fuse
-```
-
-此时 `ls /mnt/mcloud` 就是云盘根目录。官方 Skill 只允许读沙箱内文件，因此读取沙箱外
-文件时，本层会先把云端对象复制到沙箱里的暂存目录 `.MCloudHydrate/<fileId>/` 再下载
-（见[已知限制](#-已知限制)）；写操作仍然只能落在沙箱内，越界的 `mkdir` / 写入会返回 `EACCES`。
-
-首次读取某个沙箱外文件要等一次**云端复制任务**完成（秒级到数十秒，取决于文件大小与云端
-调度），之后走本地读缓存；重启挂载后按「槽位 + 文件名」复用已有副本，不会重复复制。
-
-另一个终端即可操作：
-
-```bash
-ls -la /mnt/mcloud
-cat /mnt/mcloud/某个文件
-cp ./big.iso /mnt/mcloud/
-```
-
-卸载：对运行中的进程按 `Ctrl+C`，或执行 `fusermount3 -u /mnt/mcloud`。
-**注意别停在挂载点目录里**执行卸载/重启：`umount` 会因 `EBUSY` 失败，进程被强杀后
-挂载点会变成 `ENOTCONN` 的失效挂载（新版启动时会自动清理，见[排障](#-排障)）。
-
-### 7.（可选）安装为 systemd 服务
-
-```bash
-sudo ./scripts/install_service.sh /path/to/fuse_mcloud /mnt/mcloud /var/cache/mcloud-fuse
-```
-
-脚本会写入 `/etc/default/mcloud-fuse` 并启用 `mcloud-fuse.service`（`Restart=on-failure`）。
+- **token 是账号全权凭据**：只放本机 0600 文件；泄漏等于账号被接管。本项目不接触
+  账号密码，也不会把 token 写进日志或服务单元。
+- **`rm` 默认是永久删除**：`/file/batchDelete` 不进回收站。需要可恢复时设
+  `MCLOUD_RM_MODE=trash`，或改配置里的 `rm_mode`。
+- **无随机写**：上传接口要求先给出总大小，所以 `write` 先落本地、`release` 整文件上传。
+- **tmpfs 重启会丢待上传内容**：日志能保留，但 payload 在 `/tmp`；需要跨重启保住
+  写回时改 `MCLOUD_WRITE_BACK_DIR`。
+- **上传按序**：分片必须按 partNumber 顺序发送；不支持跨进程断点续传。
+- **POSIX 语义不完整**：`chmod` / `chown` / 时间戳被忽略；不支持 xattr、符号链接、
+  硬链接、`allow_other`。
+- **锁只在本机有效**：`flock` / `fcntl` 由内核在本地维护；跨挂载、跨主机、手机 App /
+  网页端都不受约束。
+- **每人一个账号**：一个挂载对应一个账号；共享只读 `allow_other` 不在当前计划。
 
 ---
 
-## ⚙️ 配置
+## 更多文档
 
-运行时参数集中在 `mcloud_fuse/config.py`，均可用环境变量覆盖：
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MCLOUD_CACHE_DIR` | `/tmp/cmcloud-fuse/cache` | 读缓存目录 |
-| `MCLOUD_WRITE_BACK_DIR` | `/tmp/cmcloud-fuse/writeback` | 写回暂存 / 写回日志目录 |
-| `MCLOUD_API_MAX_CONCURRENT` | `3` | 云盘 API 最大并发 |
-| `MCLOUD_API_RPS` | `5` | 云盘 API 每秒请求数上限 |
-| `MCLOUD_MULTIPART_THRESHOLD` | `16777216`（16MiB） | 超过该大小改用多段上传 |
-| `MCLOUD_MIN_PART_SIZE` | `5242880`（5MiB） | 最小分片（接口硬限制） |
-| `MCLOUD_MAX_PARTS` | `64` | 最大分片数（据此自动调整分片大小） |
-| `MCLOUD_PART_RETRIES` | `3` | 单个分片上传尝试次数 |
-| `MCLOUD_UPLOAD_KEEP_CACHE` | `1` | 上传后是否把写回文件保留为读缓存（`0` = 上传后删除） |
-| `MCLOUD_ROOT` | `sandbox` | 挂载根：`sandbox` 只暴露沙箱；`cloud` 暴露云盘根（沙箱外文件懒搬运） |
-| `MCLOUD_HYDRATE_DIR` | `.MCloudHydrate` | 沙箱内的懒搬运暂存目录名（挂载云盘根时使用） |
-| `MCLOUD_BASEMENT_DIR` | 自动探测 | 官方 Skill 所在目录（`basement` 或 `basement/scripts`），装在仓库外时用它指定 |
-| `MCLOUD_TRASH_COPY` | `0` | 删除时是否额外把对象复制进 `.TrashBin`（`1` = 旧行为，会让被删对象占双倍容量） |
-| `MCLOUD_EAGER_DOWNLOAD_LIMIT` | `268435456`（256MiB） | 超过该大小的文件走按需（Range）读取；`0` = 关闭，总是整文件下载 |
-| `MCLOUD_RANGE_CHUNK` | `4194304`（4MiB） | 按需读的单次预取粒度 |
-| `MCLOUD_RANGE_TIMEOUT` | `60` | 单个分片请求的超时秒数 |
-
-`MAX_CACHE_SIZE_MB` 留 `None` 时按物理内存的 25% 自动设定。
+- [文档索引](docs/README.md)：按入门 / 设计 / 运维 / 历史分类
+- [架构详解](docs/architecture.md)：FUSE 回调、缓存、写回、映射层
+- [TUI 设计](docs/tui.md)：首次设置向导的页面、按键与降级行为
+- [开发指南](docs/development.md)：环境、测试分层、新增 FUSE 回调
+- [性能基线](docs/performance.md)：大目录、上传、删除、冷/热读的实测数字
+- [端点契约](docs/contracts.md)：真实响应样例与漂移检查
+- [Web API 分析](docs/web-api-analysis.md)：端点、鉴权、签名、风险
+- [ADR-0002](docs/adr/0002-web-api-optin.md)：为什么启用 Web API、如何隔离
+- [ADR-0003](docs/adr/0003-multiuser-and-locking.md)：多用户与文件锁
+- [发布记录](docs/release-notes.md)
 
 ---
 
-## 🧪 测试
-
-### 离线单元 / 回归测试（不需要登录态）
+## 测试
 
 ```bash
-python3 -m pytest tests -q                       # 全部离线用例
-python3 -m pytest tests -q --cov=mcloud_fuse     # 附带覆盖率报告
+python3 -m pytest tests -q                    # 离线单测 / 回归
+python3 -m pytest tests -q --cov=mcloud_fuse
+
+python3 tests/integration/fuse_mount_smoke.py # 内存假云盘 + 真实内核挂载
+python3 tests/integration/posix_stress.py
 ```
 
-覆盖：目录列举去重与稳定分页、按目录列举、陈旧清理、索引延迟、写回上传、覆盖写、截断、
-删除后不复活、墓碑持久化、删除默认不产生云端副本、按需（Range）读取、多段上传规划与字节重组、
-限流并发上限与退避重试、写回崩溃恢复。
-
-### 真实 FUSE 挂载冒烟（内存假云盘，不需要登录态）
+真实云盘与契约检查：
 
 ```bash
-python3 tests/integration/fuse_mount_smoke.py   # 只读 / 写回 / 删除全链路
-python3 tests/integration/posix_stress.py       # 大目录一致性、递归遍历、批量读写删
+python3 scripts/web139_smoke.py --list-only
+python3 scripts/check_contracts.py --live
 ```
 
-### 真实云盘端到端（需要登录态）
-
-```bash
-# 探测下载直链是否支持 HTTP Range（决定大文件按需读能否真正生效；只发两次 1KiB 请求）
-python3 scripts/check_range_support.py
-
-# 只读校验：官方 CLI 与本地列举一致、cat 字节一致
-python3 tests/integration/real_mount_smoke.py
-
-# 追加写入校验（会在云盘留下 _mcloud_fuse_probe 目录；接口无删除能力，残留只能去 App 清）
-MCLOUD_LIVE_WRITE=1 python3 tests/integration/real_mount_smoke.py
-
-# 大文件上传（cp 走写回 + 多段）与空缓存强制下载
-./tests/integration/large_file_live.sh /path/to/big.iso
-./tests/integration/large_file_read_live.sh big.iso <预期sha256> [/path/to/big.iso]
-
-# 真实云盘连通性
-MCLOUD_LIVE_TESTS=1 python3 -m pytest tests/test_wrapper.py tests/test_auth.py -q
-```
-
-> 真机测试会在你的云盘里创建文件。云盘接口**没有删除能力**，测试残留只能手动在 App 里清理。
-
 ---
 
-## 🔍 关键设计说明
+## License
 
-**为什么 `readdir` 不能用搜索接口？**
-云盘「全盘搜索」在不传目录 ID 时会返回整个盘的文件。早期实现把它当成目录列举，导致每个目录都能看到
-全盘条目并出现大量重复行。现在只按当前目录 `fileId` 调用列举并自动翻页。
+MIT。云盘接口的使用请自行遵守服务条款。
 
-**为什么 `close()` 之后还要等？**
-FUSE 的 `release` 是异步的：`close()` 返回时后台上传可能仍在进行。此时若立即 `open` / `read`，
-会读到尚未替换的占位 fileId。实现里用「在途上传事件」让后续操作等待；未关闭的写句柄直接读本地暂存。
-
-**为什么读要一直拿着 fd，还要「钉住」缓存？**
-读缓存是 LRU 的，下载另一个文件就可能触发淘汰。如果 `read` 每次都按路径重新 `open`，被淘汰的
-文件会从正在读的句柄脚下消失（表现为 `EBADF`/`ENOENT`）——尤其常见于「`open` 之后隔一会儿才读」
-的程序。现在 `open` 就把文件描述符拿在手上、并用 `pread` 读取，同时把缓存条目标记为「占用中」：
-淘汰只会摘掉缓存映射，真正的删除推迟到最后一个句柄 `close()`，与 POSIX 语义一致。
-
-**删除为什么需要墓碑？**
-云盘接口没有删除。删除 = 登记墓碑 + 本地摘除节点，但云端原对象仍在，下次列举会「复活」。
-（默认不再往 `.TrashBin` 复制副本：原对象没消失，复制只是白占一倍容量。）
-墓碑记录已删除的 fileId，充填目录时屏蔽它们；墓碑落盘，重启后依然有效。
-
-**索引最终一致怎么办？**
-刚创建 / 刚覆盖的对象在几秒内可能查不到。本地会为它们保留一段「宽限期」（默认 300s），
-云端收录后自动恢复常规对账。
-
-**多段上传为什么要按序？**
-实测该后端会维护「上一片哈希上下文」，并发或乱序会返回 `InvalidPartOrder`；同时除末片外每片不得小于 5MiB。
-因此多段的价值在于分片级重试与规避单次超大 PUT，而不是并发提速。
-
----
-
-## ⚠️ 已知限制
-
-- **没有真正的删除与重命名**：官方 Skill 只有 create / search / copy / download 一类接口，
-  **不存在删除或回收站接口**，所以：
-  - `unlink` / `rmdir` = 登记墓碑 + 本地摘除。**不释放云盘容量**，但也**不再产生额外副本**
-    （默认 `MCLOUD_TRASH_COPY=0`）：原对象留在原处并被墓碑隐藏，在官方 App 里它依然存在。
-  - 想让被删对象「回来」：删掉对应的墓碑记录即可（原对象从未移动）。
-    想真正腾出容量：只能在官方 App / 网页端删除——App 会把它放进云盘自己的回收站，本层做不到。
-  - 历史版本或用 `MCLOUD_TRASH_COPY=1` 时产生的 `.TrashBin` 副本同样只能去 App 里清；
-    本挂载既看不到（隐藏目录）也删不掉它们。
-  - 文件重命名通过「下载 + 新名上传 + 旧对象登记墓碑」实现，**目录重命名返回 `ENOSYS`**（跨目录同名移动可用）。
-- **挂载云盘根时沙箱外文件需「懒搬运」**：官方接口只允许下载沙箱内文件，因此第一次读取
-  沙箱外文件会先云内复制到沙箱暂存目录 `.MCloudHydrate/<fileId>/`（对用户隐藏）。
-  副本同样**不释放容量**、会占用云盘空间，同一文件同一进程内只搬一次，重启后按
-  「槽位 + 文件名」复用；写、改名、删除仍只允许发生在沙箱内。
-  首次读延迟取决于云端复制任务；整条搬运链路只用 `batchCheckExists` / `batchCopy` /
-  `batchGet`，不依赖最终一致的搜索接口。
-- **覆盖写会产生同名旧版本**：云盘无 in-place 更新，覆盖写会生成新 fileId，旧对象留在云端（本地用墓碑屏蔽）。
-- **墓碑是本地状态**：换机器 / 清空缓存目录后，之前「删除」过的云端对象会重新出现。
-- **多段上传必须按序**，无法并发加速；跨进程不支持从中间分片续传（崩溃后由写回日志整文件重传）。
-- **写回必须整文件落本地**：接口要求在创建上传任务时就给出总大小，无法边写边传。不过收尾是
-  `os.replace` 改名进读缓存（同文件系统零拷贝），不会为同一文件再占一份磁盘；
-  `MCLOUD_UPLOAD_KEEP_CACHE=0` 可在上传后直接删除本地副本。
-- **POSIX 语义不完整**：`chmod` / `chown` / 时间戳设置被静默忽略；不支持 `flock` / `fcntl` 锁、xattr、
-  符号链接 / 硬链接、`allow_other` 多用户。
-- **按需读取只覆盖「纯读」**：大文件按需拉取分片，但一旦发生覆盖写 / `truncate` / `rename`
-  （需要整文件上传）或读取的文件不足阈值，就会退回整文件下载——这是云盘接口的语义限制。
-  另外按需读的本地空壳会按文件大小计入缓存容量（`MCLOUD_EAGER_DOWNLOAD_LIMIT=0` 可关闭）。
-  分片长度会与元数据 `size` 校验：不一致时直接报错，而不是留下一个被截断的本地副本。
-- **元数据 TTL 60s**：远端改动最长约 1 分钟才可见；索引宽限期内远端删除也可能被暂时隐藏。
-- 文件大小以云端元数据为准；若云端 size 不准，读取会被内核按 `st_size` 截断。
-
----
-
-## 🩺 排障
-
-| 现象 | 原因 / 处理 |
-| --- | --- |
-| `未登录授权，请使用 login 命令` | 先执行 `python3 basement/scripts/main.py login` 完成授权 |
-| `权限拒绝：... 不在 /AI空间/智能体云盘助手 及其子目录下` | 官方 Skill 只允许写沙箱目录；本挂载的根就是沙箱根，越界路径会被拒绝 |
-| 读文件报 `无法确认 pending-xxx 的云盘路径` | 写回尚未完成；正常路径已同步等待，若仍出现请查看日志中的「写回上传失败」 |
-| `ls` 看不到刚建的文件 | 云盘索引延迟，几秒后重试；本层有宽限期不会误删，但其它客户端需等索引 |
-| 卸载提示 `Device or resource busy` | 仍有进程在使用挂载点，先 `cd` 出去或用 `lsof` 找到占用进程 |
-| `Transport endpoint is not connected`（`ENOTCONN`） | 挂载进程被强杀后留下的失效 FUSE 挂载。常见于**在挂载点目录里**执行 `stop`/`restart`：卸载遭遇 `EBUSY`、systemd 随后强杀进程。先 `cd` 出去，再 `fusermount3 -uz /mnt/mcloud` |
-| 服务反复重启并报 `FileExistsError: [Errno 17] File exists` | 同上，挂载点是失效挂载，`mkdir(exist_ok=True)` 会失败。新版启动时会自动 `fusermount3 -u`/`-uz` 清理残留；手工处理同样是 `cd` 出去 + `fusermount3 -uz /mnt/mcloud` |
-| `systemctl --user stop` 后 `ps` 里还有进程 | 卸载被占用时会等 `TimeoutStopSec`（默认 20s）再强杀；确认没有 shell 停在挂载点里 |
-| 上传大文件很慢 | 多段为按序上传，速度受带宽限制；可调 `MCLOUD_MAX_PARTS` 控制分片数量 |
-
-设置 `MCLOUD_LOG=DEBUG`（配合真机脚本）可看到更详细的调用过程。
-
----
-
-## 🗺 项目状态
-
-- [x] 第一阶段：SDK 集成、鉴权、限流退避、沙箱与回收站路由
-- [x] 第二阶段：三向映射、元数据 TTL 缓存、读缓存与 LRU
-- [x] 第三阶段：只读挂载、写回缓存与上传、回收站删除
-- [x] 第四阶段：崩溃恢复、POSIX 压测、systemd 打包
-- [x] 加固：目录列举修复、异步 release 同步、索引最终一致性、多段上传、限流接入、死代码清理
-- [x] v0.3.0：
-  - **工程化**：`src/` → 可安装包 `mcloud_fuse`、`mcloud-fuse` 命令入口与 `--version`、
-    版本单一来源、GitHub Actions CI（ruff + pytest 矩阵 + 真实挂载 + 覆盖率门槛）
-  - **修复**：读缓存 LRU 淘汰与在途读的竞态（读句柄持有 fd + 缓存条目钉住/延迟删除），
-    以及同一 inode 并发打开互相覆盖句柄
-  - **大文件按需读取**：超过阈值不再整文件下载，`read` 按 Range 分片拉取；服务端不支持
-    Range 时自动降级；`scripts/check_range_support.py` 可探测直链能力
-  - **删除不再烧双倍容量**：确认 Skill 无任何删除接口，删除改为「墓碑 + 本地摘除」，
-    不再往 `.TrashBin` 复制副本（`MCLOUD_TRASH_COPY=1` 保留旧行为）
-
-已在真实云盘验证：官方 CLI 与本地列举一致、`cat` 字节一致、`mkdir` / 写入 / 覆盖写 / 删除，
-756MiB 文件多段上传（133s）与空缓存下载（21s，sha256 一致）。
-
-后续可做：墓碑管理（列出/恢复被删对象，代替删不掉的回收站）、`rename` 语义增强、
-`allow_other` 多用户与文件锁支持、Grafana 风格指标。
-
----
-
-## 📄 License
-
-本项目采用 [MIT License](LICENSE)。
-
-## 🙏 致谢
-
-- 云盘能力来自中国移动云盘官方 Agent Skill（`cm-cloud-manage`），本仓库不包含其代码。
-- 文件系统层基于 [`pyfuse3`](https://github.com/libfuse/pyfuse3) 与 [`trio`](https://trio.readthedocs.io/)。
+协议细节参考 [OpenList/AList 的 139 驱动](https://github.com/AlistGo/alist/tree/main/drivers/139)；
+文件系统层基于 [`pyfuse3`](https://github.com/libfuse/pyfuse3) 与
+[`trio`](https://trio.readthedocs.io/)。

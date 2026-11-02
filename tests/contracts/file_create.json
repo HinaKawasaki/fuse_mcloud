@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "parentFileId": "/",
+    "fileId": "Fnew000000000000000000000000000000",
+    "type": "file",
+    "fileName": "hello.txt",
+    "rapidUpload": false,
+    "uploadId": "2~upload-id-sample",
+    "partInfos": [
+      {
+        "partNumber": 1,
+        "partSize": null,
+        "uploadUrl": "https://example.invalid/part1?partNumber=1&uploadId=2~upload-id-sample"
+      }
+    ]
+  }
+}

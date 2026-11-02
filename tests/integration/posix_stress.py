@@ -20,7 +20,6 @@ HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
-sys.path.insert(0, str(ROOT / "basement" / "scripts"))
 
 import pyfuse3  # noqa: E402
 import trio  # noqa: E402
@@ -134,6 +133,37 @@ class StressCloud:
             results.append({"fileId": file_id, "newFileId": new_id})
         return results
 
+    # --- Web 后端新增：rm / rename / move ---
+    def rename(self, file_id, new_name):
+        for items in self.dirs.values():
+            for item in items:
+                if item["id"] == file_id:
+                    item["name"] = new_name
+                    return
+        raise FileNotFoundError(file_id)
+
+    def move(self, file_ids, to_parent_file_id):
+        for file_id in file_ids:
+            found = None
+            for items in self.dirs.values():
+                for item in items:
+                    if item["id"] == file_id:
+                        found = item
+                        items.remove(item)
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                raise FileNotFoundError(file_id)
+            self.dirs.setdefault(to_parent_file_id, []).append(found)
+
+    def delete(self, file_ids, permanent=True):
+        for file_id in file_ids:
+            for items in self.dirs.values():
+                items[:] = [item for item in items if item["id"] != file_id]
+            self.dirs.pop(file_id, None)
+            self.content.pop(file_id, None)
+
 
 def main() -> int:
     import tempfile
@@ -158,6 +188,7 @@ def main() -> int:
         write_back_dir=workdir / "wb",
         max_size_mb=cache_mb,
         eager_download_limit_bytes=eager_limit,
+        journal_db=workdir / "journal.sqlite3",
     )
     ops = MCloudFuseOps(mapper, tree, MetaCache(ttl=5.0), cache, cloud)
 

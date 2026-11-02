@@ -7,6 +7,7 @@ PROJECT_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MOUNTPOINT="${2:-/mnt/mcloud}"
 CACHE_DIR="${3:-/var/cache/mcloud-fuse}"
 PYTHON_BIN="${MCLOUD_PYTHON:-$(command -v python3)}"
+TOKEN_FILE="${MCLOUD_WEB_TOKEN_FILE:-/etc/mcloud-fuse/web_token}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行： sudo $0" >&2
@@ -20,7 +21,8 @@ echo "Python   : $PYTHON_BIN"
 
 command -v fusermount3 >/dev/null || { echo "缺少 fusermount3，请先安装 fuse3" >&2; exit 1; }
 
-mkdir -p "$MOUNTPOINT" "$CACHE_DIR"
+mkdir -p "$MOUNTPOINT" "$CACHE_DIR" /etc/mcloud-fuse
+chmod 700 /etc/mcloud-fuse
 
 cat > /etc/default/mcloud-fuse <<EOF
 # mcloud-fuse 运行参数
@@ -28,6 +30,7 @@ MCLOUD_PROJECT_DIR=$PROJECT_DIR
 MCLOUD_MOUNTPOINT=$MOUNTPOINT
 MCLOUD_CACHE_DIR=$CACHE_DIR
 MCLOUD_PYTHON=$PYTHON_BIN
+MCLOUD_WEB_TOKEN_FILE=$TOKEN_FILE
 EOF
 
 install -m 0644 "$PROJECT_DIR/scripts/mcloud-fuse.service" /etc/systemd/system/mcloud-fuse.service
@@ -37,4 +40,5 @@ systemctl enable --now mcloud-fuse.service
 sleep 2
 systemctl --no-pager --full status mcloud-fuse.service || true
 echo
-echo "提示：如挂载失败，请先在 '$PROJECT_DIR' 下完成云盘登录（执行 basement/scripts/main.py login）。"
+echo "提示：如挂载失败，请先导入 Web token："
+echo "  sudo $PYTHON_BIN $PROJECT_DIR/scripts/import_web_token.py --path $TOKEN_FILE"

@@ -1,10 +1,11 @@
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
-from mcloud_fuse.config import META_CACHE_TTL
+from mcloud_fuse.config import META_CACHE_MAX_ENTRIES, META_CACHE_TTL
 from mcloud_fuse.mapping.id_map import InodeEntry
 
 logger = logging.getLogger(__name__)
@@ -26,15 +27,19 @@ class MetaCache:
     提供针对 getattr (InodeEntry) 和 readdir (child inodes/entries) 的秒级内存响应
     """
 
-    def __init__(self, ttl: float = META_CACHE_TTL):
+    def __init__(self, ttl: float = META_CACHE_TTL, max_entries: Optional[int] = None):
         self.ttl = ttl
+        self.max_entries = max(
+            1,
+            META_CACHE_MAX_ENTRIES if max_entries is None else int(max_entries),
+        )
         self._lock = threading.RLock()
 
         # inode -> getattr 元数据缓存 (CacheEntry[InodeEntry])
-        self._attr_cache: Dict[int, CacheEntry] = {}
+        self._attr_cache: "OrderedDict[int, CacheEntry]" = OrderedDict()
 
         # parent_inode -> readdir 子节点列举缓存 (CacheEntry[List[InodeEntry]])
-        self._dir_cache: Dict[int, CacheEntry] = {}
+        self._dir_cache: "OrderedDict[int, CacheEntry]" = OrderedDict()
 
     # ------------------ 1. Getattr (文件属性) 缓存 ------------------
 
@@ -47,12 +52,16 @@ class MetaCache:
             if entry.is_expired(self.ttl):
                 self._attr_cache.pop(inode, None)
                 return None
+            self._attr_cache.move_to_end(inode)
             return entry.data
 
     def put_attr(self, inode: int, entry: InodeEntry):
-        """存入/更新 inode 的属性缓存"""
+        """存入/更新 inode 的属性缓存；超过上限时淘汰最久未用的条目。"""
         with self._lock:
             self._attr_cache[inode] = CacheEntry(data=entry)
+            self._attr_cache.move_to_end(inode)
+            while len(self._attr_cache) > self.max_entries:
+                self._attr_cache.popitem(last=False)
 
     def invalidate_attr(self, inode: int):
         """使特定 inode 的属性缓存失效"""
@@ -70,12 +79,16 @@ class MetaCache:
             if entry.is_expired(self.ttl):
                 self._dir_cache.pop(parent_inode, None)
                 return None
+            self._dir_cache.move_to_end(parent_inode)
             return entry.data
 
     def put_readdir(self, parent_inode: int, children: List[InodeEntry]):
-        """存入/更新父目录的子项列表缓存"""
+        """存入/更新父目录的子项列表缓存；超过上限时淘汰最久未用的条目。"""
         with self._lock:
             self._dir_cache[parent_inode] = CacheEntry(data=children)
+            self._dir_cache.move_to_end(parent_inode)
+            while len(self._dir_cache) > self.max_entries:
+                self._dir_cache.popitem(last=False)
 
     def invalidate_readdir(self, parent_inode: int):
         """使特定父目录的 readdir 缓存失效"""

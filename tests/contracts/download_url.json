@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "fileId": "Ffile00000000000000000000000000000",
+    "errCode": null,
+    "message": null,
+    "url": "https://example.invalid/download?sig=sample"
+  }
+}

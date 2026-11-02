@@ -3,8 +3,8 @@ import threading
 import time
 
 import pytest
-from cm_cloud_errors import ApiError, PermissionDeniedError
 
+from mcloud_fuse.errors import MCloudAPIException, MCloudAuthException
 from mcloud_fuse.router.rate_limiter import RateLimiter, global_rate_limiter
 from mcloud_fuse.router.retry import retry_call
 
@@ -55,7 +55,7 @@ def test_retry_succeeds_after_transient_failures():
     def flaky():
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise ApiError("临时网络故障")
+            raise MCloudAPIException("临时网络故障")
         return "OK"
 
     result = retry_call(flaky, max_retries=3, initial_delay=0.01, jitter=False)
@@ -68,9 +68,9 @@ def test_retry_gives_up():
 
     def always_fail():
         attempts["n"] += 1
-        raise ApiError("一直失败")
+        raise MCloudAPIException("一直失败")
 
-    with pytest.raises(ApiError):
+    with pytest.raises(MCloudAPIException):
         retry_call(always_fail, max_retries=2, initial_delay=0.01, jitter=False)
     assert attempts["n"] == 2
 
@@ -81,9 +81,9 @@ def test_non_retryable_not_retried():
 
     def denied():
         attempts["n"] += 1
-        raise PermissionDeniedError("不在沙箱内")
+        raise MCloudAuthException("token 失效")
 
-    with pytest.raises(PermissionDeniedError):
+    with pytest.raises(MCloudAuthException):
         retry_call(denied, max_retries=5, initial_delay=0.01, jitter=False)
     assert attempts["n"] == 1
 

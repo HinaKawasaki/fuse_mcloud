@@ -19,6 +19,7 @@ def make_cache(tmp_path, cloud):
         cache_dir=tmp_path / "cache",
         write_back_dir=tmp_path / "wb",
         max_size_mb=64,
+        journal_db=tmp_path / "journal.sqlite3",
     )
 
 
@@ -31,6 +32,8 @@ def test_recover_pending_upload(tmp_path):
         "inode-99", target_dir_id="root", file_name="recovered.txt"
     )
     buffer_path.write_bytes(b"recovered data")
+    # 模拟 fsync / release 把日志从 building 推到 pending，然后进程崩溃
+    first.mark_write_ready("inode-99")
     assert "inode-99" in first.pending_uploads()
 
     # 第二次进程：新建 DataCache，读日志并补传
@@ -50,8 +53,10 @@ def test_recover_skips_missing_buffer(tmp_path):
     cloud = FakeCloud()
     first = make_cache(tmp_path, cloud)
     first.create_write_buffer("inode-1", target_dir_id="root", file_name="ghost.txt")
+    first.mark_write_ready("inode-1")
     (tmp_path / "wb" / "inode-1.wb").unlink()
 
     second = make_cache(tmp_path, cloud)
     assert second.recover_pending_uploads() == 0
     assert not second.pending_uploads()
+    assert "inode-1" in second.lost_uploads(), "payload 丢失应标记 lost 而不是静默删除"

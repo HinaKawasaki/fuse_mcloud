@@ -18,7 +18,12 @@ from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
 
 
 class DummyWrapper:
-    """只提供目录列举能力的替身。"""
+    """只提供目录列举与配额能力的替身。"""
+
+    def quota(self):
+        from mcloud_fuse.client.web139 import DiskQuota
+
+        return DiskQuota(total_mb=1000, free_mb=400, used_mb=600, raw={})
 
     def list_directory(self, dir_file_id, **kwargs):
         if dir_file_id == "root_123":
@@ -118,6 +123,7 @@ def _make_read_ops(tmp_path, payload=b"x" * 128):
         cache_dir=tmp_path / "cache",
         write_back_dir=tmp_path / "wb",
         max_size_mb=1,
+        lazy_read=False,
     )
     ops = build_ops(data_cache=cache, wrapper=wrapper)
     doc_attr = trio.run(ops.lookup, 1, b"doc")
@@ -228,3 +234,32 @@ def test_lazy_read_falls_back_when_server_ignores_range(tmp_path):
     assert len(wrapper.range_calls) == 1
 
     trio.run(ops.release, finfo.fh)
+
+
+def test_statfs_uses_real_quota():
+    stats = trio.run(build_ops().statfs)
+    block = 4096
+    assert stats.f_blocks == 1000 * 1024 * 1024 // block
+    assert stats.f_bfree == 400 * 1024 * 1024 // block
+    assert stats.f_bavail == stats.f_bfree
+    assert stats.f_files == 0 and stats.f_ffree == 0, "inode 数未知时应报 0"
+
+
+class NoQuotaWrapper(DummyWrapper):
+    def quota(self):
+        raise RuntimeError("quota unavailable")
+
+
+def test_statfs_falls_back_when_quota_fails():
+    stats = trio.run(build_ops(wrapper=NoQuotaWrapper()).statfs)
+    assert stats.f_blocks == 1 << 34
+    assert stats.f_bfree == 1 << 33
+
+
+def test_conflict_maps_to_estale():
+    import errno
+
+    from mcloud_fuse.errors import MCloudConflictError
+
+    err = build_ops()._to_fuse_error(MCloudConflictError("conflict"))
+    assert err.errno == errno.ESTALE

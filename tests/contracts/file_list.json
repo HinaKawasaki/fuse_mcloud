@@ -1,0 +1,32 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "items": [
+      {
+        "fileId": "Ffolder000000000000000000000000000",
+        "name": "docs",
+        "type": "folder",
+        "category": "folder",
+        "size": 0,
+        "createdAt": "2026-10-01T12:00:00.625+08:00",
+        "updatedAt": "2026-10-01T12:00:00.975+08:00",
+        "thumbnailUrls": null
+      },
+      {
+        "fileId": "Ffile00000000000000000000000000000",
+        "name": "a.bin",
+        "type": "file",
+        "category": "doc",
+        "size": 123,
+        "createdAt": "2026-10-01T12:00:00.625+08:00",
+        "updatedAt": "2026-10-02T12:00:00.975+08:00",
+        "thumbnailUrls": [
+          {"style": "Small", "url": "https://example.invalid/thumb"}
+        ]
+      }
+    ],
+    "nextPageCursor": "0|[1-0-0][abc=]"
+  }
+}

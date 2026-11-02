@@ -1,11 +1,10 @@
 import logging
 import threading
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 from mcloud_fuse.config import HYDRATE_DIR_NAME, TRASH_BIN_DIR_NAME
 from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
-from mcloud_fuse.mapping.tombstones import TombstoneStore
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +24,15 @@ class DirectoryTree:
     内存目录树管理器：
     1. 协调 CloudItem 数据的解析与 InodeMapper 的注册
     2. 保证“同一目录内名字唯一”这一 POSIX 硬约束，避免 readdir 吐出重复项
-    3. 为新建对象提供“索引宽限期”，适配云盘搜索的最终一致性
-    4. 用墓碑屏蔽已删除的云端对象
+    3. 为新建对象提供极短的本地宽限期
     """
 
     def __init__(
         self,
         mapper: InodeMapper,
-        tombstones: Optional[TombstoneStore] = None,
         recent_grace_sec: float = RECENT_GRACE_SEC,
     ):
         self.mapper = mapper
-        self.tombstones = tombstones if tombstones is not None else TombstoneStore(None)
         # 记录已加载/已同步过的目录 inode 集合，避免重复拉取
         self._loaded_dir_inodes: set = set()
         # 新建对象 inode -> 创建时间戳（索引宽限期）
@@ -82,7 +78,9 @@ class DirectoryTree:
     # 目录充填（核心）
     # ------------------------------------------------------------------
 
-    def populate_directory(self, parent_inode: int, cloud_items: Iterable[Dict]) -> List[InodeEntry]:
+    def populate_directory(
+        self, parent_inode: int, cloud_items: Iterable[Dict]
+    ) -> List[InodeEntry]:
         """
         将底层接口返回的 CloudItem / Dict 节点批量解析并注册进内存树。
 
@@ -110,12 +108,6 @@ class DirectoryTree:
                 continue
             if name in HIDDEN_DIR_NAMES:
                 logger.debug("跳过内部系统目录: %s", name)
-                continue
-            candidate_id = str(
-                item.get("id") or item.get("file_id") or item.get("fileId") or ""
-            )
-            # 已删除（移入回收站）的云端对象不能再出现，否则删除会在下次列举时复活
-            if candidate_id and candidate_id in self.tombstones:
                 continue
             grouped.setdefault(name, []).append(item)
 

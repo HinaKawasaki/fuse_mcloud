@@ -1,0 +1,19 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "taskInfo": {
+      "taskId": "2071391062689267840",
+      "status": "Succeed",
+      "progress": 100,
+      "createdAt": "2026-10-28T23:11:24.000+08:00",
+      "startedAt": "2026-10-28T23:11:24.000+08:00",
+      "finishedAt": "2026-10-28T23:11:25.000+08:00",
+      "code": null,
+      "message": null,
+      "taskType": 3
+    },
+    "batchFileResults": []
+  }
+}

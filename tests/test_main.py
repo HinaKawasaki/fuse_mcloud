@@ -124,3 +124,71 @@ def test_version_has_single_source():
     attr_path = pyproject["tool"]["setuptools"]["dynamic"]["version"]["attr"]
     module_name, _, attr = attr_path.rpartition(".")
     assert getattr(importlib.import_module(module_name), attr) == version.__version__
+
+
+# --------------------------------------------------------------- CLI 子命令
+
+
+def _save_config(tmp_path, monkeypatch):
+    from mcloud_fuse import userconfig
+    from mcloud_fuse.userconfig import UserConfig
+
+    path = tmp_path / "config.json"
+    config = UserConfig(
+        mountpoint=str(tmp_path / "mnt"),
+        cache_dir=str(tmp_path / "cache"),
+        install_service=False,
+    )
+    userconfig.save(config, path)
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(path))
+    monkeypatch.setenv("MCLOUD_WEB_TOKEN_FILE", str(tmp_path / "missing-token"))
+    return config
+
+
+def test_status_without_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(tmp_path / "missing.json"))
+    assert mcloud_main._status() == 0
+    assert "未配置" in capsys.readouterr().out
+
+
+def test_status_with_config(tmp_path, monkeypatch, capsys):
+    config = _save_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(mcloud_main.os.path, "ismount", lambda path: False)
+    assert mcloud_main._status() == 0
+    output = capsys.readouterr().out
+    assert config.mountpoint in output
+    assert "未挂载" in output
+
+
+def test_unmount_on_unmounted_path_is_noop(tmp_path, monkeypatch, capsys):
+    _save_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(mcloud_main.service, "is_active", lambda: False)
+    monkeypatch.setattr(mcloud_main.os.path, "ismount", lambda path: False)
+    assert mcloud_main._unmount() == 0
+    assert "未挂载" in capsys.readouterr().out
+
+
+def test_cli_help(capsys):
+    assert mcloud_main.cli(["--help"]) == 0
+    assert "用法" in capsys.readouterr().out
+
+
+def test_cli_unknown_command(capsys):
+    assert mcloud_main.cli(["definitely-not-a-command"]) == 2
+    assert "未知命令" in capsys.readouterr().err
+
+
+def test_default_command_without_config_is_nonzero(monkeypatch, tmp_path):
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    assert mcloud_main._default_command() == 1
+
+
+def test_parse_args_uses_config_defaults(tmp_path):
+    from mcloud_fuse.userconfig import UserConfig
+
+    config = UserConfig(mountpoint=str(tmp_path / "mnt"), cache_dir=str(tmp_path / "cache"))
+    args = mcloud_main.parse_args([], config)
+    assert args.mountpoint == config.mountpoint
+    assert args.cache_dir == config.cache_dir
+    assert args.root == "/"

@@ -1,9 +1,8 @@
-"""写回上传、目录创建、删除进回收站的离线回归测试（不需要真实挂载）。"""
+"""写回上传、目录创建、真删除的离线回归测试（不需要真实挂载）。"""
 import os
 import shutil
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 
 import pytest
@@ -13,63 +12,13 @@ SRC_DIR = Path(__file__).resolve().parent.parent  # 仓库根（mcloud_fuse/ 所
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from fakes import FakeCloud  # noqa: E402
+
 from mcloud_fuse.cache.data_cache import DataCache  # noqa: E402
 from mcloud_fuse.cache.meta_cache import MetaCache  # noqa: E402
-from mcloud_fuse.client.wrapper import CloudItem  # noqa: E402
 from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps  # noqa: E402
 from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeMapper  # noqa: E402
 from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
-
-
-class FakeCloud:
-    def __init__(self):
-        self.dirs = {"root": [{"id": "f_a", "name": "a.txt", "size": 3}]}
-        self.content = {"f_a": b"old"}
-        self.uploads = []
-        self.copies = []
-
-    def list_directory(self, dir_file_id, **kwargs):
-        return [
-            CloudItem(i["id"], i["name"], bool(i.get("isDir")), int(i.get("size") or 0), "", dir_file_id)
-            for i in self.dirs.get(dir_file_id, [])
-        ]
-
-    def download_file(self, file_id, local_save_path):
-        path = Path(local_save_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(self.content[file_id])
-        return path
-
-    def upload_file(self, local_file_path, target_dir_id, name=None):
-        payload = Path(local_file_path).read_bytes()
-        file_name = name or Path(local_file_path).name
-        new_id = f"up_{uuid.uuid4().hex[:8]}"
-        self.content[new_id] = payload
-        self.dirs.setdefault(target_dir_id, []).append(
-            {"id": new_id, "name": file_name, "size": len(payload)}
-        )
-        self.uploads.append((file_name, payload))
-        return CloudItem(new_id, file_name, False, len(payload), "", target_dir_id)
-
-    def create_folder(self, name, parent_file_id):
-        new_id = f"dir_{uuid.uuid4().hex[:8]}"
-        self.dirs.setdefault(parent_file_id, []).append({"id": new_id, "name": name, "isDir": True})
-        self.dirs.setdefault(new_id, [])
-        return new_id
-
-    def batch_copy(self, file_ids, to_parent_file_id):
-        results = []
-        for file_id in file_ids:
-            new_id = f"copy_{uuid.uuid4().hex[:8]}"
-            src = next(
-                (i for items in self.dirs.values() for i in items if i["id"] == file_id), None
-            )
-            self.dirs.setdefault(to_parent_file_id, []).append(
-                {"id": new_id, "name": src["name"] if src else file_id, "size": src.get("size", 0) if src else 0}
-            )
-            self.copies.append((file_id, to_parent_file_id))
-            results.append({"fileId": file_id, "newFileId": new_id})
-        return results
 
 
 @pytest.fixture()
@@ -136,39 +85,21 @@ def test_mkdir_creates_cloud_folder(env):
     assert mapper.get_by_path("/docs") is entry
 
 
-def test_unlink_tombstones_without_cloud_copy(env):
-    """默认删除策略：只登记墓碑 + 本地摘除，云端不产生任何副本。
-
-    接口删不掉原对象，副本只会让被删对象占双倍容量，而 .TrashBin 在本挂载里
-    是隐藏目录，用户既看不到也删不掉——所以默认不复制。
-    """
-    ops, cloud, mapper, tree = env
+def test_unlink_deletes_cloud_object(env):
+    """rm 语义：直接调用后端 delete，不再登记墓碑或复制副本。"""
+    ops, cloud, mapper, _ = env
     mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
         "f_a", "/a.txt", False, parent_inode=1, size=3
     )
     trio.run(ops.unlink, 1, b"a.txt", None)
 
     assert mapper.get_by_path("/a.txt") is None
-    assert cloud.copies == [], "默认不应在云端产生回收站副本"
-    assert "f_a" in tree.tombstones, "必须登记墓碑，否则下次列举会复活"
-
-
-def test_unlink_copies_when_trash_copy_enabled(env, monkeypatch):
-    """显式打开 MCLOUD_TRASH_COPY=1 时保留旧的「复制进 .TrashBin」行为。"""
-    monkeypatch.setattr("mcloud_fuse.utils.trash_bin.TRASH_COPY_ENABLED", True)
-    ops, cloud, mapper, tree = env
-    mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
-        "f_a", "/a.txt", False, parent_inode=1, size=3
-    )
-    trio.run(ops.unlink, 1, b"a.txt", None)
-
-    assert mapper.get_by_path("/a.txt") is None
-    assert cloud.copies and cloud.copies[0][0] == "f_a"
-    assert "f_a" in tree.tombstones
+    assert cloud.deleted == [("f_a", True)], "默认应调用永久删除（permanent=True）"
+    assert cloud.copies == []
 
 
 def test_deleted_file_does_not_resurrect(env):
-    """云盘没有删除 API：删除后重新列举，墓碑必须阻止原文件复活。"""
+    """后端真删后，重新列举不应再出现该对象。"""
     ops, cloud, mapper, tree = env
     trio.run(ops._load_directory, 1)
     assert mapper.get_by_path("/a.txt") is not None
@@ -176,21 +107,24 @@ def test_deleted_file_does_not_resurrect(env):
     trio.run(ops.unlink, 1, b"a.txt", None)
     assert mapper.get_by_path("/a.txt") is None
 
-    # 强制重新从（仍然含有 a.txt 的）云端列举
     tree.mark_directory_stale(1)
     ops.meta_cache.invalidate_readdir(1)
     trio.run(ops._load_directory, 1)
     assert mapper.get_by_path("/a.txt") is None
 
 
-def test_tombstone_persists_to_disk(tmp_path):
-    from mcloud_fuse.mapping.tombstones import TombstoneStore
+def test_rename_directory_uses_backend_primitive(env):
+    """目录改名不再 ENOSYS：同目录走 rename，跨目录走 move。"""
+    ops, cloud, mapper, _ = env
+    attrs = trio.run(ops.mkdir, 1, b"docs", 0o755, None)
+    entry = mapper.get_by_inode(attrs.st_ino)
 
-    path = tmp_path / ".tombstones"
-    first = TombstoneStore(path)
-    first.add("f_deleted")
-    assert "f_deleted" in TombstoneStore(path)
-    assert "f_deleted" in first.snapshot()
+    trio.run(ops.rename, 1, b"docs", 1, b"docs2", 0)
+    assert mapper.get_by_path("/docs2") is not None
+    assert any(name == "docs2" for _, name in cloud.renames)
+
+    moved = mapper.get_by_path("/docs2")
+    assert moved.file_id == entry.file_id
 
 
 def test_cloud_index_lag_does_not_drop_new_file(env):

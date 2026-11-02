@@ -1,3 +1,4 @@
+import errno
 import json
 import logging
 import os
@@ -12,9 +13,30 @@ from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper
 from mcloud_fuse.config import (
     CACHE_DIR,
     EAGER_DOWNLOAD_LIMIT_BYTES,
+    LAZY_READ,
+    MIN_FREE_MB,
     RANGE_CHUNK_BYTES,
+    RESCUE_FILE_MAX_MB,
+    RESCUE_MAX_MB,
+    RESCUE_MIN_FREE_MB,
+    RESCUE_ON_SHUTDOWN,
+    RESCUE_TIMEOUT_SEC,
     WRITE_BACK_DIR,
     get_effective_cache_limit_mb,
+    get_effective_write_back_limit_mb,
+)
+from mcloud_fuse.fsutil import is_volatile_writeback
+from mcloud_fuse.journal import (
+    BUILDING,
+    LOST,
+    PENDING,
+    RESCUED,
+    UPLOADED,
+    UPLOADING,
+    JournalEntry,
+    WritebackJournal,
+    default_journal_path,
+    rescue_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +46,21 @@ def _safe_component(name: str) -> str:
     """把云端文件名清洗成可安全用作本地缓存文件名的片段。"""
     cleaned = str(name or "").replace("/", "_").replace("\\", "_").strip()
     return cleaned or "unnamed"
+
+
+@dataclass
+class RescueResult:
+    """关机抢救的结果，便于日志与测试断言。"""
+
+    rescued: List[tuple] = field(default_factory=list)
+    skipped: List[tuple] = field(default_factory=list)
+    total_bytes: int = 0
+    elapsed: float = 0.0
+    reason: str = ""
+
+    @property
+    def count(self) -> int:
+        return len(self.rescued)
 
 
 @dataclass
@@ -39,6 +76,9 @@ class _PartialFile:
     name: str
     size: int
     covered: List[Tuple[int, int]] = field(default_factory=list)
+
+    def covered_bytes(self) -> int:
+        return sum(stop - begin for begin, stop in self.covered)
 
     def covers(self, start: int, end: int) -> bool:
         for begin, stop in self.covered:
@@ -72,18 +112,62 @@ class DataCache:
         max_size_mb: Optional[int] = None,
         eager_download_limit_bytes: Optional[int] = None,
         range_chunk_bytes: Optional[int] = None,
+        journal_db: Optional[Path] = None,
+        lazy_read: Optional[bool] = None,
+        max_write_back_mb: Optional[int] = None,
+        min_free_mb: Optional[int] = None,
+        rescue_on_shutdown: Optional[bool] = None,
+        rescue_max_mb: Optional[int] = None,
+        rescue_file_max_mb: Optional[int] = None,
+        rescue_timeout_sec: Optional[float] = None,
+        rescue_min_free_mb: Optional[int] = None,
     ):
         self.wrapper = client_wrapper
         self.cache_dir = Path(cache_dir)
         self.write_back_dir = Path(write_back_dir)
         limit_mb = max_size_mb if max_size_mb is not None else get_effective_cache_limit_mb()
         self.max_bytes = max(1, int(limit_mb)) * 1024 * 1024
-        # 大于该大小的文件走按需（Range）读取；0 表示关闭该特性
+        # 默认所有文件懒加载：open 不下载，read 才拉分片
+        self.lazy_read = LAZY_READ if lazy_read is None else bool(lazy_read)
+        # >0 时只对该大小以上的文件懒加载；0 表示全部懒加载
         self.eager_download_limit_bytes = (
             EAGER_DOWNLOAD_LIMIT_BYTES
             if eager_download_limit_bytes is None
             else int(eager_download_limit_bytes)
         )
+        write_back_mb = (
+            get_effective_write_back_limit_mb()
+            if max_write_back_mb is None
+            else max(1, int(max_write_back_mb))
+        )
+        self.max_write_back_bytes = write_back_mb * 1024 * 1024
+        self.min_free_bytes = (
+            max(0, int(min_free_mb)) * 1024 * 1024
+            if min_free_mb is not None
+            else MIN_FREE_MB * 1024 * 1024
+        )
+        self.rescue_on_shutdown = (
+            RESCUE_ON_SHUTDOWN if rescue_on_shutdown is None else bool(rescue_on_shutdown)
+        )
+        self.rescue_max_bytes = (
+            (RESCUE_MAX_MB if rescue_max_mb is None else int(rescue_max_mb))
+            * 1024
+            * 1024
+        )
+        self.rescue_file_max_bytes = (
+            (RESCUE_FILE_MAX_MB if rescue_file_max_mb is None else int(rescue_file_max_mb))
+            * 1024
+            * 1024
+        )
+        self.rescue_timeout_sec = (
+            RESCUE_TIMEOUT_SEC if rescue_timeout_sec is None else float(rescue_timeout_sec)
+        )
+        self.rescue_min_free_bytes = (
+            (RESCUE_MIN_FREE_MB if rescue_min_free_mb is None else int(rescue_min_free_mb))
+            * 1024
+            * 1024
+        )
+        self._stopping = threading.Event()
         self.range_chunk_bytes = max(
             1, RANGE_CHUNK_BYTES if range_chunk_bytes is None else int(range_chunk_bytes)
         )
@@ -104,13 +188,19 @@ class DataCache:
         self._partial_paths: Dict[str, _PartialFile] = {}
         # 写回暂存 key -> 本地路径
         self._write_paths: Dict[str, Path] = {}
-        # 写回日志：崩溃恢复时用来把未上传的暂存文件补传回云盘
-        self._journal_path = self.write_back_dir / "writeback_journal.json"
-        self._journal: Dict[str, dict] = {}
-
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.write_back_dir.mkdir(parents=True, exist_ok=True)
-        self._load_journal()
+
+        # 写回日志：SQLite 元数据放持久化的 state 目录，payload 仍在 tmpfs。
+        # 两者故意分开：日志很小且必须跨重启，payload 很大且可以丢（代价见 journal.py）。
+        try:
+            self._journal = WritebackJournal(
+                journal_db or default_journal_path(self.write_back_dir)
+            )
+        except Exception as exc:  # noqa: BLE001 - 日志坏了不应该阻止挂载
+            logger.warning("写回日志不可用，降级为内存日志（崩溃恢复失效）: %s", exc)
+            self._journal = WritebackJournal(Path(":memory:"))
+        self._migrate_legacy_journal()
 
     # ------------------------------------------------------------------
     # 读缓存
@@ -249,19 +339,60 @@ class DataCache:
         except OSError as exc:
             logger.warning("删除本地缓存失败: %s", exc)
 
+    @staticmethod
+    def _allocated_bytes(path: Path) -> int:
+        """实际占用（稀疏文件按 st_blocks 算），避免把 100GB 稀疏壳算成 100GB 缓存。"""
+        try:
+            stat = path.stat()
+        except OSError:
+            return 0
+        blocks = getattr(stat, "st_blocks", 0) * 512
+        return blocks if blocks > 0 else stat.st_size
+
     def _get_current_cache_size(self) -> int:
-        """计算当前缓存占用的总字节数（完整文件 + 按需读的部分文件）"""
+        """计算当前缓存实际占用的磁盘/内存字节数（完整文件 + 按需读部分文件）。"""
         with self._lock:
             paths = list(self._cache_map.values())
-            paths.extend(partial.path for partial in self._partial_paths.values())
-        total = 0
-        for path in paths:
-            try:
-                if path.exists():
-                    total += path.stat().st_size
-            except OSError:
-                continue
-        return total
+            partial_bytes = sum(
+                partial.covered_bytes() for partial in self._partial_paths.values()
+            )
+        return sum(self._allocated_bytes(path) for path in paths) + partial_bytes
+
+    def _get_write_back_size(self) -> int:
+        with self._lock:
+            paths = list(self._write_paths.values())
+        return sum(self._allocated_bytes(path) for path in paths)
+
+    def cache_usage_bytes(self) -> int:
+        return self._get_current_cache_size()
+
+    def write_back_usage_bytes(self) -> int:
+        return self._get_write_back_size()
+
+    def ensure_write_back_capacity(self, additional_bytes: int) -> None:
+        """在写入前检查写回上限与剩余空间；不够就抛 ENOSPC，而不是把 tmpfs 写满。"""
+        additional = max(0, int(additional_bytes))
+        if additional == 0:
+            return
+        used = self._get_write_back_size()
+        limit = self.max_write_back_bytes
+        if used + additional > limit:
+            raise OSError(
+                errno.ENOSPC,
+                f"写回暂存将超过上限 {limit // (1024 * 1024)} MiB "
+                f"(已用 {used // (1024 * 1024)} MiB, 本次 +{additional // (1024 * 1024)} MiB)；"
+                "调大 MCLOUD_MAX_WRITE_BACK_MB 或把 MCLOUD_WRITE_BACK_DIR 指到持久盘",
+            )
+        try:
+            free = shutil.disk_usage(self.write_back_dir).free
+        except OSError:
+            free = 0
+        if free < self.min_free_bytes + additional:
+            raise OSError(
+                errno.ENOSPC,
+                f"缓存所在文件系统剩余空间不足（free={free // (1024 * 1024)} MiB, "
+                f"需要 {self.min_free_bytes // (1024 * 1024)} MiB 保底）",
+            )
 
     def _evict_if_needed(self):
         """根据 LRU 算法剔除最老的文件，保持缓存容量在上限以内。
@@ -290,10 +421,16 @@ class DataCache:
     # ------------------------------------------------------------------
 
     def should_read_lazily(self, size: int) -> bool:
-        """该大小的文件是否值得走按需读取（``eager_download_limit_bytes`` 为 0 时关闭）。"""
+        """是否走按需读取。
+
+        默认全部懒加载（``lazy_read=True``）；``EAGER_DOWNLOAD_LIMIT>0`` 时只对大文件；
+        ``lazy_read=False`` 时退回 v0.3.0 的整文件下载。
+        """
+        if not self.lazy_read:
+            return False
         return (
-            self.eager_download_limit_bytes > 0
-            and int(size) > self.eager_download_limit_bytes
+            self.eager_download_limit_bytes <= 0
+            or int(size) > self.eager_download_limit_bytes
         )
 
     def is_partial(self, file_id: str) -> bool:
@@ -378,6 +515,7 @@ class DataCache:
                 )
                 return self._promote_partial(file_id, partial)
             partial.add(start, start + max(0, int(written)))
+            self._evict_if_needed()
             if partial.covers(0, partial.size):
                 return self._promote_partial(file_id, partial)
             return None
@@ -446,68 +584,331 @@ class DataCache:
     # 写回日志（崩溃恢复）
     # ------------------------------------------------------------------
 
-    def _load_journal(self) -> None:
+    def _migrate_legacy_journal(self) -> None:
+        """把旧版 ``writeback_journal.json`` 导入 SQLite 后改名留档。"""
+        legacy = self.write_back_dir / "writeback_journal.json"
+        if not legacy.exists():
+            return
         try:
-            if self._journal_path.exists():
-                with open(self._journal_path, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                if isinstance(data, dict):
-                    self._journal = data
-                    logger.info("发现 %s 条未完成的写回记录", len(self._journal))
+            data = json.loads(legacy.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            logger.warning("加载写回日志失败: %s", exc)
-
-    def _save_journal_nolock(self) -> None:
+            logger.warning("旧写回日志无法读取，跳过迁移: %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        imported = 0
+        for key, meta in data.items():
+            if not isinstance(meta, dict):
+                continue
+            target_dir_id = str(meta.get("target_dir_id") or "")
+            file_name = str(meta.get("file_name") or "")
+            if not target_dir_id or not file_name:
+                continue
+            self._journal.upsert(
+                JournalEntry(
+                    key=str(key),
+                    target_dir_id=target_dir_id,
+                    file_name=file_name,
+                    payload_path=str(self.write_back_dir / f"{_safe_component(key)}.wb"),
+                    base_file_id=meta.get("base_file_id"),
+                    base_updated_at=meta.get("base_updated_at"),
+                    state=PENDING,
+                )
+            )
+            imported += 1
         try:
-            tmp = self._journal_path.with_name(self._journal_path.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(self._journal, handle, ensure_ascii=False)
-            os.replace(tmp, self._journal_path)
+            legacy.replace(legacy.with_suffix(".json.migrated"))
         except OSError as exc:
-            logger.warning("保存写回日志失败: %s", exc)
+            logger.warning("旧写回日志迁移后改名失败: %s", exc)
+        if imported:
+            logger.info("已迁移 %s 条旧写回日志到 SQLite", imported)
 
-    def register_write_meta(self, key: str, target_dir_id: str, file_name: str) -> None:
-        """登记一条待上传的写回记录。"""
+    @property
+    def journal_path(self) -> Path:
+        return self._journal.path
+
+    def register_write_meta(
+        self,
+        key: str,
+        target_dir_id: str,
+        file_name: str,
+        base_file_id: Optional[str] = None,
+        base_updated_at: Optional[str] = None,
+        payload_path: Optional[Path] = None,
+        state: str = BUILDING,
+    ) -> None:
+        """登记一条待上传的写回记录（含冲突检测基线）。
+
+        先以 ``building`` 状态登记、payload 写完后改为 ``pending``，
+        避免崩溃恢复时把只写了一半的文件当成完整文件上传。
+        """
+        target = Path(payload_path) if payload_path else (
+            self.write_back_dir / f"{_safe_component(key)}.wb"
+        )
         with self._lock:
-            self._journal[key] = {
-                "target_dir_id": str(target_dir_id),
-                "file_name": str(file_name),
-            }
-            self._save_journal_nolock()
+            self._journal.upsert(
+                JournalEntry(
+                    key=str(key),
+                    target_dir_id=str(target_dir_id),
+                    file_name=str(file_name),
+                    payload_path=str(target),
+                    base_file_id=str(base_file_id) if base_file_id else None,
+                    base_updated_at=str(base_updated_at) if base_updated_at else None,
+                    state=state,
+                )
+            )
 
     def clear_write_meta(self, key: str) -> None:
         with self._lock:
-            if self._journal.pop(key, None) is not None:
-                self._save_journal_nolock()
+            self._journal.remove(key)
+
+    def begin_shutdown(self) -> None:
+        """通知后台补传尽快停下，给关机抢救让路。"""
+        self._stopping.set()
 
     def pending_uploads(self) -> Dict[str, dict]:
         with self._lock:
-            return dict(self._journal)
+            pending = self._journal.pending()
+            pending.update({item.key: item.meta() for item in self._journal.entries(RESCUED)})
+            return pending
+
+    def lost_uploads(self) -> Dict[str, dict]:
+        """payload 已丢失（常见于 tmpfs 重启）的写回记录，供 status/doctor 展示。"""
+        with self._lock:
+            return self._journal.lost()
+
+    def rescuable_uploads(self) -> Dict[str, dict]:
+        """真正会在关机抢救里被搬运的条目（pending/uploading 且 payload 存在）。"""
+        with self._lock:
+            entries = self._journal.entries(PENDING) + self._journal.entries(UPLOADING)
+        result = {}
+        for entry in entries:
+            if Path(entry.payload_path).exists():
+                result[entry.key] = entry.meta()
+        return result
+
+    def _rescue_path(self, key: str) -> Path:
+        return rescue_dir(self.write_back_dir) / f"{_safe_component(key)}.wb"
+
+    @staticmethod
+    def _copy_with_deadline(source: Path, target: Path, deadline: float) -> None:
+        with open(source, "rb") as src, open(target, "wb") as dst:
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("关机抢救超时")
+                chunk = src.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+
+    def rescue_pending_uploads(self, *, force: bool = False) -> RescueResult:
+        """关机时把待上传 payload 从 tmpfs 复制到持久盘。
+
+        - 只处理 ``pending`` / ``uploading``；``building`` 是半成品，绝不上传；
+        - 有总大小、单文件大小、剩余空间、总超时四道闸门；
+        - 先写 ``.part``，fsync 后原子改名，再更新日志路径；
+        - 默认只在写回目录位于 tmpfs/ramfs 时执行。
+        """
+        started = time.monotonic()
+        result = RescueResult()
+        if not force and not self.rescue_on_shutdown:
+            result.reason = "MCLOUD_RESCUE_ON_SHUTDOWN=0"
+            return result
+        if not force and not is_volatile_writeback(self.write_back_dir):
+            result.reason = "写回目录不在 tmpfs，无需抢救"
+            return result
+
+        with self._lock:
+            entries = self._journal.entries(PENDING) + self._journal.entries(UPLOADING)
+        candidates = []
+        for entry in entries:
+            path = Path(entry.payload_path)
+            if not path.exists():
+                self._journal.set_state(
+                    entry.key, LOST, last_error="关机抢救时 payload 已不存在"
+                )
+                result.skipped.append((entry.key, entry.file_name, 0, "payload 不存在"))
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            candidates.append((size, entry, path))
+        if not candidates:
+            result.reason = "没有待抢救文件"
+            result.elapsed = time.monotonic() - started
+            return result
+
+        target_dir = rescue_dir(self.write_back_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_dir.chmod(0o700)
+        except OSError:
+            pass
+        if not force and is_volatile_writeback(target_dir):
+            result.reason = "状态目录也在 tmpfs，抢救没有意义"
+            result.elapsed = time.monotonic() - started
+            return result
+        deadline = started + max(0.0, self.rescue_timeout_sec)
+        logger.info(
+            "关机抢救：%s 个待上传文件，预算 %.0f 秒 / %s MiB",
+            len(candidates),
+            self.rescue_timeout_sec,
+            self.rescue_max_bytes // (1024 * 1024),
+        )
+
+        for size, entry, source in sorted(candidates, key=lambda item: item[0]):
+            if time.monotonic() >= deadline:
+                result.skipped.append((entry.key, entry.file_name, size, "超时"))
+                break
+            if size > self.rescue_file_max_bytes:
+                result.skipped.append(
+                    (
+                        entry.key,
+                        entry.file_name,
+                        size,
+                        f"单文件超过 {self.rescue_file_max_bytes // (1024 * 1024)} MiB",
+                    )
+                )
+                continue
+            if result.total_bytes + size > self.rescue_max_bytes:
+                result.skipped.append((entry.key, entry.file_name, size, "超过总预算"))
+                break
+            try:
+                free = shutil.disk_usage(target_dir).free
+            except OSError:
+                free = 0
+            if free < self.rescue_min_free_bytes + size:
+                result.skipped.append((entry.key, entry.file_name, size, "目标盘空间不足"))
+                break
+            destination = target_dir / f"{_safe_component(entry.key)}.wb"
+            part = destination.with_name(destination.name + ".part")
+            try:
+                self._copy_with_deadline(source, part, deadline)
+                os.replace(part, destination)
+                try:
+                    os.chmod(destination, 0o600)
+                except OSError:
+                    pass
+                try:
+                    dir_fd = os.open(target_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+                # uploading 的歧义状态要保留：下次启动先核对远端，避免重复上传。
+                rescued_state = UPLOADING if entry.state == UPLOADING else RESCUED
+                self._journal.relocate(
+                    entry.key, str(destination), state=rescued_state, size=size
+                )
+                # 日志已经指向持久盘，tmpfs 原文件可以删掉（同路径时不要删目标）
+                if source != destination:
+                    try:
+                        source.unlink()
+                    except OSError:
+                        pass
+            except TimeoutError:
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                result.skipped.append((entry.key, entry.file_name, size, "复制超时"))
+                break
+            except OSError as exc:
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                result.skipped.append((entry.key, entry.file_name, size, f"复制失败：{exc}"))
+                continue
+            result.rescued.append((entry.key, entry.file_name, size))
+            result.total_bytes += size
+            logger.info("关机抢救：%s -> %s", entry.file_name, destination)
+
+        result.elapsed = time.monotonic() - started
+        if result.skipped:
+            logger.warning("关机抢救跳过 %s 个文件（见 journal）", len(result.skipped))
+        logger.info(
+            "关机抢救完成：%s 个 / %.1f MiB / %.1f 秒",
+            result.count,
+            result.total_bytes / (1024 * 1024),
+            result.elapsed,
+        )
+        return result
 
     def recover_pending_uploads(self) -> int:
         """启动时把上次崩溃遗留的写回文件补传回云盘。
 
+        - ``building``：崩溃在 payload 写入阶段，标记丢失，绝不上传半成品；
+        - ``pending`` 但 payload 不存在：tmpfs 重启后内容没了，标记 ``lost`` 留档；
+        - 上传成功：转读缓存并删除日志条目。
+
         :return: 成功补传的数量
         """
         recovered = 0
-        for key, meta in self.pending_uploads().items():
-            path = self.write_back_dir / f"{_safe_component(key)}.wb"
-            target_dir_id = str(meta.get("target_dir_id") or "")
-            file_name = str(meta.get("file_name") or "")
-            if not path.exists() or not target_dir_id or not file_name:
-                self.clear_write_meta(key)
+        # 先处理「上传中崩溃」：可能服务端已成功、只是响应/清理没回来。
+        # 核对远端同名同大小文件，能确认就清日志，避免重复上传占容量。
+        for entry in self._journal.entries(UPLOADING):
+            if self._looks_uploaded(entry):
+                logger.info("恢复：%s 已在云端存在，清除上传中日志", entry.file_name)
+                self.clear_write_meta(entry.key)
                 continue
+            self._journal.set_state(entry.key, PENDING, last_error="上传状态未知，已转为待传")
+
+        for entry in self._journal.entries(BUILDING):
+            self._journal.set_state(
+                entry.key, LOST, last_error="payload 写入阶段被中断（不会补传半成品）"
+            )
+            logger.warning("写回文件在创建阶段中断: %s (%s)", entry.file_name, entry.key)
+
+        for entry in self._journal.entries(PENDING) + self._journal.entries(RESCUED):
+            if self._stopping.is_set():
+                logger.info("收到关机信号，停止后台补传")
+                break
+            path = Path(entry.payload_path)
+            if not path.exists():
+                rescued_path = self._rescue_path(entry.key)
+                if rescued_path.exists():
+                    path = rescued_path
+                    self._journal.relocate(
+                        entry.key, str(path), state=entry.state, size=path.stat().st_size
+                    )
+            if not path.exists():
+                self._journal.set_state(
+                    entry.key, LOST, last_error="payload 不存在（tmpfs 重启或已被清理）"
+                )
+                logger.warning(
+                    "写回文件已丢失，无法补传: %s（%s）；记录已标记 lost",
+                    entry.file_name,
+                    entry.key,
+                )
+                continue
+            extra = {}
+            if entry.base_file_id and entry.base_updated_at:
+                extra["expected_file_id"] = entry.base_file_id
+                extra["expected_updated_at"] = entry.base_updated_at
             try:
                 item = self.wrapper.upload_file(
-                    local_file_path=path, target_dir_id=target_dir_id, name=file_name
+                    local_file_path=path,
+                    target_dir_id=entry.target_dir_id,
+                    name=entry.file_name,
+                    **extra,
                 )
             except Exception as exc:  # noqa: BLE001 - 恢复失败保留现场
-                logger.warning("补传写回文件失败 key=%s: %s", key, exc)
+                self._journal.set_state(entry.key, PENDING, last_error=str(exc))
+                logger.warning("补传写回文件失败 key=%s: %s", entry.key, exc)
                 continue
-            self._promote_to_cache(path, item.file_id, file_name)
-            self.clear_write_meta(key)
+            if item.name != entry.file_name:
+                logger.warning("崩溃恢复发现远端修改，已将本地版本另存为 %s", item.name)
+            self._journal.set_state(entry.key, UPLOADED)
+            self._promote_to_cache(path, item.file_id, item.name)
+            self.clear_write_meta(entry.key)
             recovered += 1
-            logger.info("崩溃恢复：已补传 %s -> fileId=%s", file_name, item.file_id)
+            logger.info("崩溃恢复：已补传 %s -> fileId=%s", entry.file_name, item.file_id)
         return recovered
 
     # ------------------------------------------------------------------
@@ -520,6 +921,8 @@ class DataCache:
         initial_path: Optional[Path] = None,
         target_dir_id: Optional[str] = None,
         file_name: Optional[str] = None,
+        base_file_id: Optional[str] = None,
+        base_updated_at: Optional[str] = None,
     ) -> Path:
         """
         为写操作创建本地暂存文件。
@@ -530,14 +933,60 @@ class DataCache:
         """
         target = self.write_back_dir / f"{_safe_component(key)}.wb"
         if initial_path is not None and Path(initial_path).exists():
-            shutil.copyfile(initial_path, target)
-        else:
-            target.touch()
+            self.ensure_write_back_capacity(Path(initial_path).stat().st_size)
+        tracked = bool(target_dir_id and file_name)
+        if tracked:
+            self.register_write_meta(
+                key,
+                str(target_dir_id),
+                str(file_name),
+                base_file_id=base_file_id,
+                base_updated_at=base_updated_at,
+                payload_path=target,
+                state=BUILDING,
+            )
+        try:
+            if initial_path is not None and Path(initial_path).exists():
+                shutil.copyfile(initial_path, target)
+            else:
+                target.touch()
+            # 让日志里的「pending」在数据真正落盘之后才出现
+            with open(target, "rb") as handle:
+                os.fsync(handle.fileno())
+        except BaseException:
+            if tracked:
+                self.clear_write_meta(key)
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
         with self._lock:
             self._write_paths[key] = target
-        if target_dir_id and file_name:
-            self.register_write_meta(key, target_dir_id, file_name)
+        if tracked:
+            # 仍保持 building：只有 fsync/release 真正提交时才转为 pending，
+            # 否则崩溃恢复会把写了一半的文件当成完整文件上传。
+            self._journal.set_state(key, BUILDING, size=target.stat().st_size)
         return target
+
+    def mark_write_uploading(self, key: str) -> None:
+        """上传请求发出前标记；崩溃恢复时可据此核对远端，避免重复上传。"""
+        self._journal.set_state(key, UPLOADING)
+
+    def mark_write_pending(self, key: str, error: str = "") -> None:
+        self._journal.set_state(key, PENDING, last_error=error or None)
+
+    def mark_write_ready(self, key: str) -> None:
+        """把写回记录从 building 转为 pending（调用方准备上传/已 fsync）。
+
+        这一步之后崩溃，恢复逻辑才会补传；之前崩溃只会把条目标记 lost，
+        不会把半成品上传到云端。
+        """
+        with self._lock:
+            path = self._write_paths.get(key)
+        if path is None or not path.exists():
+            raise FileNotFoundError(f"写回暂存文件不存在: {key}")
+        self._journal.set_state(key, PENDING, size=path.stat().st_size)
 
     def discard_write_buffer(self, key: str) -> None:
         """放弃某次写操作（如上传失败后清理）。"""
@@ -550,7 +999,14 @@ class DataCache:
             except OSError:
                 pass
 
-    def upload_write_buffer(self, key: str, target_dir_id: str, file_name: str) -> CloudItem:
+    def upload_write_buffer(
+        self,
+        key: str,
+        target_dir_id: str,
+        file_name: str,
+        base_file_id: Optional[str] = None,
+        base_updated_at: Optional[str] = None,
+    ) -> CloudItem:
         """把写回暂存文件整文件上传到云盘，**保留**暂存文件。
 
         保留是必要的：``fsync`` 之后文件可能仍处于打开状态，后续 ``write`` 还要继续写它。
@@ -560,10 +1016,15 @@ class DataCache:
             path = self._write_paths.get(key)
         if path is None or not path.exists():
             raise FileNotFoundError(f"写回暂存文件不存在: {key}")
+        extra = {}
+        if base_file_id and base_updated_at:
+            extra["expected_file_id"] = base_file_id
+            extra["expected_updated_at"] = base_updated_at
         return self.wrapper.upload_file(
             local_file_path=path,
             target_dir_id=target_dir_id,
             name=file_name,
+            **extra,
         )
 
     def _promote_to_cache(self, source: Path, file_id: str, file_name: str) -> Optional[Path]:
@@ -580,6 +1041,32 @@ class DataCache:
                 return None
         self.register_cache_file(file_id, cache_path)
         return cache_path
+
+    def _looks_uploaded(self, entry: JournalEntry) -> bool:
+        """保守核对：目标目录里存在同名、同大小、且不是旧基线的文件。"""
+        path = Path(entry.payload_path)
+        if not path.exists():
+            return False
+        try:
+            size = path.stat().st_size
+            items = self.wrapper.list_directory(entry.target_dir_id, page_limit=200)
+        except Exception:  # noqa: BLE001 - 核对失败就退回重传，宁可多传不丢
+            return False
+        for item in items:
+            same_name = item.name == entry.file_name or item.name.startswith(
+                entry.file_name + ".conflict-"
+            )
+            if not same_name or int(item.size or 0) != size:
+                continue
+            if entry.base_file_id and item.file_id == entry.base_file_id:
+                if not entry.base_updated_at or item.updated_at == entry.base_updated_at:
+                    continue  # 还是上传前的旧对象
+            return True
+        return False
+
+    def close(self) -> None:
+        with self._lock:
+            self._journal.close()
 
     def finalize_write_buffer(
         self,

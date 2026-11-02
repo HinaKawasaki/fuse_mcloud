@@ -1,0 +1,17 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "fileId": "Ffolder000000000000000000000000000",
+    "parentFileId": "/",
+    "name": "renamed",
+    "description": "",
+    "type": "folder",
+    "category": "folder",
+    "createdAt": "2026-10-01T12:00:00.175+08:00",
+    "updatedAt": "2026-10-28T23:24:16.378+08:00",
+    "trashedAt": null,
+    "size": null
+  }
+}

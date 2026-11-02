@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "freeDiskSize": 8334382,
+    "diskSize": 8547328,
+    "quotaList": [
+      {"driveType": 1, "driveName": "个人云（我的文件）", "usedSize": 212922},
+      {"driveType": 2, "driveName": "家庭云", "usedSize": 0},
+      {"driveType": 8, "driveName": "笔记", "usedSize": 24}
+    ]
+  }
+}

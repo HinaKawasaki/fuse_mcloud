@@ -1,60 +1,92 @@
 # 架构详解
 
-本文说明 `mcloud_FUSE` 的模块划分、数据流与并发模型，以及为了适配云盘接口而做的关键设计。
+> 适用版本：v0.4.0（`yun.139.com` Web API 后端）。
+> 旧 Skill / 沙箱 / 墓碑实现已整体归档在 [`.old-version/`](../.old-version/README.md)，
+> 不参与打包、测试与运行。
+
+本文说明当前实现的模块划分、数据流、并发模型，以及几个关键取舍：
+**懒加载、写回、SQLite 日志、关机抢救**。
 
 ## 组件总览
 
 ```text
-                        ┌───────────────────────────────┐
-             VFS 调用 → │  mcloud_fuse.fuse.fuse_ops    │
-                        │  MCloudFuseOps                │
-                        └───────┬───────────┬───────────┘
-                                │           │
-              ┌─────────────────┘           └──────────────────┐
-              ▼                                                ▼
-   ┌──────────────────────┐                        ┌────────────────────────┐
-   │ mapping/             │                        │ cache/                 │
-   │  id_map  inode↔path  │                        │  meta_cache 属性/目录  │
-   │  tree    目录充填     │                        │  data_cache 读/写回    │
-   │  tombstones 删除墓碑  │                        └───────────┬────────────┘
-   └──────────┬───────────┘                                    │
-              └───────────────────┬────────────────────────────┘
-                                  ▼
-                        ┌────────────────────────┐      ┌───────────────────────┐
-                        │ client/wrapper.py      │─────▶│ router/rate_limiter   │
-                        │ DirectClientWrapper    │      │ router/retry          │
-                        └───────────┬────────────┘      └───────────────────────┘
-                                    ▼
-                        ┌────────────────────────┐
-                        │ basement/scripts/*.py  │  官方 Skill SDK（Direct Import）
-                        └───────────┬────────────┘
-                                    ▼
-                             云盘 HTTPS 接口
+┌──────────────────────────── CLI ────────────────────────────┐
+│ main.py   mount / unmount / status / setup / doctor / journal│
+│ userconfig.py  tokens.py  service.py  sdnotify.py            │
+└─────────────────────────────┬───────────────────────────────┘
+                              ▼
+                    ┌───────────────────┐
+                    │ fuse/fuse_ops.py  │  pyfuse3 回调
+                    │ MCloudFuseOps     │  阻塞操作进 trio 线程
+                    └───┬───────────┬───┘
+                        ▼           ▼
+              ┌──────────────┐  ┌────────────────────┐
+              │ mapping/     │  │ cache/             │
+              │ id_map       │  │ meta_cache (LRU)   │
+              │ tree         │  │ data_cache         │
+              └──────┬───────┘  └─────────┬──────────┘
+                     └──────────┬─────────┘
+                                ▼
+                    ┌──────────────────────┐     ┌───────────────────┐
+                    │ client/wrapper.py    │────▶│ router/           │
+                    │ DirectClientWrapper  │     │ rate_limiter/retry│
+                    └──────────┬───────────┘     └───────────────────┘
+                               ▼
+                    ┌──────────────────────┐
+                    │ client/web139.py     │  签名 / 鉴权 / 端点
+                    └──────────┬───────────┘
+                               ▼
+                         yun.139.com Web API
 ```
 
-## 进程与并发模型
+旁路组件：
 
-- FUSE 事件循环跑在 **trio** 上（`pyfuse3` 要求）。所有 `Operations` 回调都是 `async`。
-- 一切**阻塞操作**（云盘 HTTP、磁盘读写、sha256）都通过 `trio.to_thread.run_sync` 丢到工作线程，
-  避免阻塞事件循环。
-- 跨线程共享的状态用 `threading.RLock` 保护：
-  - `InodeMapper`（三向映射）
-  - `MetaCache`（TTL 缓存）
-  - `DataCache`（读缓存 / 写回）
-  - `DirectoryTree`（目录树、索引宽限期）
-  - `TombstoneStore`（墓碑）
-- **限流器**（`router/rate_limiter.py`）用 `threading.BoundedSemaphore` + 单调时钟实现。之所以不用
-  asyncio/trio 原语，是因为调用发生在工作线程里，且 `DirectClientWrapper` 也会被脚本同步调用。
-- **读句柄持有真实 fd**：`open(O_RDONLY)` 时就把本地缓存文件 `open(2)` 出来、把 fd 记在
-  `_read_fds[fh]` 上，`read` 用 `os.pread`（不改偏移，天然可并发）。fh 从 `2**32` 起分配，
-  与 inode 区分开：同一个 inode 被并发打开多次时，若复用 inode 当 fh，句柄会互相覆盖、
-  `release` 还可能关掉别人的 fd。
-- **缓存条目会被「钉住」**：`DataCache.acquire_for_read()` 在读句柄存续期间给条目计数，
-  LRU 淘汰跳过它们。淘汰一个仍被占用的条目时只摘掉缓存映射，真正的 `unlink` 推迟到最后一个
-  `release_read()`（POSIX 语义：已打开的文件不会凭空消失）。这条路径修复了
-  「下载 A 触发淘汰，把正在读的 B 删掉 → `read` 报 EBADF」的竞态。
+| 模块 | 职责 |
+| --- | --- |
+| `journal.py` | SQLite 写回日志；元数据持久化，payload 留在 tmpfs |
+| `fsutil.py` | 判断目录在 tmpfs 还是持久盘 |
+| `lock.py` | 同一缓存目录的 `flock` 互斥 |
+| `setup.py` + `tui.py` | 首次设置向导（curses）与行模式 |
+| `service.py` | `systemd --user` 单元生成、安装、状态 |
+| `sdnotify.py` | `READY` / `STATUS` / `EXTEND_TIMEOUT_USEC` |
 
-## inode / 路径 / fileId 映射
+## 启动与生命周期
+
+```text
+mcloud-fuse
+  ├─ 读 config.json + 环境变量
+  ├─ token 缺失/过期 → setup TUI
+  ├─ CacheLock(cache_dir).acquire()          # 同一目录只允许一个挂载
+  ├─ DirectClientWrapper()                    # 加载 token、准备 HTTP
+  ├─ pyfuse3.init(mountpoint)
+  ├─ sdnotify.ready()                         # systemd Type=notify 就绪
+  ├─ 后台线程 recover_pending_uploads()
+  └─ trio + pyfuse3.main()
+        │
+        └─ SIGTERM / SIGINT
+             ├─ sdnotify.extend_timeout()     # 有界，最多 30s
+             ├─ rescue_pending_uploads()      # tmpfs → state/rescue
+             ├─ flush_deletes()               # 删除队列收尾
+             └─ pyfuse3.close()
+```
+
+- `mcloud-fuse mount` 也走同一条路径；unit 的 `ExecStart` 就是它。
+- 手动运行没有 `NOTIFY_SOCKET` 时，`sdnotify` 全部 no-op。
+- systemd 单元的 `Type=notify` 保证 `systemctl start` 在挂载点真正可用后才返回。
+
+## 进程与并发
+
+- FUSE 事件循环跑在 **trio** 上；所有回调是 `async`。
+- 阻塞操作（HTTP、磁盘、sha256）通过 `trio.to_thread.run_sync` 进入工作线程。
+- 共享状态用 `threading.RLock` 保护：`InodeMapper`、`MetaCache`、`DataCache`、
+  `DirectoryTree`、SQLite 日志。
+- **读句柄持有真实 fd**：`open` 后把 fd 记在 `_read_fds[fh]`，`read` 用 `os.pread`，
+  不会互相改文件偏移。
+- **缓存条目钉住**：读句柄存续期间禁止 LRU 删除；淘汰只摘映射，最后一个句柄
+  `release` 后才真正 `unlink`（POSIX 语义）。
+- **缓存目录锁**：`flock` 锁住 `cache_dir/.mcloud-fuse.lock`，进程被 kill 时内核自动释放。
+
+## inode / 路径 / fileId
 
 `InodeMapper` 维护三张表：
 
@@ -64,132 +96,149 @@
 | `_path_to_inode` | 本地绝对路径 → inode | `lookup` / 路径解析 |
 | `_file_id_to_inode` | 云盘 fileId → inode | 上传后重映射、去重 |
 
-- inode 从 2 单调递增分配（1 是挂载根），**永不复用**。这也是 `readdir` 能用 inode 当 `next_id` 的前提：
-  新文件 inode 一定更大，追加在末尾，不会跳过或重复已返回条目。
-- 新建文件先分配一个 `pending-<uuid>` 占位 fileId；上传成功后用 `remap_file_id` 换成真实 fileId，
-  **inode 不变**，因此已打开的句柄不会失效。
-- 同一路径出现新 fileId（覆盖写）时，旧 inode 会被回收，路径归属唯一。
+- inode 从 2 单调递增（1 是根），**永不复用**；`readdir` 的 `next_id` 依赖这一点。
+- 新建文件先分配 `pending-<uuid>` 占位 fileId，上传成功后 `remap_file_id` 换成真实
+  fileId，**inode 不变**，已打开句柄不受影响。
+- 同名覆盖时，旧 inode 被回收，路径归属唯一。
 
-## 目录充填与一致性
+## 目录充填
 
-`DirectoryTree.populate_directory` 是目录视图的唯一入口：
+`DirectoryTree.populate_directory` 是目录视图唯一入口：
 
-1. **过滤**：跳过 `.TrashBin`（根目录）、跳过在墓碑里的 fileId、跳过没有 fileId 的脏条目。
-2. **同名去重**：云盘允许同名，POSIX 不允许。同名时优先保留“本地已映射的 fileId”，
-   否则取 `updateTime` 最新的一条。
-3. **索引宽限期**：如果本地同一路径上是一个 `pending-` 或刚创建（默认 300s 内）的节点，
-   就保留本地版本，不采用云端（可能还没收录）的结果。
-4. **对账清理**：本轮云端没返回、且不在宽限期内的旧子节点会被移除，避免幽灵条目。
+1. 过滤历史内部目录（`.TrashBin` / `.MCloudHydrate`）；
+2. 同名去重：云端允许同名，POSIX 不允许；优先保留本地已映射的 fileId，否则取
+   `updatedAt` 最新的一条；
+3. 索引宽限期：本地刚创建的节点在云端索引里可能还查不到，默认保留 300 秒；
+4. 对账清理：本轮云端没返回且不在宽限期的旧子节点会被移除。
 
-## 读路径
+`MetaCache` 对 `getattr` / `readdir` 做 TTL 缓存（默认 60 秒），并用 LRU 限制条数
+（默认 4096），避免浏览超大目录时内存无限增长。
+
+## 懒加载读路径
+
+默认 **所有文件** 懒加载（`MCLOUD_LAZY_READ=1`）：
 
 ```text
-open(inode)
-  └─ DataCache.prepare_file_for_read(fileId)
-       命中缓存 → 直接返回本地文件
-       未命中   → wrapper.download_file()（直链 + 流式落盘 + LRU 淘汰）
-                    ├─ 沙箱内文件   → 直接取直链下载
-                    └─ 沙箱外文件（--root cloud）→ hydrate_file() 先云内复制到
-                       .MCloudHydrate/<fileId>/，再对副本取直链下载
+open(inode, O_RDONLY)
+  └─ open_lazy(fileId, name, size)
+       └─ 建一个大小已知的稀疏文件，不下载内容；句柄钉住该条目
+
 read(fh, off, size)
-  └─ 本地文件 seek + read（工作线程）
+  └─ ensure_range(fileId, off, size)
+       ├─ 命中已覆盖分片 → 直接 pread
+       ├─ 缺块 → download_range(4MiB 对齐)
+       └─ 服务端不支持 Range（HTTP 200）
+            → 整文件落盘并升级为完整缓存
 ```
 
-官方 Skill 的下载接口带沙箱校验（`ensure_files_in_sandbox`），而 `copy` 的**源**允许是
-全盘任意位置。因此挂载云盘根时，读取沙箱外文件走「云内复制 → 再下载」两步：每个源文件在
-沙箱暂存目录里占一个以自身 fileId 命名的子目录，副本与源同名也不冲突，进程重启后按
-「槽位 + 文件名」做同名检查即可复用、不重复搬运。
+- 稀疏文件按 `st_blocks` / 已覆盖分片计费，100GB 空壳不会算成 100GB 缓存；
+- 需要完整内容的地方（覆盖写、`truncate`、`rename` 上传）必须走
+  `ensure_complete()`，绝不把部分文件当完整文件上传；
+- `MCLOUD_LAZY_READ=0` 或 `MCLOUD_EAGER_DOWNLOAD_LIMIT>0` 可退回整文件下载策略；
+- 不预取、不全盘同步、启动时不列举整棵树。
 
-搬运的触发点是取直链时的 `PermissionDeniedError`（这已经是最准确的「不在沙箱内」信号，
-无需再查一次路径）；并且整条链路只用 `batchCheckExists` / `batchCopy` / `batchGet`
-这类强一致接口，**不使用搜索接口**——目录列举用的 merge search 是最终一致的，会返回
-「缓存信息失效」之类的服务端错误，不该被懒搬运继承。写路径不做搬运
-（`upload` / `createFolder` 的目标必须在沙箱内），越界写会由 SDK 拒绝并映射为 `EACCES`。
-
-## 写路径（Write-Back）
+## 写回路径
 
 ```text
 create()/open(O_WRONLY)
-  └─ DataCache.create_write_buffer()      新建 .wb 暂存，并登记写回日志
-write()
-  └─ 写入 .wb；更新 mapper 中的 size
+  └─ create_write_buffer()        新建 .wb，日志状态 building
+
+write(fh, off, data)
+  └─ 直接写 .wb；检查写回上限 + 剩余空间（ENOSPC）
+
 fsync(fh)
-  └─ _commit_write(final=False)           上传，但**保留** .wb（文件还开着）
+  └─ mark ready → uploading → 上传 → 清日志，保留 .wb
+
 release(fh)
-  └─ _commit_write(final=True)
-       1) 若 dirty/新建 → 上传（>16MiB 走多段）
-       2) remap fileId（inode 不变）
-       3) finalize：把 .wb **改名**进读缓存目录（同文件系统零拷贝，跨文件系统回退拷贝）
-       4) 旧 fileId 记墓碑（覆盖写会在云端留下旧对象）
+  └─ mark ready → uploading → 上传 → remap fileId → finalize
+       └─ .wb 改名进读缓存（同文件系统零拷贝；跨文件系统回退拷贝）
 ```
 
 要点：
 
-- **异步 release**：FUSE 的 `release` 不阻塞 `close()`。本层用 `_commit_events`（每个 inode 一个
-  `threading.Event`）标记「上传在途」，后续 `open` / `unlink` 会等待它完成，避免读到占位 fileId。
-- **零拷贝收尾**：`os.replace(.wb → cache/<fileId>_<name>)`，不再为同一个文件额外拷贝一份。
-  可用 `MCLOUD_UPLOAD_KEEP_CACHE=0` 关闭“保留本地副本”，上传后直接删除暂存。
-- **为什么不流式上传**：云盘 `file/create` 必须在创建任务时就给出**总大小**与每片大小，
-  而写文件时总大小未知。因此只能先落本地、关闭时上传；这是接口限制，不是实现取舍。
+- 写回日志状态：`building → pending → uploading → uploaded/清除`；
+- 崩溃在 `building` 阶段不会上传半成品；
+- 上传成功后再清日志；`uploading` 崩溃由下次启动核对远端同名同大小文件；
+- 云盘要求先给总大小，所以必须整文件落本地后上传，**不支持随机写**；
+- 分片大小默认 100MiB，严格按序上传；失败重试，末片后 `file/complete`；
+- 覆盖写冲突：提交前比对 `updatedAt`，默认另存 `name.conflict-<host>-<ts>`，
+  `MCLOUD_CONFLICT=error` 则返回 `ESTALE`。
 
-## 大文件多段上传
+## 删除 / 回收站
 
-`DirectClientWrapper.upload_file`：
-
-- `size <= MCLOUD_MULTIPART_THRESHOLD`（默认 16MiB）→ 单段上传（官方 `file/create` 一个 part）。
-- 否则按 `MIN_PART_SIZE`（5MiB）与 `MAX_PARTS`（64）规划分片，**严格按 partNumber 顺序**上传，
-  每片独立重试；最后 `file/complete` 带整文件 SHA-256。
-- 任一步失败回退单段上传。
-
-两条实测约束（都是真机上撞出来的）：
-
-1. 除末片外，每片不得小于 **5MiB**，否则返回 `请求参数不合法(00010002)`。
-2. 分片必须**按序**上传，并发/乱序会返回 `InvalidPartOrder: fail to get previous part hash context`。
-
-## 删除与墓碑
-
-官方 Skill 只有 create / search / copy / download 一类接口，**没有任何删除或回收站接口**，
-因此「删除」在云端是做不到的，本层只能让它在挂载里消失：
+`unlink` / `rmdir`：
 
 ```text
-unlink/rmdir
-  └─ TrashBinHandler.move_to_trash(entry)
-       1) tombstones.add(fileId)   ← 落盘 cache_dir/.tombstones（删除语义的唯一实现）
-       2) mapper 摘除该节点
-       3) tree.mark_directory_stale(parent)
-      （MCLOUD_TRASH_COPY=1 时才会额外 copy <fileId> → .TrashBin/<fileId>）
+默认：/file/batchDelete → 轮询 /task/get 到 Succeed
+trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 ```
 
-- 墓碑在目录充填时过滤对应 fileId。它是**本地状态**：换机器/清缓存后，云端旧对象会重新出现。
-- **为什么默认不再复制一份进 `.TrashBin`**：原对象并没有被删掉，复制只会让被删对象占双倍容量
-  （目录移动时更是 `batch_copy` 整棵子树）；而 `.TrashBin` 属于 `HIDDEN_DIR_NAMES`，
-  用户在挂载里看不到、也无法通过接口删除它，副本没有任何收益。
-- 想恢复被删对象：从墓碑里移除该 fileId 即可（云端原对象从未移动）。
-  想真正腾出容量：只能在官方 App / 网页端删除，本层无能为力。
+- 删除是**真删除**，不是墓碑；
+- `batchDelete` / `batchMove` 返回 `taskId`，必须等任务结束再返回，避免 `rm` 后
+  对象又出现在下一次 `ls`；
+- 网页端删除的对象也出现在回收站 CLI 里。
 
-## 崩溃恢复
+## SQLite 写回日志与恢复
 
-- `DataCache` 在 `write_back_dir/writeback_journal.json` 里记录每个写回文件的
-  `{target_dir_id, file_name}`。
-- 启动时 `main.py` 调 `recover_pending_uploads()`：对每个仍有 `.wb` 的日志项重新上传，
-  成功后改名进读缓存并清除日志。
-- 未完成的多段上传无法续传（接口不提供 resume），会作为整文件重新上传。
+日志数据库：`~/.local/state/mcloud-fuse/writeback-<hash>.sqlite3`（0600，按写回目录分库）。
 
-## 限流与重试
+| 字段 | 说明 |
+| --- | --- |
+| `key` | 本地写回 key（通常 `inode-N`） |
+| `target_dir_id` / `file_name` | 目标目录与文件名 |
+| `payload_path` | `.wb` 或 rescue 文件路径 |
+| `base_file_id` / `base_updated_at` | 覆盖写冲突基线 |
+| `state` | `building` / `pending` / `uploading` / `rescued` / `lost` |
+| `size` / `last_error` | 诊断信息 |
 
-- `RateLimiter(max_concurrent, requests_per_second)`：并发信号量 + 请求间隔。
-- `retry_call(func, max_retries, ...)`：指数退避 + 抖动；`ApiError/OSError/超时` 重试，
-  `权限拒绝/入参错误/未登录` 立即抛出。
-- `DirectClientWrapper._api()` 把两者串起来，所有云盘调用都必须走它。
+启动时后台补传：
 
-## 错误映射
+1. `uploading`：先核对远端是否有同名同大小对象；有则清日志，避免重复上传；
+2. `building`：半成品，标记 `lost`，不上传；
+3. `pending` / `rescued`：从 payload 路径补传；成功转读缓存并清日志；
+4. payload 不存在：标记 `lost`，保留记录供 `journal list` 查看。
 
-`MCloudFuseOps._to_fuse_error` 把内部异常翻译成 `errno`：
+补传在挂载后后台执行，不阻塞 FUSE 就绪。
+
+## 关机抢救
+
+收到 `SIGTERM` / `SIGINT`：
+
+1. 通过 `sd_notify` 申请一次有界停止延时（默认最多 30 秒）；
+2. 只挑 `pending` / `uploading`，按大小从小到大复制到
+   `~/.local/state/mcloud-fuse/rescue/<hash>/`；
+3. `.part` + `fsync` + 原子 `rename`，更新日志 `payload_path`，状态 `rescued`；
+4. 超时/超单文件/超总量/空间不足就跳过，记录原因；`building` 不搬；
+5. 下次启动从持久盘补传。
+
+`TimeoutStopSec=60`，抢救自身默认 20 秒硬超时；断电 / SIGKILL 仍无法抢救，
+只能靠把 `MCLOUD_WRITE_BACK_DIR` 指到持久盘。
+
+## 资源上限
+
+| 资源 | 默认 | 机制 |
+| --- | --- | --- |
+| 读缓存 | `min(512, 10% RAM)`，至少 128MiB | LRU，按实际占用 / 已读分片计费 |
+| 写回 | `min(1024, 10% RAM)`，至少 256MiB | 写前检查，超限 `ENOSPC` |
+| 剩余空间 | 64MiB 保底 | `disk_usage` |
+| 元数据 | 4096 条 | `MetaCache` LRU |
+| 关机遇失抢救 | 1GiB / 单文件 512MiB / 20 秒 | 有界复制 |
+
+## 限流、重试与错误映射
+
+- `RateLimiter`：并发 3 + 5 RPS（可环境变量覆盖）。
+- `retry_call`：指数退避 + 抖动；权限/入参错误不重试。
+- `MCloudFuseOps._to_fuse_error`：
 
 | 内部异常 | errno |
 | --- | --- |
-| `AuthRequiredException` / `MCloudAuthException` | `EACCES` |
-| `PermissionDeniedError`（沙箱越界） | `EACCES` |
-| 不存在 / not found | `ENOENT` |
+| 鉴权失败 / token 过期 | `EACCES` |
+| 不存在 | `ENOENT` |
 | 已存在 | `EEXIST` |
+| 写回超过上限 / 磁盘满 | `ENOSPC` |
 | 其它 API 异常 | `EIO` |
+
+## 历史实现
+
+v0.3.0 的 Skill 通道、沙箱、`.MCloudHydrate`、墓碑删除与 `.TrashBin` 复制逻辑
+全部在 [`.old-version/`](../.old-version/README.md)，仅作对照，不参与构建与测试。

@@ -46,7 +46,7 @@ class RangeWrapper:
         return len(chunk)
 
 
-def make_cache(tmp_path, wrapper, limit=64, chunk=64):
+def make_cache(tmp_path, wrapper, limit=64, chunk=64, lazy_read=True):
     return DataCache(
         client_wrapper=wrapper,
         cache_dir=tmp_path / "cache",
@@ -54,6 +54,7 @@ def make_cache(tmp_path, wrapper, limit=64, chunk=64):
         max_size_mb=64,
         eager_download_limit_bytes=limit,
         range_chunk_bytes=chunk,
+        lazy_read=lazy_read,
     )
 
 
@@ -128,10 +129,18 @@ def test_server_without_range_falls_back_and_stays_complete(tmp_path):
     assert wrapper.full_calls == []
 
 
-def test_eager_limit_zero_disables_lazy_reads(tmp_path):
-    """``MCLOUD_EAGER_DOWNLOAD_LIMIT=0`` 时必须退回 v0.3.0 的整文件下载行为。"""
+def test_eager_limit_zero_means_all_files_lazy(tmp_path):
+    """``MCLOUD_EAGER_DOWNLOAD_LIMIT=0`` 是「全部懒加载」，不是关闭懒加载。"""
     wrapper = RangeWrapper(CONTENT)
     cache = make_cache(tmp_path, wrapper, limit=0)
+    assert cache.should_read_lazily(10_000) is True
+    assert cache.should_read_lazily(1) is True
+
+
+def test_lazy_read_can_be_disabled(tmp_path):
+    """``MCLOUD_LAZY_READ=0`` 才退回 v0.3.0 的整文件下载行为。"""
+    wrapper = RangeWrapper(CONTENT)
+    cache = make_cache(tmp_path, wrapper, limit=0, lazy_read=False)
     assert cache.should_read_lazily(10_000) is False
 
     path = cache.acquire_for_read("fid_big", "big.bin")

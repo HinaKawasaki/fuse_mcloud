@@ -1,0 +1,23 @@
+{
+  "success": true,
+  "code": "0000",
+  "message": "请求成功",
+  "data": {
+    "items": [
+      {
+        "fileId": "Ftrash0000000000000000000000000000",
+        "name": "old.txt",
+        "type": "file",
+        "category": "doc",
+        "size": 34,
+        "createdAt": "2026-10-12T23:13:19.000+08:00",
+        "updatedAt": "2026-10-12T23:13:19.127+08:00",
+        "trashedAt": "2026-10-12T23:13:19.127+08:00",
+        "remainingTime": 43,
+        "trashedReason": "userTrashed",
+        "trashedDirStatistics": null
+      }
+    ],
+    "nextPageCursor": "0|[11-1-0]"
+  }
+}

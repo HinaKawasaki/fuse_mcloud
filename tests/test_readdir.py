@@ -16,7 +16,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mcloud_fuse.cache.meta_cache import MetaCache  # noqa: E402
-from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper  # noqa: E402
+from mcloud_fuse.client.wrapper import CloudItem  # noqa: E402
 from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps  # noqa: E402
 from mcloud_fuse.mapping.id_map import InodeMapper  # noqa: E402
 from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
@@ -225,15 +225,3 @@ def test_lookup_populates_correct_parent(monkeypatch):
 
     with pytest.raises(Exception):
         trio.run(ops.lookup, docs_inode, b"nope.txt")
-
-
-# ---------------------------------------------------------------------------
-# wrapper 解析
-# ---------------------------------------------------------------------------
-
-def test_parse_raw_file_detects_directories():
-    parse = DirectClientWrapper._parse_raw_file
-    assert parse({"fileId": "1", "name": "d", "type": "folder"}).is_dir is True
-    assert parse({"fileId": "2", "name": "d", "category": "folder"}).is_dir is True
-    assert parse({"fileId": "3", "name": "f", "type": "file"}).is_dir is False
-    assert parse({"fileId": "4", "name": "f", "isDir": False, "size": "12"}).size == 12

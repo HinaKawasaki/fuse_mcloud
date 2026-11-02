@@ -1,5 +1,71 @@
 # Release Notes
 
+## v0.4.0：后端换成 yun.139.com Web API
+
+这是一次**破坏性后端替换**，不是增量版本。
+
+### 能力
+
+- `rm` 真删除：`/file/batchDelete`（`MCLOUD_RM_MODE=trash` 可退回回收站）；
+- 删除/移动会轮询 `/task/get` 到 `Succeed` 再返回，避免异步任务造成「删不掉的幽灵目录」；
+- `statfs` 接入 `/disk/quota/detail`：`df -h` 显示真实容量，删除后可用空间回升；
+- 新增 `mcloud-fuse trash list / restore / empty`：回收站查看、恢复与清空；
+- `statfs` 的 inode 数改为按约定报 0（未知），不再编造 10 亿上限；
+- 新增端点契约：`tests/contracts/*.json` + `scripts/check_contracts.py`，
+  每周真机检查字段漂移（`.github/workflows/contract-live.yml`）；
+- 覆盖写冲突检测：提交前比对远端 `updatedAt`，默认把本地版本另存为
+  `name.conflict-<host>-<ts>`（`MCLOUD_CONFLICT=copy`），可切 `error` 返回 `ESTALE`；
+- 多用户定为「每人一个账号」：systemd --user 模板（v0.4.0 起由
+  `mcloud_fuse/service.py` 生成），不做共享写 ACL / `allow_other`；
+- 文件锁确认为内核本地 advisory：`flock` / `fcntl` 单挂载内可用，跨主机无效；
+- 性能：页大小 500、去掉缩略图请求、删除批处理（`rm` 20 文件 13.8s → 0.6s）；
+- 新增 `scripts/bootstrap.sh` 一键部署、`mcloud-fuse doctor` 自检、`mcloud-fuse setup` 向导；
+- **首次设置改为全屏 TUI**（标准库 `curses`，无新依赖）：7 步向导完成 token、
+  挂载点、云盘范围、缓存、删除语义、冲突策略与服务安装；有 `--no-tui` / `--yes`
+  行模式，非 TTY 自动降级。设计见 [docs/tui.md](tui.md)；
+- **配置持久化**：向导写 `~/.config/mcloud-fuse/config.json`（0600），之后
+  `mcloud-fuse` 不带参数即可挂载，不再需要背 `--mountpoint` / `--root`；
+- 新增 `mcloud-fuse status` / `mcloud-fuse unmount`；`mcloud-fuse mount` 仍可用
+  命令行参数临时覆盖配置；
+- `systemd --user` 单元由 Python 直接生成（`mcloud_fuse/service.py`），不再依赖
+  `scripts/install_user_service.sh` 与 `setup.env`；服务单元不含 token 明文；
+- token 解析/脱敏/0600 落盘收敛到 `mcloud_fuse/tokens.py`，向导、`status` 与
+  `scripts/import_web_token.py` 共用；
+- 写回日志从 JSON 换成 **SQLite**（`~/.local/state/mcloud-fuse/writeback-<hash>.sqlite3`），
+  与 `/tmp/cmcloud-fuse/writeback` 的 payload 分离：进程崩溃可恢复，tmpfs 重启后
+  payload 丢失的条目标记 `lost` 并在 `status` / `doctor` 中显示；
+- 读缓存与待上传文件仍放 `/tmp/cmcloud-fuse`（tmpfs）；需要跨整机重启保住写入时，
+  可把 `MCLOUD_WRITE_BACK_DIR` 指到持久化磁盘；
+- **默认全量懒加载**：`open()` 不再下载内容，`read()` 才按 4MiB Range 拉取；
+  `MCLOUD_LAZY_READ=0` 才回到整文件下载。`ls` / `stat` 只访问元数据；
+- **资源硬上限**：读缓存自动 128~512MiB、写回 256~1024MiB，另有 64MiB 保底剩余空间；
+  超过返回 `ENOSPC`，不再可能把 tmpfs 写满；元数据缓存加 LRU 上限（默认 4096 条）；
+- **补传后台化**：挂载先就绪，未上传文件在后台补传，不再阻塞 `pyfuse3.init`；
+- **关机遇失抢救**：收到 SIGTERM 时先通过 `sd_notify` 的
+  `EXTEND_TIMEOUT_USEC` 向 systemd 申请一次有上限的停止延时（默认最多 30 秒），
+  再在卸载前把 `pending` / `uploading` 的 payload 从 tmpfs 复制到
+  `~/.local/state/mcloud-fuse/rescue/`；默认总上限 1GiB、单文件 512MiB、20 秒。
+  下次启动从持久盘补传。`building` 半成品不抢救，断电 / SIGKILL 仍无法抢救；
+- systemd 单元改为 `Type=notify`：挂载真正就绪后才向 systemd 发 `READY=1`，
+  `systemctl start` 不再“进程起来但挂载点还没好”就返回；
+- **缓存目录互斥**：`flock` 锁住同一 cache dir，两个挂载进程不会互相覆盖缓存；
+- 新增 `mcloud-fuse journal list / forget / gc / retry`：查看、清理 `lost`、回收孤儿
+  payload、未挂载时手动补传；
+- `status --cache-dir` 可以显式指定要查的缓存目录；`doctor` 会显示缓存文件系统类型；
+- `rename` 支持目录：`/file/update`，不再 `ENOSYS`；
+- 跨目录移动是原语：`/file/batchMove`，不再复制双份；
+- 全盘直读，删除 `.MCloudHydrate` 懒搬运与沙箱边界；
+- 目录枚举改用 `/file/list` 游标分页，不再依赖搜索索引。
+
+### 工程
+
+- 新增隔离的 L3 协议层 `client/web139.py`（token/续期/签名/上传/冲突处理）；
+- `client/wrapper.py` 改为后端适配器，保留原有 FUSE/缓存接口；
+- token 导入脚本与真机冒烟脚本；
+- Skill 通道整体归档到 `.old-version/`，不参与打包、CI 与测试；
+- 版本号升至 `0.4.0`。
+
+
 ## v0.3.0
 
 把 v0.2.1 之后的三块工作（工程化、读路径修复、两项行为改进）合并为同一个版本发布。

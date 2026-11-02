@@ -16,6 +16,9 @@ class FakeCloud:
         self.uploads = []
         self.copies = []
         self.list_calls = []
+        self.deleted = []
+        self.renames = []
+        self.moves = []
 
     def list_directory(self, dir_file_id, recursive=False, page_limit=200, max_items=50000):
         self.list_calls.append(dir_file_id)
@@ -65,3 +68,43 @@ class FakeCloud:
             self.copies.append((file_id, to_parent_file_id))
             results.append({"fileId": file_id, "newFileId": new_id})
         return results
+
+    # ------------------------------------------------------------------
+    # Web 后端新增：rename / move / delete（rm 语义）
+    # ------------------------------------------------------------------
+
+    def rename(self, file_id, new_name):
+        for items in self.dirs.values():
+            for item in items:
+                if item["id"] == file_id:
+                    item["name"] = new_name
+                    self.renames.append((file_id, new_name))
+                    return
+        raise FileNotFoundError(file_id)
+
+    def move(self, file_ids, to_parent_file_id):
+        for file_id in file_ids:
+            item = None
+            for items in self.dirs.values():
+                for candidate in items:
+                    if candidate["id"] == file_id:
+                        item = candidate
+                        items.remove(candidate)
+                        break
+                if item is not None:
+                    break
+            if item is None:
+                raise FileNotFoundError(file_id)
+            self.dirs.setdefault(to_parent_file_id, []).append(item)
+            self.moves.append((file_id, to_parent_file_id))
+
+    def delete(self, file_ids, permanent=True):
+        for file_id in file_ids:
+            for items in self.dirs.values():
+                items[:] = [item for item in items if item["id"] != file_id]
+            self.dirs.pop(file_id, None)
+            self.content.pop(file_id, None)
+            self.deleted.append((file_id, permanent))
+
+    def clear_recycle_bin(self):
+        return None

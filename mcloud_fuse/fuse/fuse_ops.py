@@ -12,12 +12,15 @@ import trio
 
 from mcloud_fuse.cache.data_cache import DataCache
 from mcloud_fuse.cache.meta_cache import MetaCache
-from mcloud_fuse.client.auth_manager import AuthRequiredException, MCloudAuthException
-from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper, MCloudAPIException
-from mcloud_fuse.config import UPLOAD_KEEP_CACHE
+from mcloud_fuse.client.wrapper import (
+    CloudItem,
+    MCloudAPIException,
+    MCloudAuthException,
+    MCloudConflictError,
+)
+from mcloud_fuse.config import QUOTA_CACHE_TTL, UPLOAD_KEEP_CACHE
 from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
 from mcloud_fuse.mapping.tree import DirectoryTree
-from mcloud_fuse.utils.trash_bin import TrashBinHandler
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,8 @@ class MCloudFuseOps(pyfuse3.Operations):
     - 所有阻塞式网络 / 磁盘 I/O 都通过 ``trio.to_thread.run_sync`` 放到工作线程，
       避免阻塞 pyfuse3 的 trio 事件循环。
     - 写入采用写回缓存：write 先落本地暂存文件，release/fsync 时整文件上传。
-    - 删除被改写为移入沙箱根下的 .TrashBin（云盘接口没有删除能力）。
+    - 删除/重命名/移动直接调用 Web API 原语（/file/batchDelete、/file/update、
+      /file/batchMove），不再做墓碑或「下载 + 重传」近似。
     """
 
     def __init__(
@@ -41,7 +45,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         tree: DirectoryTree,
         meta_cache: MetaCache,
         data_cache: DataCache,
-        wrapper: DirectClientWrapper,
+        wrapper,
     ):
         super().__init__()
         self.mapper = mapper
@@ -49,9 +53,6 @@ class MCloudFuseOps(pyfuse3.Operations):
         self.meta_cache = meta_cache
         self.data_cache = data_cache
         self.wrapper = wrapper
-        self.trash = TrashBinHandler(wrapper, mapper, tree)
-        # 已删除 fileId 的墓碑集合（由 DirectoryTree 持有，可持久化）
-        self.tombstones = tree.tombstones
 
         # 已打开文件句柄 inode -> 本地读缓存 Path（仅写句柄使用，读句柄见 _read_fds）
         self._fh_map: Dict[int, "os.PathLike"] = {}
@@ -74,6 +75,9 @@ class MCloudFuseOps(pyfuse3.Operations):
         # FUSE 的 release 是异步的，close() 返回时上传可能仍在后台进行；
         # 紧随其后的 open/read/unlink 必须等待它完成，否则会读到占位 fileId。
         self._commit_events: Dict[int, threading.Event] = {}
+        # statfs 配额缓存：(到期时间, DiskQuota | None)
+        self._quota_cache: Optional[tuple] = None
+        self._quota_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 写回在途同步
@@ -159,8 +163,10 @@ class MCloudFuseOps(pyfuse3.Operations):
         """把内部异常映射为合适的 errno，供内核返回给用户态。"""
         if isinstance(exc, pyfuse3.FUSEError):
             return exc
-        if isinstance(exc, (AuthRequiredException, MCloudAuthException)):
+        if isinstance(exc, MCloudAuthException):
             return pyfuse3.FUSEError(errno.EACCES)
+        if isinstance(exc, MCloudConflictError):
+            return pyfuse3.FUSEError(errno.ESTALE)
         if isinstance(exc, FileNotFoundError):
             return pyfuse3.FUSEError(errno.ENOENT)
         if isinstance(exc, (PermissionError, IsADirectoryError)):
@@ -253,7 +259,9 @@ class MCloudFuseOps(pyfuse3.Operations):
             return None
         return self.mapper.get_by_path(self.tree.child_path(parent_entry.path, name))
 
-    async def lookup(self, parent_inode: int, name_bytes: bytes, ctx=None) -> pyfuse3.EntryAttributes:
+    async def lookup(
+        self, parent_inode: int, name_bytes: bytes, ctx=None
+    ) -> pyfuse3.EntryAttributes:
         """[FUSE System Call] 寻找指定父目录下的子节点"""
         name = self._decode_name(name_bytes)
         parent_entry = self.mapper.get_by_inode(parent_inode)
@@ -294,16 +302,43 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         return True
 
+    def _quota_sync(self):
+        """[阻塞] 取配额，带 60s 缓存；失败返回 None，由调用方回退到估算值。"""
+        now = time.monotonic()
+        with self._quota_lock:
+            cached = self._quota_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        quota = None
+        try:
+            quota = self.wrapper.quota()
+        except Exception as exc:  # noqa: BLE001 - statfs 不能因为配额失败而报错
+            logger.warning("获取配额失败，statfs 使用估算值: %s", exc)
+        with self._quota_lock:
+            self._quota_cache = (now + QUOTA_CACHE_TTL, quota)
+        return quota
+
     async def statfs(self, ctx=None) -> pyfuse3.StatvfsData:
+        quota = await trio.to_thread.run_sync(self._quota_sync)
         stats = pyfuse3.StatvfsData()
-        stats.f_bsize = 4096
-        stats.f_frsize = 4096
-        stats.f_blocks = 1 << 34  # ~64 TiB，云盘容量对内核不可知，给一个宽松上限
-        stats.f_bfree = 1 << 33
-        stats.f_bavail = 1 << 33
-        stats.f_files = 1 << 30
-        stats.f_ffree = 1 << 29
-        stats.f_favail = 1 << 29
+        block = 4096
+        stats.f_bsize = block
+        stats.f_frsize = block
+        if quota is not None:
+            total_bytes = quota.total_mb * 1024 * 1024
+            free_bytes = quota.free_mb * 1024 * 1024
+            stats.f_blocks = total_bytes // block
+            stats.f_bfree = free_bytes // block
+            stats.f_bavail = free_bytes // block
+        else:
+            stats.f_blocks = 1 << 34
+            stats.f_bfree = 1 << 33
+            stats.f_bavail = 1 << 33
+        # 云盘没有 inode 概念，也没有「最多多少个文件」的公开配额。
+        # 按 statvfs 约定用 0 表示未知，比编一个 10 亿的假上限诚实。
+        stats.f_files = 0
+        stats.f_ffree = 0
+        stats.f_favail = 0
         stats.f_namemax = 255
         return stats
 
@@ -317,6 +352,20 @@ class MCloudFuseOps(pyfuse3.Operations):
             self._next_read_fh += 1
             return fh
 
+    def _conflict_base(self, entry: InodeEntry) -> tuple:
+        """[阻塞] 取覆盖写基线；拿不到就退回本地缓存值。"""
+        if str(entry.file_id).startswith(PENDING_FILE_ID_PREFIX):
+            return entry.file_id, ""
+        getter = getattr(self.wrapper, "get_item", None)
+        if getter is None:
+            return entry.file_id, entry.updated_at or ""
+        try:
+            fresh = getter(entry.file_id)
+            return fresh.file_id, fresh.updated_at or ""
+        except Exception as exc:  # noqa: BLE001 - 远端不存在/不可读一律按冲突处理
+            logger.warning("读取 %s 的远端版本失败，按冲突处理: %s", entry.file_id, exc)
+            return entry.file_id, entry.updated_at or "<unavailable>"
+
     def _open_write_sync(self, inode: int, flags: int):
         entry = self.mapper.get_by_inode(inode)
         if entry is None:
@@ -327,10 +376,15 @@ class MCloudFuseOps(pyfuse3.Operations):
         name = entry.path.rstrip("/").rsplit("/", 1)[-1]
         parent_entry = self.mapper.get_by_inode(entry.parent_inode)
         target_dir_id = parent_entry.file_id if parent_entry else None
+        base_file_id, base_updated_at = self._conflict_base(entry)
         truncate = bool(flags & os.O_TRUNC)
         if truncate:
             buffer_path = self.data_cache.create_write_buffer(
-                f"inode-{inode}", target_dir_id=target_dir_id, file_name=name
+                f"inode-{inode}",
+                target_dir_id=target_dir_id,
+                file_name=name,
+                base_file_id=base_file_id,
+                base_updated_at=base_updated_at,
             )
             size = 0
         else:
@@ -342,18 +396,21 @@ class MCloudFuseOps(pyfuse3.Operations):
                     initial_path=read_path,
                     target_dir_id=target_dir_id,
                     file_name=name,
+                    base_file_id=base_file_id,
+                    base_updated_at=base_updated_at,
                 )
             finally:
                 self.data_cache.release_read(entry.file_id)
             size = entry.size
-        return buffer_path, size
+        return buffer_path, size, base_file_id, base_updated_at
 
     def _open_read_handle_sync(self, inode: int) -> tuple:
         """准备本地文件，返回 ``(fd, 被钉住的 file_id, 按需读的 file_id)``。
 
-        - 普通文件：整文件下载/复用缓存，持有 fd（``pread`` 读取）；
-        - 大文件（超过 ``MCLOUD_EAGER_DOWNLOAD_LIMIT``）：只建一个大小已知的空壳，
-          不下载内容，read 时按 Range 拉取。此时没有 fd，靠钉住保证路径稳定；
+        - 默认所有普通文件懒加载：只建一个大小已知的稀疏空壳，不下载内容，
+          read 时按 Range 拉取。此时没有 fd，靠钉住保证路径稳定；
+        - ``MCLOUD_LAZY_READ=0``（或 ``EAGER_DOWNLOAD_LIMIT>0`` 且文件不够大）时
+          才整文件下载/复用缓存，持有 fd（``pread`` 读取）；
         - 未关闭写句柄的暂存文件：直接读它，无需钉住，也没有按需读。
         """
         entry = self.mapper.get_by_inode(inode)
@@ -391,8 +448,8 @@ class MCloudFuseOps(pyfuse3.Operations):
         await self._wait_inflight_commit(inode)
         try:
             if writable:
-                buffer_path, size = await trio.to_thread.run_sync(
-                    self._open_write_sync, inode, flags
+                buffer_path, size, base_file_id, base_updated_at = (
+                    await trio.to_thread.run_sync(self._open_write_sync, inode, flags)
                 )
                 entry = self.mapper.get_by_inode(inode)
                 name = entry.path.rstrip("/").rsplit("/", 1)[-1]
@@ -400,7 +457,8 @@ class MCloudFuseOps(pyfuse3.Operations):
                     "buffer": buffer_path,
                     "dirty": False,
                     "size": size,
-                    "base_file_id": entry.file_id,
+                    "base_file_id": base_file_id,
+                    "base_updated_at": base_updated_at,
                     "target_dir_inode": entry.parent_inode,
                     "name": name,
                 }
@@ -467,6 +525,11 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EBADF)
 
         payload = bytes(buf)
+        growth = max(0, off + len(payload) - int(state.get("size", 0)))
+        try:
+            self.data_cache.ensure_write_back_capacity(growth)
+        except OSError as exc:
+            raise self._to_fuse_error(exc) from exc
 
         def _write():
             with open(state["buffer"], "r+b") as handle:
@@ -561,27 +624,45 @@ class MCloudFuseOps(pyfuse3.Operations):
         self._commit_events[inode] = event
         try:
             if need_upload:
+                # 先把日志从 building 推到 pending，再标记 uploading：
+                # 崩溃恢复才允许补传，并能区分「请求已发出」的歧义状态。
+                self.data_cache.mark_write_ready(key)
+
                 def _upload() -> CloudItem:
                     return self.data_cache.upload_write_buffer(
                         key=key,
                         target_dir_id=target_dir_id,
                         file_name=file_name,
+                        base_file_id=state.get("base_file_id"),
+                        base_updated_at=state.get("base_updated_at"),
                     )
 
+                self.data_cache.mark_write_uploading(key)
                 try:
                     item = await trio.to_thread.run_sync(_upload)
                 except Exception as exc:  # noqa: BLE001
+                    self.data_cache.mark_write_pending(key, str(exc))
                     logger.error("写回上传失败 inode=%s: %s", inode, exc)
                     raise self._to_fuse_error(exc) from exc
 
+                # 上传已经成功，日志不应再触发一次补传（包括 fsync 后继续写的情况）
+                self.data_cache.clear_write_meta(key)
+                if item.name != file_name:
+                    # 远端在打开后被改过：本地版本已另存为冲突副本，原文件保留
+                    logger.warning(
+                        "写回冲突: %s 已被远端修改，本地版本另存为 %s",
+                        file_name, item.name,
+                    )
+                    self.data_cache.discard_write_buffer(key)
+                    state["dirty"] = False
+                    state["conflicted"] = True
+                    self.meta_cache.invalidate_readdir(parent_inode)
+                    self.tree.mark_directory_stale(parent_inode)
+                    return
                 # 用真实 fileId 替换占位/旧 fileId，保持 inode 与已打开句柄不变
                 old_file_id = state["base_file_id"]
                 self.mapper.remap_file_id(old_file_id, item.file_id)
                 self.mapper.update_entry(inode, size=state["size"])
-                # 覆盖写会在云端留下同名的旧对象，登记墓碑避免它重新出现在目录里
-                if self.tombstones is not None and old_file_id != item.file_id:
-                    if not str(old_file_id).startswith(PENDING_FILE_ID_PREFIX):
-                        self.tombstones.add(old_file_id)
                 state["base_file_id"] = item.file_id
                 state["dirty"] = False
 
@@ -651,7 +732,10 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise
         except Exception as exc:  # noqa: BLE001
             raise self._to_fuse_error(exc) from exc
-        logger.debug("create name=%s inode=%s flags=%s pending=%s", decoded, entry.inode, flags, entry.file_id)
+        logger.debug(
+            "create name=%s inode=%s flags=%s pending=%s",
+            decoded, entry.inode, flags, entry.file_id,
+        )
 
         self._write_state[entry.inode] = {
             "buffer": buffer_path,
@@ -729,10 +813,11 @@ class MCloudFuseOps(pyfuse3.Operations):
         self.tree.mark_directory_stale(parent_inode)
         return self._to_attrs(entry)
 
-    def _trash_sync(self, entry: InodeEntry) -> None:
-        self.trash.move_to_trash(entry)
+    def _delete_cloud_sync(self, entry: InodeEntry) -> None:
+        """真正删除（默认 /file/batchDelete），不再登记墓碑。"""
+        self.wrapper.delete([entry.file_id])
 
-    async def _trash_entry(self, entry: InodeEntry) -> None:
+    async def _delete_entry(self, entry: InodeEntry) -> None:
         parent_inode = entry.parent_inode
         # 若该文件的上传还在后台进行，先等它完成，避免把写回暂存文件删掉
         await self._wait_inflight_commit(entry.inode)
@@ -744,9 +829,11 @@ class MCloudFuseOps(pyfuse3.Operations):
             self.meta_cache.invalidate_all_for_inode(entry.inode, parent_inode=parent_inode)
             return
         try:
-            await trio.to_thread.run_sync(self._trash_sync, entry)
+            await trio.to_thread.run_sync(self._delete_cloud_sync, entry)
         except Exception as exc:  # noqa: BLE001
             raise self._to_fuse_error(exc) from exc
+        # 云端已删除，本地节点必须同步摘除；否则 unlink 返回后路径仍然存在
+        self.mapper.remove_by_inode(entry.inode)
         self.meta_cache.invalidate_all_for_inode(entry.inode, parent_inode=parent_inode)
 
     def _resolve_for_delete(self, parent_inode: int, name: str, *, want_dir: bool) -> InodeEntry:
@@ -762,7 +849,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         if not self.tree.is_directory_loaded(parent_inode):
             await self._load_directory(parent_inode)
         entry = self._resolve_for_delete(parent_inode, decoded, want_dir=False)
-        await self._trash_entry(entry)
+        await self._delete_entry(entry)
 
     async def rmdir(self, parent_inode, name, ctx=None) -> None:
         decoded = self._decode_name(name)
@@ -770,55 +857,26 @@ class MCloudFuseOps(pyfuse3.Operations):
         children = await self._load_directory(entry.inode)
         if children:
             raise pyfuse3.FUSEError(errno.ENOTEMPTY)
-        await self._trash_entry(entry)
+        await self._delete_entry(entry)
 
-    def _rename_file_sync(self, entry: InodeEntry, new_parent: InodeEntry, new_name: str) -> InodeEntry:
+    def _rename_sync(
+        self, entry: InodeEntry, new_parent: InodeEntry, new_name: str
+    ) -> InodeEntry:
+        """同目录改名用 /file/update，跨目录用 /file/batchMove；文件与目录同一套。"""
         old_name = entry.path.rstrip("/").rsplit("/", 1)[-1]
-        # 上传期间钉住缓存，否则并发的 LRU 淘汰可能在上传中途把源文件删掉
-        local_path = self.data_cache.acquire_for_read(entry.file_id, old_name)
-        try:
-            item = self.wrapper.upload_file(
-                local_file_path=local_path,
-                target_dir_id=new_parent.file_id,
-                name=new_name,
-            )
-        finally:
-            self.data_cache.release_read(entry.file_id)
-        try:
-            self.trash.move_to_trash(entry)
-        except Exception as exc:  # noqa: BLE001 - 新副本已就绪，旧文件回收失败不致命
-            logger.warning("重命名后旧文件移入回收站失败: %s", exc)
-        new_entry = self.mapper.allocate_or_update(
-            file_id=item.file_id,
+        if entry.parent_inode == new_parent.inode:
+            self.wrapper.rename(entry.file_id, new_name)
+        else:
+            self.wrapper.move([entry.file_id], new_parent.file_id)
+            if new_name != old_name:
+                self.wrapper.rename(entry.file_id, new_name)
+        return self.mapper.allocate_or_update(
+            file_id=entry.file_id,
             path=self.tree.child_path(new_parent.path, new_name),
-            is_dir=False,
+            is_dir=entry.is_dir,
             parent_inode=new_parent.inode,
-            size=item.size,
+            size=entry.size,
         )
-        self.tree.mark_recent(new_entry.inode)
-        self.data_cache.register_cache_file(item.file_id, local_path)
-        return new_entry
-
-    def _move_directory_sync(self, entry: InodeEntry, new_parent: InodeEntry) -> InodeEntry:
-        name = entry.path.rstrip("/").rsplit("/", 1)[-1]
-        results = self.wrapper.batch_copy([entry.file_id], new_parent.file_id)
-        new_file_id = None
-        for row in results or []:
-            if str(row.get("fileId") or "") == str(entry.file_id):
-                new_file_id = row.get("newFileId")
-        if not new_file_id and results:
-            new_file_id = results[0].get("newFileId")
-        if not new_file_id:
-            raise MCloudAPIException("目录移动失败：未返回 newFileId")
-        self.trash.move_to_trash(entry)
-        moved = self.mapper.allocate_or_update(
-            file_id=new_file_id,
-            path=self.tree.child_path(new_parent.path, name),
-            is_dir=True,
-            parent_inode=new_parent.inode,
-        )
-        self.tree.mark_recent(moved.inode)
-        return moved
 
     async def rename(self, parent_inode_old, name_old, parent_inode_new, name_new, flags, ctx=None):
         old_name = self._decode_name(name_old)
@@ -829,25 +887,27 @@ class MCloudFuseOps(pyfuse3.Operations):
         entry = self._resolve_child(parent_inode_old, old_name)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
+        # 刚写完的文件可能还在后台上传，此时 fileId 还是 pending-*，直接 rename 会 EIO
+        await self._wait_inflight_commit(entry.inode)
 
         new_parent = self.mapper.get_by_inode(parent_inode_new)
         if new_parent is None or not new_parent.is_dir:
             raise pyfuse3.FUSEError(errno.ENOTDIR)
 
         target_existing = self._resolve_child(parent_inode_new, new_name)
-        if target_existing is not None:
+        if target_existing is not None and target_existing.inode != entry.inode:
             if target_existing.is_dir and not entry.is_dir:
                 raise pyfuse3.FUSEError(errno.EISDIR)
-            await self._trash_entry(target_existing)
+            if entry.is_dir and not target_existing.is_dir:
+                raise pyfuse3.FUSEError(errno.ENOTDIR)
+            if target_existing.is_dir:
+                remaining = await self._load_directory(target_existing.inode)
+                if remaining:
+                    raise pyfuse3.FUSEError(errno.ENOTEMPTY)
+            await self._delete_entry(target_existing)
 
         try:
-            if entry.is_dir:
-                if old_name != new_name:
-                    # 云盘接口没有重命名目录的能力，无法在不改变目录名的前提下移动
-                    raise pyfuse3.FUSEError(errno.ENOSYS)
-                await trio.to_thread.run_sync(self._move_directory_sync, entry, new_parent)
-            else:
-                await trio.to_thread.run_sync(self._rename_file_sync, entry, new_parent, new_name)
+            await trio.to_thread.run_sync(self._rename_sync, entry, new_parent, new_name)
         except pyfuse3.FUSEError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -867,21 +927,28 @@ class MCloudFuseOps(pyfuse3.Operations):
         # 复制旧内容进写回暂存期间钉住缓存，避免并发 LRU 淘汰删掉源文件
         read_path = self.data_cache.acquire_for_read(entry.file_id, name)
         try:
+            base_file_id, base_updated_at = self._conflict_base(entry)
             buffer_path = self.data_cache.create_write_buffer(
                 f"inode-{inode}",
                 initial_path=read_path,
                 target_dir_id=parent_entry.file_id if parent_entry else None,
                 file_name=name,
+                base_file_id=base_file_id,
+                base_updated_at=base_updated_at,
             )
         finally:
             self.data_cache.release_read(entry.file_id)
+        self.data_cache.ensure_write_back_capacity(
+            max(0, size - buffer_path.stat().st_size)
+        )
         with open(buffer_path, "r+b") as handle:
             handle.truncate(size)
         self._write_state[inode] = {
             "buffer": buffer_path,
             "dirty": True,
             "size": size,
-            "base_file_id": entry.file_id,
+            "base_file_id": base_file_id,
+            "base_updated_at": base_updated_at,
             "target_dir_inode": entry.parent_inode,
             "name": name,
         }
@@ -897,6 +964,9 @@ class MCloudFuseOps(pyfuse3.Operations):
             state = self._write_state.get(inode)
             if state is not None:
                 def _truncate_buffer():
+                    self.data_cache.ensure_write_back_capacity(
+                        max(0, new_size - int(state.get("size", 0)))
+                    )
                     with open(state["buffer"], "r+b") as handle:
                         handle.truncate(new_size)
                     state["size"] = new_size

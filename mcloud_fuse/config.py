@@ -8,99 +8,126 @@ import os
 from pathlib import Path
 
 # ==================== 1. 缓存与路径配置 ====================
-# 内存/临时缓存目录 (默认放在 /tmp 内存文件系统中)
-CACHE_DIR = Path(os.getenv("MCLOUD_CACHE_DIR", "/tmp/cmcloud-fuse/cache"))
+# 读缓存目录（默认 tmpfs，重启即清空；写回日志单独放持久化 state 目录）
+CACHE_DIR = Path(os.getenv("MCLOUD_CACHE_DIR", "/tmp/cmcloud-fuse"))
 
 # 写回缓存的本地暂存目录：write() 先落这里，release()/fsync() 再整文件上传
-WRITE_BACK_DIR = Path(os.getenv("MCLOUD_WRITE_BACK_DIR", "/tmp/cmcloud-fuse/writeback"))
+WRITE_BACK_DIR = Path(
+    os.getenv("MCLOUD_WRITE_BACK_DIR", "/tmp/cmcloud-fuse/writeback")
+)
 
 # 缓存容量最大限制 (单位: MB)
 # - 设置为固定数值 (如 2048): 严格限制缓存上限为 2GB
-# - 设置为 None: 由程序自动探测系统可用内存并动态设定 (默认分配 25% RAM)
+# - 设置为 None: 自动取 min(512, 10% RAM)，至少 128MB（读缓存只保留最近用到的内容）
 MAX_CACHE_SIZE_MB = None  # 用户可直接修改此数字
+
+# 写回暂存上限（单位: MB）。超过就返回 ENOSPC，避免 cp 大文件把 tmpfs/内存写满。
+# None = 自动取 min(1024, 10% RAM)，至少 256MB。
+MAX_WRITE_BACK_MB = None
+# 写回/缓存目录至少保留的剩余空间（MB），低于它就拒绝新的写回。
+MIN_FREE_MB = int(os.getenv("MCLOUD_MIN_FREE_MB", "64"))
+
+# ==================== 1.1 关机遇失抢救 ====================
+# 只对 pending/uploading 的 payload 生效；building 表示半成品，绝不上传。
+RESCUE_ON_SHUTDOWN = os.getenv("MCLOUD_RESCUE_ON_SHUTDOWN", "1").strip().lower() not in (
+    "0", "false", "no",
+)
+RESCUE_MAX_MB = int(os.getenv("MCLOUD_RESCUE_MAX_MB", "1024"))
+RESCUE_FILE_MAX_MB = int(os.getenv("MCLOUD_RESCUE_FILE_MAX_MB", "512"))
+RESCUE_TIMEOUT_SEC = float(os.getenv("MCLOUD_RESCUE_TIMEOUT_SEC", "20"))
+RESCUE_MIN_FREE_MB = int(os.getenv("MCLOUD_RESCUE_MIN_FREE_MB", "256"))
+# 关机抢救时向 systemd 申请延长停止超时的上限（秒）；只申请一次，绝不无限延长。
+STOP_EXTEND_MAX_SEC = float(os.getenv("MCLOUD_STOP_EXTEND_MAX_SEC", "30"))
 
 # ==================== 2. 元数据与 TTL 策略 ====================
 META_CACHE_TTL = 60        # getattr / readdir 元数据缓存有效时间 (秒)
+# 元数据缓存最多保留多少条（inode 属性 / 目录列表各一份），防止浏览大目录时内存无限涨
+META_CACHE_MAX_ENTRIES = int(os.getenv("MCLOUD_META_CACHE_ENTRIES", "4096"))
+QUOTA_CACHE_TTL = float(os.getenv("MCLOUD_QUOTA_TTL", "60"))  # statfs 配额缓存（秒）
 
-# ==================== 3. 沙箱与目录映射 ====================
-SANDBOX_ROOT = "/AI空间/智能体云盘助手"
+# ==================== 3. 遗留内部目录 ====================
+# 旧版本写入的 .TrashBin / .MCloudHydrate 仍然隐藏，避免历史残留出现在
+# 新挂载里。新版本不再创建这两个目录。
 TRASH_BIN_DIR_NAME = ".TrashBin"
 
-# 沙箱外文件的懒搬运暂存目录（位于沙箱根下）。
-# 官方接口只允许下载沙箱内文件，因此读取沙箱外文件时先云内复制到这里的
-# 每文件子目录，再走普通下载；该目录与其子项在目录列举中隐藏。
+# 旧版沙箱外文件的懒搬运目录；新版本不再创建，只在列举时继续隐藏。
 HYDRATE_DIR_NAME = os.getenv("MCLOUD_HYDRATE_DIR", ".MCloudHydrate")
-
-# 挂载根：
-# - sandbox（默认）：只暴露沙箱 /AI空间/智能体云盘助手，行为与以前一致；
-# - cloud：暴露整个云盘根目录，沙箱外文件读取时按需搬进沙箱暂存目录；
-#   写操作仍只允许落在沙箱内，越界由官方 Skill 拒绝（表现为 EACCES）。
-ROOT_MODE = os.getenv("MCLOUD_ROOT", "sandbox").strip().lower()
-ROOT_MODE_SANDBOX = "sandbox"
-ROOT_MODE_CLOUD = "cloud"
-CLOUD_ROOT_FILE_ID = "root"
 
 # ==================== 4. 并发与限流 ====================
 API_MAX_CONCURRENT = int(os.getenv("MCLOUD_API_MAX_CONCURRENT", "3"))
 API_REQUESTS_PER_SECOND = float(os.getenv("MCLOUD_API_RPS", "5"))
 
-# ==================== 5. 大文件多段上传 ====================
-# 超过该大小改用多段并发上传（单段也能传，多段是为了提速与分片重试）
-MULTIPART_THRESHOLD_BYTES = int(
-    os.getenv("MCLOUD_MULTIPART_THRESHOLD", str(16 * 1024 * 1024))
-)
-# 云盘接口强制的最小分片大小（实测 < 5MiB 会被判“请求参数不合法”）
-MIN_PART_SIZE_BYTES = int(os.getenv("MCLOUD_MIN_PART_SIZE", str(5 * 1024 * 1024)))
-# 分片数量上限（分片大小据此向上取整，保证总片数不超过它）
-MAX_PARTS = int(os.getenv("MCLOUD_MAX_PARTS", "64"))
-# 单个分片上传的尝试次数
-PART_RETRIES = int(os.getenv("MCLOUD_PART_RETRIES", "3"))
-# 注：该后端要求分片严格按序上传（InvalidPartOrder），因此不提供并发分片。
-
-# ==================== 6. 写回收尾策略 ====================
+# ==================== 5. 写回收尾策略 ====================
 # 上传完成后是否把写回文件保留为本地读缓存（改名进缓存目录，零拷贝）。
 # 置 0 则上传后直接删除，适合本地磁盘紧张、且不在意刚写完立刻重读还要下次下载的场景。
 UPLOAD_KEEP_CACHE = os.getenv("MCLOUD_UPLOAD_KEEP_CACHE", "1").strip().lower() not in (
     "0", "false", "no",
 )
 
-# ==================== 7. 按需（Range）读取大文件 ====================
-# 大于该大小的文件不再「打开即整文件下载」，而是在 read 时按块拉取；
-# 置 0 关闭按需读（总是整文件下载，行为与 v0.3.0 一致）。
+# ==================== 6. 懒加载 / 按需（Range）读取 ====================
+# 默认所有文件都按需读：open() 不下载内容，read() 才按 4MiB 分片拉取。
+# MCLOUD_LAZY_READ=0 可退回旧的整文件下载；MCLOUD_EAGER_DOWNLOAD_LIMIT>0
+# 则只对超过该大小的文件懒加载。
+LAZY_READ = os.getenv("MCLOUD_LAZY_READ", "1").strip().lower() not in (
+    "0", "false", "no",
+)
 EAGER_DOWNLOAD_LIMIT_BYTES = int(
-    os.getenv("MCLOUD_EAGER_DOWNLOAD_LIMIT", str(256 * 1024 * 1024))
+    os.getenv("MCLOUD_EAGER_DOWNLOAD_LIMIT", "0")
 )
 # 按需读的单次预取粒度（实际请求会向上取整到该大小的整数倍）
 RANGE_CHUNK_BYTES = int(os.getenv("MCLOUD_RANGE_CHUNK", str(4 * 1024 * 1024)))
 # 单个分片请求的超时（与 SDK 的整文件下载超时分开：分片更小、应当更快返回）
 RANGE_TIMEOUT_SEC = float(os.getenv("MCLOUD_RANGE_TIMEOUT", "60"))
 
-# ==================== 8. 删除（回收站）策略 ====================
-# 云盘接口没有任何删除能力，unlink/rmdir 只能「本地摘除 + 登记墓碑」。
-# 旧实现会额外把对象云内复制一份到 .TrashBin：原对象并未消失，于是被删对象
-# 要占用双倍容量；而 .TrashBin 在本挂载里是隐藏目录（用户既看不到、也无法通过
-# 接口删除），副本没有任何用户可见价值。因此默认不再复制。
-# 置 1 恢复旧行为，便于在官方 App 的同一个目录里集中查看被删对象。
-TRASH_COPY_ENABLED = os.getenv("MCLOUD_TRASH_COPY", "0").strip().lower() in (
-    "1", "true", "yes",
-)
+# ==================== 7. yun.139.com Web API ====================
+# 使用前提是显式导入 token（scripts/import_web_token.py）；没有 token 时
+# 挂载会直接报错，不会静默改走其他通道。启用风险见 ADR-0002。
+# 浏览器里 hcy/file/list 请求头 Authorization: Basic 后面的值
+WEB_TOKEN_FILE = Path(
+    os.getenv("MCLOUD_WEB_TOKEN_FILE", "~/.config/mcloud-fuse/web_token")
+).expanduser()
+# Web 端单文件上传上限比 Skill 宽松：13=PC（500GB）、9=网页（50GB）
+WEB_CLIENT_TYPE = os.getenv("MCLOUD_WEB_CLIENT_TYPE", "13").strip()
+WEB_PART_SIZE_BYTES = int(os.getenv("MCLOUD_WEB_PART_SIZE", str(100 * 1024 * 1024)))
+
+# rm 语义：delete=调用 /file/batchDelete（不进回收站）；
+# trash=调用 /recyclebin/batchTrash（可在 App 回收站里恢复）。
+RM_PERMANENT = os.getenv("MCLOUD_RM_MODE", "delete").strip().lower() != "trash"
+
+# 覆盖写冲突策略：
+# - copy：把本地版本另存为 name.conflict-<host>-<ts>，远端原样保留（不丢数据）
+# - error：提交失败（ESTALE），保留写回缓冲，由调用方决定重试
+CONFLICT_MODE = os.getenv("MCLOUD_CONFLICT", "copy").strip().lower()
+if CONFLICT_MODE not in ("copy", "error"):
+    CONFLICT_MODE = "copy"
 
 
-def get_effective_cache_limit_mb() -> int:
-    """获取实际生效的缓存容量限额 (MB)。
-
-    用户在 config.MAX_CACHE_SIZE_MB 显式配置时直接使用；
-    为 None 时读取 /proc/meminfo，分配物理内存的 25%（至少 1GB，兜底 2GB）。
-    """
-    if MAX_CACHE_SIZE_MB is not None and MAX_CACHE_SIZE_MB > 0:
-        return int(MAX_CACHE_SIZE_MB)
-
+def _total_ram_mb() -> int:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("MemTotal:"):
-                    total_kb = int(line.split()[1])
-                    return max(1024, total_kb // 1024 // 4)
+                    return int(line.split()[1]) // 1024
     except (OSError, ValueError, IndexError):
         pass
-    return 2048  # 保底 2GB
+    return 2048
+
+
+def get_effective_cache_limit_mb() -> int:
+    """读缓存上限：显式配置 > MCLOUD_MAX_CACHE_MB > 自动（min(512, 10% RAM)）。"""
+    explicit = os.getenv("MCLOUD_MAX_CACHE_MB")
+    if explicit:
+        return max(32, int(explicit))
+    if MAX_CACHE_SIZE_MB is not None and MAX_CACHE_SIZE_MB > 0:
+        return int(MAX_CACHE_SIZE_MB)
+    return max(128, min(512, _total_ram_mb() // 10))
+
+
+def get_effective_write_back_limit_mb() -> int:
+    """写回暂存上限：显式配置 > MCLOUD_MAX_WRITE_BACK_MB > 自动（min(1024, 10% RAM)）。"""
+    explicit = os.getenv("MCLOUD_MAX_WRITE_BACK_MB")
+    if explicit:
+        return max(32, int(explicit))
+    if MAX_WRITE_BACK_MB is not None and MAX_WRITE_BACK_MB > 0:
+        return int(MAX_WRITE_BACK_MB)
+    return max(256, min(1024, _total_ram_mb() // 10))

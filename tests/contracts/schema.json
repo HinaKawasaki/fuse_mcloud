@@ -1,0 +1,61 @@
+{
+  "file_list": [
+    "success",
+    "code",
+    "data.items",
+    "data.items.0.fileId",
+    "data.items.0.name",
+    "data.items.0.type",
+    "data.items.0.size",
+    "data.items.0.createdAt",
+    "data.items.0.updatedAt"
+  ],
+  "file_create": [
+    "success",
+    "data.fileId",
+    "data.fileName",
+    "data.uploadId",
+    "data.partInfos",
+    "data.partInfos.0.partNumber",
+    "data.partInfos.0.uploadUrl"
+  ],
+  "file_update": [
+    "success",
+    "data.fileId",
+    "data.name",
+    "data.type",
+    "data.updatedAt"
+  ],
+  "batch_task": [
+    "success",
+    "data.taskId"
+  ],
+  "task_get": [
+    "success",
+    "data.taskInfo.taskId",
+    "data.taskInfo.status",
+    "data.taskInfo.progress"
+  ],
+  "quota_detail": [
+    "success",
+    "data.diskSize",
+    "data.freeDiskSize",
+    "data.quotaList",
+    "data.quotaList.0.driveType",
+    "data.quotaList.0.usedSize"
+  ],
+  "recyclebin_list": [
+    "success",
+    "data.items",
+    "data.items.0.fileId",
+    "data.items.0.name",
+    "data.items.0.type",
+    "data.items.0.trashedAt",
+    "data.items.0.remainingTime"
+  ],
+  "download_url": [
+    "success",
+    "data.fileId",
+    "data.url"
+  ]
+}

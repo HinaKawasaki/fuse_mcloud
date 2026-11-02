@@ -5,7 +5,7 @@
 1. 只读：ls 无重复、子目录不串台、cat 内容正确（对应 debug/log_repeat_location.log）；
 2. 写回：create/write/release 后整文件上传，内容可读；
 3. 目录：mkdir 后 ls 可见；
-4. 删除：unlink 登记墓碑并摘除本地节点（不复制云端副本），本地消失、且不复活；
+4. 删除：unlink 调真删除，本地消失、云端对象也消失，且不复活；
 5. 覆盖写：改写已有文件后内容更新。
 
 运行： /home/dsh-ssh/venvs/mcloud/bin/python tests/integration/fuse_mount_smoke.py
@@ -21,7 +21,6 @@ from pathlib import Path
 HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "basement" / "scripts"))
 
 import pyfuse3  # noqa: E402
 import trio  # noqa: E402
@@ -92,6 +91,16 @@ class FakeCloud:
         path.write_bytes(self.content[file_id])
         return path
 
+    # --- 按需读 ---
+    def download_range(self, file_id, local_save_path, offset, length, expected_total=None):
+        data = self.content[file_id]
+        path = Path(local_save_path)
+        chunk = data[offset : offset + length]
+        with open(path, "r+b") as handle:
+            handle.seek(offset)
+            handle.write(chunk)
+        return len(chunk)
+
     # --- 写 ---
     def upload_file(self, local_file_path, target_dir_id, name=None):
         path = Path(local_file_path)
@@ -134,6 +143,37 @@ class FakeCloud:
             results.append({"fileId": file_id, "newFileId": new_id})
         return results
 
+    # --- Web 后端新增：rm / rename / move ---
+    def rename(self, file_id, new_name):
+        for items in self.dirs.values():
+            for item in items:
+                if item["id"] == file_id:
+                    item["name"] = new_name
+                    return
+        raise FileNotFoundError(file_id)
+
+    def move(self, file_ids, to_parent_file_id):
+        for file_id in file_ids:
+            found = None
+            for items in self.dirs.values():
+                for item in items:
+                    if item["id"] == file_id:
+                        found = item
+                        items.remove(item)
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                raise FileNotFoundError(file_id)
+            self.dirs.setdefault(to_parent_file_id, []).append(found)
+
+    def delete(self, file_ids, permanent=True):
+        for file_id in file_ids:
+            for items in self.dirs.values():
+                items[:] = [item for item in items if item["id"] != file_id]
+            self.dirs.pop(file_id, None)
+            self.content.pop(file_id, None)
+
 
 def build_ops(cache_root: Path):
     wrapper = FakeCloud()
@@ -144,6 +184,7 @@ def build_ops(cache_root: Path):
         cache_dir=cache_root / "cache",
         write_back_dir=cache_root / "writeback",
         max_size_mb=64,
+        journal_db=cache_root / "journal.sqlite3",
     )
     ops = MCloudFuseOps(
         mapper=mapper,
@@ -248,16 +289,15 @@ def main() -> int:
         run(["bash", "-c", f"echo -n 'replaced' > {mountpoint}/a.txt"])
         check("覆盖写后内容", run(["cat", str(mountpoint / "a.txt")]).stdout, "replaced")
 
-        print("🚀 5. 删除：登记墓碑并本地摘除（接口无删除能力，默认不复制副本）")
+        print("🚀 5. 删除：真删除（Web API），云端对象同步消失")
         run(["rm", str(mountpoint / "b.txt")])
         check("删除后本地消失", "b.txt" in ls(mountpoint), False)
         trash_ids = [i["id"] for i in cloud.dirs.get(ROOT_ID, []) if i["name"] == ".TrashBin"]
-        check("默认不再创建 .TrashBin 副本", trash_ids, [])
-        # 接口没有删除能力：原对象仍在云端，只是被墓碑屏蔽（这正是它不额外占容量的原因）
+        check("不创建 .TrashBin 副本", trash_ids, [])
         check(
-            "云端仍保留原对象（由墓碑隐藏）",
+            "云端对象已删除",
             any(i["name"] == "b.txt" for i in cloud.dirs.get(ROOT_ID, [])),
-            True,
+            False,
         )
     finally:
         token = state.get("token")

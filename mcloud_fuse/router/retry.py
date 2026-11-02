@@ -1,23 +1,9 @@
 import logging
 import random
-import sys
 import time
-from pathlib import Path
 from typing import Callable, Tuple, Type, TypeVar
 
-# 动态注入 basement/scripts 以加载异常层次
-BASEMENT_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "basement" / "scripts"
-if str(BASEMENT_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(BASEMENT_SCRIPTS_DIR))
-
-from cm_cloud_errors import (  # noqa: E402
-    ApiError,
-    AuthError,
-    ConfigError,
-    NeedAuthError,
-    PermissionDeniedError,
-    ValidationError,
-)
+from mcloud_fuse.errors import MCloudAPIException, MCloudAuthException
 
 logger = logging.getLogger(__name__)
 
@@ -25,19 +11,17 @@ T = TypeVar("T")
 
 # 默认需要重试的异常：网络类 + 接口临时失败
 DEFAULT_RETRY_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
-    ApiError,
+    MCloudAPIException,
     ConnectionError,
     TimeoutError,
     OSError,
 )
 
-# 明确不该重试的异常：入参错误、权限/沙箱拒绝、需要登录
+# 明确不该重试的异常：鉴权失败、入参错误
 NON_RETRYABLE_EXCEPTIONS: Tuple[Type[BaseException], ...] = (
-    PermissionDeniedError,
-    ValidationError,
-    ConfigError,
-    NeedAuthError,
-    AuthError,
+    MCloudAuthException,
+    ValueError,
+    PermissionError,
 )
 
 
