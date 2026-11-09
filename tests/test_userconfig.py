@@ -70,6 +70,14 @@ def test_paths_are_expanded_and_absolute(tmp_path: Path, monkeypatch):
     assert config.root == "/dir"
 
 
+def test_defaults_honor_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MCLOUD_MOUNTPOINT", str(tmp_path / "env-mnt"))
+    monkeypatch.setenv("MCLOUD_CACHE_DIR", str(tmp_path / "env-cache"))
+    config = UserConfig()
+    assert config.mountpoint == str(tmp_path / "env-mnt")
+    assert config.cache_dir == str(tmp_path / "env-cache")
+
+
 def test_existing_environment_wins(tmp_path: Path):
     config = make_config(tmp_path, cache_dir=str(tmp_path / "from-file"))
     environ = {"MCLOUD_CACHE_DIR": "/explicit", "MCLOUD_RM_MODE": "trash"}

@@ -115,8 +115,17 @@ def validate_root(value: str) -> Optional[str]:
     text = value.strip() or "/"
     if text == "/":
         return None
-    if "/" in text or "\\" in text:
-        return "根 fileId 不能包含 /；整个云盘请填 /"
+    if "\\" in text:
+        return "云盘路径请用 / 分隔，例如 /Photos/2026"
+    if not text.startswith("/"):
+        if "/" in text:
+            return "云盘路径必须以 / 开头，例如 /Photos/2026"
+        # 兼容旧版直接填 fileId
+        return None
+    trimmed = text.rstrip("/")
+    parts = trimmed.split("/")[1:]
+    if not trimmed or not parts or any(part in ("", ".", "..") for part in parts):
+        return "云盘路径不能包含空段、. 或 .."
     return None
 
 
@@ -285,7 +294,9 @@ def run_line(plan: SetupPlan, args: argparse.Namespace) -> int:
 
     if not args.yes:
         mountpoint = _prompt_value("挂载点", cfg.mountpoint, validate_mountpoint, args.yes)
-        root = _prompt_value("云盘根 fileId（/ 表示整个云盘）", cfg.root, validate_root, args.yes)
+        root = _prompt_value(
+            "云盘路径（/ 表示整个云盘，如 /Photos/2026）", cfg.root, validate_root, args.yes
+        )
         cache_dir = _prompt_value(
             "缓存目录",
             cfg.cache_dir,
@@ -467,10 +478,10 @@ class _Wizard:
             step=3,
             total=STEP_TOTAL,
             title="云盘范围",
-            subtitle="默认挂载整个云盘。只挂某个目录时，需要网页端该目录的 parentFileId。",
+            subtitle="默认挂载整个云盘。只挂某个目录时，直接填云盘里的路径即可。",
             items=[
                 ("整个云盘（推荐）", "根目录显示云盘里的全部文件"),
-                ("只挂载某个目录", "输入网页端某个目录的 fileId"),
+                ("只挂载某个目录", "例如 /Photos/2026，不用再找 fileId"),
             ],
         )
         if choice == 0:
@@ -479,8 +490,8 @@ class _Wizard:
         value = self.screen.input(
             step=3,
             total=STEP_TOTAL,
-            title="目录 fileId",
-            subtitle="在网页端打开该目录，从 Network 的 file/list 请求里取 parentFileId。",
+            title="目录路径",
+            subtitle="从云盘根开始，以 / 开头；旧版填过的 fileId 也可以继续用。",
             default=self.plan.config.root,
             validator=validate_root,
         )
@@ -649,7 +660,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         description="首次设置向导：导入 token、写配置、可选安装 systemd 用户服务",
     )
     parser.add_argument("--mountpoint", help="挂载点（默认 ~/mnt/mcloud）")
-    parser.add_argument("--root", help="云盘根 fileId（默认 / 表示整个云盘）")
+    parser.add_argument("--root", help="云盘路径（如 /Photos/2026）或旧版 fileId；默认 /")
     parser.add_argument("--cache-dir", help="缓存目录（默认 /tmp/cmcloud-fuse）")
     parser.add_argument("--rm-mode", choices=("delete", "trash"), help="删除语义")
     parser.add_argument("--conflict", choices=("copy", "error"), help="覆盖写冲突策略")

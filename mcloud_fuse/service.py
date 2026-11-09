@@ -1,7 +1,7 @@
 """``systemd --user`` 服务管理（安装 / 卸载 / 状态）。
 
 服务单元完全由用户配置生成，不再依赖 shell 模板与 ``EnvironmentFile``：
-挂载点、缓存目录、根 fileId 都在 ``config.json`` 里，``mcloud-fuse mount``
+挂载点、缓存目录、云盘范围（路径或 fileId）都在 ``config.json`` 里，``mcloud-fuse mount``
 启动时自己读取，单元里只需要固定解释器与配置文件路径。
 
 每个用户一个账号、一个服务、一个挂载点；不启用 ``allow_other``，因此不需要

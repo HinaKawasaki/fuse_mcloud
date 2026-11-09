@@ -55,10 +55,16 @@ def default_token_path() -> Path:
 
 
 def default_mountpoint() -> Path:
+    override = os.getenv("MCLOUD_MOUNTPOINT")
+    if override:
+        return Path(override).expanduser()
     return Path.home() / "mnt" / "mcloud"
 
 
 def default_cache_dir() -> Path:
+    override = os.getenv("MCLOUD_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
     return Path("/tmp/cmcloud-fuse")
 
 

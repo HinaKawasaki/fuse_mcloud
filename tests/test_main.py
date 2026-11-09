@@ -101,6 +101,53 @@ def test_version_flag_prints_version_and_exits(capsys):
     assert version.__version__ in capsys.readouterr().out
 
 
+def test_parse_root_accepts_cloud_path():
+    args = mcloud_main.parse_args(["--root", "/Photos/2026"])
+    assert args.root == "/Photos/2026"
+
+
+def test_resolve_root_path_walks_components():
+    tree = {
+        "/": {"docs": ("d_docs", True), "a.txt": ("f_a", False)},
+        "d_docs": {"sub": ("d_sub", True), "a.txt": ("f_a2", False)},
+    }
+
+    class FakeWrapper:
+        def find_child(self, parent: str, name: str):
+            entry = tree.get(parent, {}).get(name)
+            if entry is None:
+                return None
+            return types.SimpleNamespace(file_id=entry[0], is_dir=entry[1])
+
+    wrapper = FakeWrapper()
+    assert mcloud_main.resolve_root_path(wrapper, "/") == "/"
+    assert mcloud_main.resolve_root_path(wrapper, "/docs") == "d_docs"
+    assert mcloud_main.resolve_root_path(wrapper, "/docs/sub/") == "d_sub"
+    with pytest.raises(ValueError, match="不存在"):
+        mcloud_main.resolve_root_path(wrapper, "/nope")
+    with pytest.raises(ValueError, match="不是目录"):
+        mcloud_main.resolve_root_path(wrapper, "/a.txt")
+    with pytest.raises(ValueError, match=r"\.\."):
+        mcloud_main.resolve_root_path(wrapper, "/docs/../x")
+
+
+def test_resolve_root_accepts_special_file_id():
+    """同步盘这类旧 fileId 以 / 开头，路径解析失败后应回退为 fileId。"""
+
+    class FakeWrapper:
+        def find_child(self, parent: str, name: str):
+            return None
+
+        def get_item(self, file_id: str):
+            if file_id == "/synbox":
+                return types.SimpleNamespace(is_dir=True)
+            raise mcloud_main.MCloudAPIException("not found")
+
+    assert mcloud_main.resolve_root(FakeWrapper(), "/synbox") == "/synbox"
+    with pytest.raises(ValueError, match="不存在"):
+        mcloud_main.resolve_root(FakeWrapper(), "/no-such-dir")
+
+
 def test_console_script_entrypoint_is_importable():
     """pyproject 里声明的 `mcloud-fuse` 入口必须真实可导入、可调用。"""
     tomllib = pytest.importorskip("tomllib", reason="需要 Python 3.11+ 读取 pyproject")

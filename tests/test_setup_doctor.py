@@ -60,7 +60,11 @@ def test_validate_cache_creates_dir(tmp_path: Path):
 def test_validate_root():
     assert setup_mod.validate_root("/") is None
     assert setup_mod.validate_root("abc123") is None
+    assert setup_mod.validate_root("/Photos") is None
+    assert setup_mod.validate_root("/Photos/2026/") is None
     assert setup_mod.validate_root("a/b") is not None
+    assert setup_mod.validate_root("/Photos//2026") is not None
+    assert setup_mod.validate_root("/Photos/../etc") is not None
 
 
 def test_apply_args_overrides_config(tmp_path: Path):

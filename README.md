@@ -67,7 +67,7 @@ mcloud-fuse
 | --- | --- | --- |
 | 1 | 访问令牌：浏览器里的 `Authorization: Basic ...` 或整段 cURL | 已有则复用 |
 | 2 | 挂载点：云盘内容出现在哪个目录 | `~/mnt/mcloud` |
-| 3 | 云盘范围：整个云盘，或某个目录的 `parentFileId` | 整个云盘 |
+| 3 | 云盘范围：整个云盘，或某个目录的路径（如 `/Photos/2026`） | 整个云盘 |
 | 4 | 缓存目录：读缓存与写回暂存 | `/tmp/cmcloud-fuse` |
 | 5 | 删除方式：永久删除 / 移入回收站 | 永久删除 |
 | 6 | 覆盖写冲突：另存副本 / 报错 | 另存副本 |
@@ -125,6 +125,9 @@ mcloud-fuse                 # 挂载，前台运行；Ctrl+C 卸载
 mcloud-fuse status          # 看是否挂上了
 ls ~/mnt/mcloud             # 像本地目录一样用
 mcloud-fuse unmount         # 卸载
+
+# 只挂云盘里的某个目录（不用翻 Network 找 parentFileId）
+mcloud-fuse mount --root /Photos/2026
 ```
 
 `Ctrl+C` 是优雅卸载：会等删除队列提交完、补传未完成的写回，再 `pyfuse3.close()`。
@@ -147,6 +150,11 @@ mcloud-fuse unmount         # 卸载
   "version": 1
 }
 ```
+
+`root` 可以是 `/`、`/Photos/2026` 这样的云盘路径，也可以是旧版直接填的 fileId
+（包括 `/synbox` 这类以 `/` 开头的特殊值；路径解析失败时会回退为 fileId）。
+命令行 `--root` 只覆盖本次挂载，不会写回配置；想长期只挂某个目录，重新运行
+`mcloud-fuse setup` 改第 3 步。
 
 环境变量优先于配置文件，常用覆盖：
 

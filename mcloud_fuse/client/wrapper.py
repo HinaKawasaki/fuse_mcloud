@@ -161,6 +161,17 @@ class DirectClientWrapper:
                 return
             yield item
 
+    def find_child(self, parent_file_id: str, name: str) -> Optional[CloudItem]:
+        """在目录里按名字找子项；命中即返回，不做整目录缓存。"""
+        self._ensure_auth()
+        try:
+            item = self.client.find_child(parent_file_id, name)
+        except Web139AuthError as exc:
+            raise MCloudAuthException(str(exc)) from exc
+        except Web139Error as exc:
+            raise MCloudAPIException(str(exc)) from exc
+        return self._to_item(item) if item is not None else None
+
     def file_name(self, file_id: str) -> str:
         try:
             return self.client.get_file(file_id).name

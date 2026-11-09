@@ -29,6 +29,7 @@ from mcloud_fuse import config, sdnotify, service, tokens, userconfig
 from mcloud_fuse.cache.data_cache import DataCache
 from mcloud_fuse.cache.meta_cache import MetaCache
 from mcloud_fuse.client.wrapper import DirectClientWrapper
+from mcloud_fuse.errors import MCloudAPIException
 from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps
 from mcloud_fuse.journal import WritebackJournal, default_journal_path
 from mcloud_fuse.lock import CacheLock, CacheLockError
@@ -83,10 +84,48 @@ def parse_args(argv: Optional[Sequence[str]] = None, cfg: Optional[userconfig.Us
         "--root",
         type=str,
         default=defaults.root,
-        help="挂载根对应的云盘 fileId（默认 / = 整个云盘）",
+        help="挂载根：云盘路径（如 /Photos/2026）或旧版 fileId；默认 / = 整个云盘",
     )
     parser.add_argument("--foreground", action="store_true", help="前台运行（默认行为，保留兼容）")
     return parser.parse_args(argv)
+
+
+def resolve_root_path(wrapper: DirectClientWrapper, path: str) -> str:
+    """把 ``/Photos/2026`` 这样的云盘路径解析成 fileId；``/`` 原样返回。"""
+    text = (path or "/").strip()
+    if text in ("", "/"):
+        return "/"
+    parts = [part for part in text.strip("/").split("/") if part]
+    if any(part in (".", "..") for part in parts):
+        raise ValueError(f"云盘路径不能包含 . 或 ..：{path}")
+    current = "/"
+    for part in parts:
+        child = wrapper.find_child(current, part)
+        if child is None:
+            raise ValueError(f"云盘路径不存在：{path}（找不到 {part!r}）")
+        if not child.is_dir:
+            raise ValueError(f"云盘路径不是目录：{path}（{part!r} 是文件）")
+        current = child.file_id
+    return current
+
+
+def resolve_root(wrapper: DirectClientWrapper, root: str) -> str:
+    """解析挂载根：优先按路径，失败时兼容旧版特殊 fileId（如 ``/synbox``）。"""
+    text = (root or "/").strip()
+    if text in ("", "/"):
+        return "/"
+    if not text.startswith("/"):
+        return text
+    try:
+        return resolve_root_path(wrapper, text)
+    except ValueError as path_exc:
+        try:
+            item = wrapper.get_item(text)
+        except MCloudAPIException:
+            raise path_exc from None
+        if not item.is_dir:
+            raise ValueError(f"挂载根不是目录：{text}") from None
+        return text
 
 
 def prepare_mountpoint(mountpoint: Path) -> None:
@@ -177,7 +216,15 @@ async def main(
             "请运行 `mcloud-fuse setup` 导入 token（或检查 ~/.config/mcloud-fuse/web_token）。"
         ) from exc
 
-    root_file_id = args.root or "/"
+    root = (args.root or "/").strip()
+    try:
+        root_file_id = resolve_root(wrapper, root)
+    except ValueError as exc:
+        raise SystemExit(f"❌ {exc}") from exc
+    except MCloudAPIException as exc:
+        raise SystemExit(f"❌ 解析云盘路径 {root} 失败：{exc}") from exc
+    if root.startswith("/") and root != "/" and root_file_id != root:
+        logger.info("云盘路径 %s → fileId %s", root, root_file_id)
     logger.info("挂载根 fileId = %s", root_file_id)
 
     mapper = InodeMapper(root_file_id=root_file_id)

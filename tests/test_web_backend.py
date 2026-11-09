@@ -40,6 +40,12 @@ class FakeClient:
         for item in self.tree.get(parent_id, []):
             yield WebFile.from_api(item, parent_id)
 
+    def find_child(self, parent_id: str, name: str):
+        for item in self.tree.get(parent_id, []):
+            if item["name"] == name:
+                return WebFile.from_api(item, parent_id)
+        return None
+
     def create_folder(self, parent_id, name):
         self.calls.append(("mkdir", parent_id, name))
         return "d2"
@@ -91,6 +97,13 @@ def test_list_directory_recursive_walks_children():
     wrapper = make_wrapper()
     items = wrapper.list_directory("/", recursive=True)
     assert [i.file_id for i in items] == ["d1", "f1", "f2"]
+
+
+def test_find_child_maps_cloud_item():
+    wrapper = make_wrapper()
+    item = wrapper.find_child("/", "docs")
+    assert item is not None and item.file_id == "d1" and item.is_dir
+    assert wrapper.find_child("/", "missing") is None
 
 
 def test_rename_move_delete_delegate_to_web_client():
