@@ -90,5 +90,14 @@ python3 scripts/check_contracts.py --live --write
 MCLOUD_WEB_TOKEN = <浏览器里复制的 Authorization: Basic 后面的值>
 ```
 
-没有配置 secret 时 workflow 会失败在「未找到 Web token」，这是预期行为；
-如果不想启用，直接在 Actions 里禁用该 workflow 即可。
+配置后 workflow 会用 `--live --write` 做全量检查（会创建并删除
+`_mcloud_contract_*` 探测对象）。
+
+没有配置 secret 时（fork、刚发布的仓库、或忘了配）workflow **不会失败**：
+只跑离线契约，并在 Actions 里留一条 warning。token 过期、续期失败或格式错误
+仍会以非零码退出，需要重新从浏览器复制 Authorization 更新 secret。
+
+> 如果 secret 放在 **Environment** 里，记得给 job 声明 `environment:`，
+> 否则 `schedule` 触发时读不到，表现会和「没配置」一样（只跑离线）。
+
+如果完全不想启用，直接在 Actions 里禁用该 workflow 即可。

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mcloud_fuse.client.web139 import QUOTA_URL, Web139Auth, Web139Client  # noqa: E402
+from mcloud_fuse.client.web139 import (  # noqa: E402
+    QUOTA_URL,
+    Web139Auth,
+    Web139AuthError,
+    Web139Client,
+)
 
 CONTRACT_DIR = ROOT / "tests" / "contracts"
 SCHEMA = json.loads((CONTRACT_DIR / "schema.json").read_text(encoding="utf-8"))
@@ -109,8 +115,9 @@ def collect_write(client: Web139Client) -> Dict[str, Dict[str, Any]]:
         except Exception:  # noqa: BLE001 - 已随 dest 删除或不存在
             pass
 
-    # 上传一个极小文件来拿 file/create 的真实槽位
-    data = b"mcloud-contract"
+    # 内容必须每次不同：固定内容会命中服务端秒传（rapidUpload=true、partInfos=null），
+    # 这样既测不到真实上传槽位，还会被 schema 误报为字段漂移。
+    data = f"mcloud-contract-{time.time_ns()}-{secrets.token_hex(8)}".encode()
     digest = hashlib.sha256(data).hexdigest()
     name = f"_mcloud_contract_upload_{stamp}.txt"
     create = client._post_json(
@@ -183,10 +190,20 @@ def main() -> int:
     if not args.live:
         return 0
 
-    client = Web139Client(Web139Auth.load())
-    docs = collect_readonly(client)
-    if args.write:
-        docs.update(collect_write(client))
+    try:
+        auth = Web139Auth.load()
+    except Web139AuthError as exc:
+        print(f"❌ 真机检查无法开始：{exc}", file=sys.stderr)
+        return 2
+
+    client = Web139Client(auth)
+    try:
+        docs = collect_readonly(client)
+        if args.write:
+            docs.update(collect_write(client))
+    except Web139AuthError as exc:
+        print(f"❌ 真机检查中断：{exc}", file=sys.stderr)
+        return 2
 
     if args.dump:
         args.dump.mkdir(parents=True, exist_ok=True)

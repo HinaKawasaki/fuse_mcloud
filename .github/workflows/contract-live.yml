@@ -13,6 +13,10 @@ jobs:
   live:
     name: 真机端点契约
     runs-on: ubuntu-latest
+    env:
+      # 未配置 secret 时该值为空，用它决定跑真机还是只跑离线；
+      # 这样 fork / 新仓库的定时任务不会每周固定变红。
+      MCLOUD_WEB_TOKEN: ${{ secrets.MCLOUD_WEB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +24,11 @@ jobs:
           python-version: "3.12"
       - name: 安装最小依赖（不需要 pyfuse3）
         run: python -m pip install --upgrade pip requests
+      - name: 离线契约（未配置 token 时）
+        if: env.MCLOUD_WEB_TOKEN == ''
+        run: |
+          echo "::warning title=真机契约未启用::未配置 MCLOUD_WEB_TOKEN secret，本次只校验离线 fixtures；配置方法见 docs/contracts.md"
+          python scripts/check_contracts.py
       - name: 检查真实接口
-        env:
-          MCLOUD_WEB_TOKEN: ${{ secrets.MCLOUD_WEB_TOKEN }}
+        if: env.MCLOUD_WEB_TOKEN != ''
         run: python scripts/check_contracts.py --live --write
