@@ -175,6 +175,17 @@ class Web139Auth:
             self.save()
             return self._token.to_basic()
 
+    def refresh(self, session: requests.Session, timeout: float = 15) -> Web139Token:
+        """强制续期并落盘，不检查剩余寿命。
+
+        供 ``mcloud-fuse token refresh`` 和向导的「立即续期」使用。只走
+        ``tellin/authTokenRefresh.do``，不涉及账号密码或浏览器 Cookie。
+        """
+        with self._lock:
+            self._token = self._refresh(session, timeout)
+            self.save()
+            return self._token
+
     def _refresh(self, session: requests.Session, timeout: float) -> Web139Token:
         body = (
             "<root><token>"
@@ -409,6 +420,17 @@ class Web139Client:
         self._base_url = base_url
         self._host: Optional[str] = base_url
         self._host_lock = threading.Lock()
+
+    def refresh_token(self, *, force: bool = False, timeout: float = 15) -> Web139Token:
+        """检查 token；``force=True`` 时立即续期（向导 / 手动命令）。
+
+        不 force 时只在 ``needs_refresh``（剩余不足 15 天）才会真正请求，
+        适合后台线程定期调用；无论哪条路径都不会发起业务请求。
+        """
+        if force:
+            return self.auth.refresh(self._session, timeout)
+        self.auth.authorization(self._session, timeout)
+        return self.auth.token
 
     # ------------------------------------------------------------------ 传输
 

@@ -132,6 +132,6 @@ python3 scripts/web139_smoke.py              # 真机全链路（会建删探针
   `mcloud_fuse/version.py`，标签名必须与之一致：
 
 ```bash
-git tag -a v0.4.0 -m "v0.4.0"
+git tag -a v0.5.0 -m "v0.5.0"
 git push origin main --tags
 ```

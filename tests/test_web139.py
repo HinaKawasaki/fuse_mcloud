@@ -147,6 +147,46 @@ def test_auth_refresh_rejected_raises(tmp_path: Path):
     with pytest.raises(Web139AuthError, match="expired"):
         auth.authorization(session)  # type: ignore[arg-type]
 
+def test_auth_refresh_forces_even_when_far_from_expiry(tmp_path: Path):
+    """向导的「立即续期」不依赖 15 天窗口，force 时也要真的请求。"""
+    new_payload = f"v2|sig|opaque|{int(time.time() * 1000) + 60 * 24 * 3600 * 1000}"
+    xml = f"<root><return>0</return><token>{new_payload}</token></root>".encode()
+    session = FakeSession(
+        {("POST", "/tellin/authTokenRefresh.do"): FakeResponse(200, content=xml)}
+    )
+    path = tmp_path / "web_token"
+    auth = Web139Auth(Web139Token.parse(make_token()), path)
+
+    refreshed = auth.refresh(session)  # type: ignore[arg-type]
+
+    assert refreshed.payload == new_payload
+    assert Web139Token.parse(path.read_text().strip()).payload == new_payload
+    assert len(session.calls) == 1
+
+
+def test_client_refresh_token_skips_request_when_not_needed():
+    session = FakeSession({})
+    client = Web139Client(Web139Auth(Web139Token.parse(make_token())), session=session)
+
+    token = client.refresh_token()
+
+    assert token.needs_refresh() is False
+    assert session.calls == [], "剩余寿命充足时不应发起续期请求"
+
+
+def test_client_refresh_token_force_uses_refresh_endpoint():
+    new_payload = f"v2|sig|opaque|{int(time.time() * 1000) + 60 * 24 * 3600 * 1000}"
+    xml = f"<root><return>0</return><token>{new_payload}</token></root>".encode()
+    session = FakeSession(
+        {("POST", "/tellin/authTokenRefresh.do"): FakeResponse(200, content=xml)}
+    )
+    client = Web139Client(Web139Auth(Web139Token.parse(make_token())), session=session)
+
+    token = client.refresh_token(force=True)
+
+    assert token.payload == new_payload
+    assert len(session.calls) == 1
+
 
 # ---------------------------------------------------------------------- sign
 

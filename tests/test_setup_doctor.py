@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from mcloud_fuse import doctor
+from mcloud_fuse import doctor, tokens
 from mcloud_fuse import setup as setup_mod
-from mcloud_fuse.client.web139 import Web139AuthError
+from mcloud_fuse.client.web139 import Web139AuthError, Web139Token
 from mcloud_fuse.userconfig import UserConfig
 
 
@@ -118,6 +118,31 @@ def basic_token() -> str:
     return base64.b64encode(f"pc:13800138000:v1|sig|opaque|{expiry}".encode()).decode()
 
 
+def test_refresh_existing_token_saves_new_token(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MCLOUD_WEB_TOKEN_FILE", str(tmp_path / "web_token"))
+    old = Web139Token.parse(basic_token())
+    new_expiry = int(time.time() * 1000) + 60 * 24 * 3600 * 1000
+    new = Web139Token("pc", "13800138000", f"v1|sig|opaque|{new_expiry}")
+
+    class FakeClient:
+        def __init__(self, auth):
+            self.auth = auth
+
+        def refresh_token(self, *, force: bool = False):
+            assert force is True, "向导里的「立即续期」必须强制请求"
+            return new
+
+    monkeypatch.setattr(setup_mod, "Web139Client", FakeClient)
+
+    refreshed = setup_mod.refresh_existing_token(old)
+
+    assert refreshed.expires_at_ms == new_expiry
+    saved = tokens.load_saved(tmp_path / "web_token")
+    assert saved is not None
+    assert saved.expires_at_ms == new_expiry
+    assert (tmp_path / "web_token").stat().st_mode & 0o777 == 0o600
+
+
 def test_parse_token_rejects_expired():
     expiry = int(time.time() * 1000) - 1000
     raw = base64.b64encode(f"pc:13800138000:v1|sig|opaque|{expiry}".encode()).decode()
@@ -145,3 +170,115 @@ def test_run_line_imports_token_and_writes_config(tmp_path: Path, monkeypatch):
 def test_load_existing_token_returns_none_when_missing(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MCLOUD_WEB_TOKEN_FILE", str(tmp_path / "missing"))
     assert setup_mod.load_existing_token() is None
+
+
+def test_run_line_refresh_token_updates_existing_token(tmp_path: Path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    token_file = tmp_path / "web_token"
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(config_file))
+    monkeypatch.setenv("MCLOUD_WEB_TOKEN_FILE", str(token_file))
+
+    old = Web139Token.parse(basic_token())
+    new_expiry = int(time.time() * 1000) + 60 * 24 * 3600 * 1000
+    new = Web139Token("pc", "13800138000", f"v1|sig|opaque|{new_expiry}")
+    monkeypatch.setattr(setup_mod, "refresh_existing_token", lambda token: new)
+
+    plan = setup_mod.SetupPlan(
+        config=make_config(tmp_path),
+        existing_token=old,
+        verify_api=False,
+    )
+    args = setup_mod._parse_args(
+        ["--yes", "--no-service", "--no-check-api", "--refresh-token"]
+    )
+
+    assert setup_mod.run_line(plan, args) == 0
+    saved = tokens.load_saved(token_file)
+    assert saved is not None
+    assert saved.expires_at_ms == new_expiry
+
+
+class FakeScreen:
+    """只实现 step_token 用到的几个页面方法。"""
+
+    def __init__(self, choice: int, pasted: str = ""):
+        self.choice = choice
+        self.pasted = pasted
+        self.messages = []
+        self.menu_kwargs = {}
+
+    def menu(self, **kwargs):
+        self.menu_kwargs = kwargs
+        return self.choice
+
+    def progress(self, **kwargs):
+        return None
+
+    def message(self, **kwargs):
+        self.messages.append(kwargs)
+
+    def read_pasted(self, instructions):
+        return self.pasted
+
+
+def test_wizard_auto_refresh_success(tmp_path: Path, monkeypatch):
+    old = Web139Token.parse(basic_token())
+    new_expiry = int(time.time() * 1000) + 60 * 24 * 3600 * 1000
+    new = Web139Token("pc", "13800138000", f"v1|sig|opaque|{new_expiry}")
+    plan = setup_mod.SetupPlan(
+        config=make_config(tmp_path),
+        existing_token=old,
+        verify_api=False,
+    )
+    monkeypatch.setattr(setup_mod, "refresh_existing_token", lambda token: new)
+    screen = FakeScreen(choice=1)  # 有效 token：使用 / 自动续期 / 重新粘贴
+
+    setup_mod._Wizard(screen, plan, force_token=False).step_token()
+
+    assert plan.existing_token == new
+    assert plan.new_token_basic == new.to_basic()
+    assert screen.messages[-1]["title"] == "续期成功"
+
+
+def test_wizard_auto_refresh_failure_falls_back_to_paste(tmp_path: Path, monkeypatch):
+    old = Web139Token.parse(basic_token())
+    plan = setup_mod.SetupPlan(
+        config=make_config(tmp_path),
+        existing_token=old,
+        verify_api=False,
+    )
+
+    def boom(token):
+        raise Web139AuthError("token 续期被拒绝：需要设备指纹")
+
+    monkeypatch.setattr(setup_mod, "refresh_existing_token", boom)
+    screen = FakeScreen(choice=1, pasted="")  # 续期失败后粘贴空内容 = 沿用旧 token
+
+    setup_mod._Wizard(screen, plan, force_token=False).step_token()
+
+    assert screen.messages[0]["title"] == "自动续期失败"
+    assert "设备指纹" in screen.messages[0]["lines"][0]
+    assert plan.new_token_basic is None
+
+
+def test_wizard_expired_token_defaults_to_auto_refresh(tmp_path: Path, monkeypatch):
+    expired = int(time.time() * 1000) - 1000
+    old = Web139Token("pc", "13800138000", f"v1|sig|opaque|{expired}")
+    new_expiry = int(time.time() * 1000) + 60 * 24 * 3600 * 1000
+    new = Web139Token("pc", "13800138000", f"v1|sig|opaque|{new_expiry}")
+    plan = setup_mod.SetupPlan(
+        config=make_config(tmp_path),
+        existing_token=old,
+        verify_api=False,
+    )
+    monkeypatch.setattr(setup_mod, "refresh_existing_token", lambda token: new)
+    screen = FakeScreen(choice=0)  # 已过期：尝试自动续期 / 重新粘贴
+
+    setup_mod._Wizard(screen, plan, force_token=False).step_token()
+
+    assert [item[0] for item in screen.menu_kwargs["items"]] == [
+        "尝试自动续期（无需粘贴）",
+        "重新粘贴令牌",
+    ]
+    assert screen.menu_kwargs["selected"] == 0
+    assert plan.existing_token == new

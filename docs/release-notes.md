@@ -1,5 +1,49 @@
 # Release Notes
 
+## v0.5.0：令牌自动续期与云盘路径挂载
+
+本版汇总 v0.4.0 之后的三组改动，没有破坏性接口变更。
+
+### 令牌生命周期
+
+- **`systemctl` 里能看到 token 剩余时间**：挂载进程每 12 小时通过 `sd_notify`
+  的 `STATUS=` 上报 token 剩余寿命，`systemctl --user status mcloud-fuse` 的
+  `Status:` 一行直接显示脱敏账号与到期时间；
+- **空闲时自动续期**：剩余不足 15 天时调用已有的 `authTokenRefresh.do`，
+  续期结果以 0600 原子写回；`MCLOUD_TOKEN_AUTO_REFRESH=0` 可关闭空闲续期，
+  `MCLOUD_TOKEN_STATUS_INTERVAL_SEC` 控制上报间隔（默认 43200 秒，0 = 只在启动时报一次）；
+- 新增 `mcloud-fuse token status|refresh`：查看剩余时间、手动触发续期；
+- 首次设置 TUI 的令牌页新增「尝试自动续期（无需粘贴）」，token 已过期时默认选中；
+  行模式对应 `setup --refresh-token`；
+- 仍然只续期已保存的 Basic token：不实现账号密码登录，不读浏览器 Cookie，
+  续期失败不静默降级（ADR-0002 补充）。
+
+### 按云盘路径挂载
+
+- `--root` / 设置向导第 3 步支持 `/Photos/2026` 形式的云盘路径，自动解析成
+  fileId，不必再去网页端找 `parentFileId`；解析失败时回退为旧版 fileId
+  （包括 `/synbox` 这类特殊值）；
+- 新增 `DirectClientWrapper.find_child`，路径解析按名字查找、命中即停；
+- 修复 `MCLOUD_MOUNTPOINT` / `MCLOUD_CACHE_DIR` 在 `UserConfig` 默认值里不生效的问题。
+
+### CI 与契约检查
+
+- 未配置 `MCLOUD_WEB_TOKEN` secret 时，`Contract (live)` 只跑离线 fixtures
+  并留一条 warning，不再每周固定变红；`check_contracts.py --live` 缺 token 时
+  给出可读错误并返回 2，不再抛 traceback；
+- 上传探针改为每次生成唯一内容，避免服务端秒传导致 `partInfos=null` 误报字段漂移；
+- `actions/checkout` 升到 v5、`actions/setup-python` 升到 v6（均使用 Node 24），
+  消除 Node.js 20 弃用警告。
+
+### 工程
+
+- 新增 `mcloud_fuse/token_status.py`（心跳 / STATUS / 续期）与
+  `mcloud_fuse/token_cli.py`；`Web139Auth.refresh()`、`Web139Client.refresh_token()`
+  对外暴露主动续期；
+- 测试增至 254 条，覆盖 token 状态文本、续期窗口、TUI 自动续期、token 子命令
+  与契约脚本降级；
+- 版本号升至 `0.5.0`。
+
 ## v0.4.0：后端换成 yun.139.com Web API
 
 这是一次**破坏性后端替换**，不是增量版本。

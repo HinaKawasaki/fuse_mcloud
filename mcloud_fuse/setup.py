@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from mcloud_fuse import service, tokens, tui, userconfig
+from mcloud_fuse import service, token_status, tokens, tui, userconfig
 from mcloud_fuse.client.web139 import (
     Web139Auth,
     Web139AuthError,
@@ -151,6 +151,18 @@ def parse_token(raw: str) -> Web139Token:
     return token
 
 
+def refresh_existing_token(token: Web139Token) -> Web139Token:
+    """尝试用续期接口延长已有 token；成功后原子写回 0600 文件。
+
+    只对已有 token 生效：没有 token 时没有任何东西可以续期，必须粘贴。
+    续期失败通常意味着接口要求设备指纹，调用方应退回「重新粘贴」。
+    """
+    auth = Web139Auth(token, path=None)
+    refreshed = Web139Client(auth).refresh_token(force=True)
+    tokens.save_basic(refreshed.to_basic(), force=False)
+    return refreshed
+
+
 def _save_token_step(plan: SetupPlan) -> str:
     assert plan.new_token_basic is not None
     result = tokens.save_basic(plan.new_token_basic, path=tokens.default_token_path())
@@ -268,6 +280,19 @@ def run_line(plan: SetupPlan, args: argparse.Namespace) -> int:
         print(f"token：{tokens.describe(plan.existing_token)}")
     else:
         print("token：未导入")
+
+    if args.refresh_token:
+        if plan.existing_token is None:
+            print("⚠️  没有已保存的 token，无法自动续期；请先粘贴。", file=sys.stderr)
+        else:
+            try:
+                refreshed = refresh_existing_token(plan.existing_token)
+            except (Web139Error, OSError) as exc:
+                print(f"⚠️  自动续期失败：{exc}", file=sys.stderr)
+            else:
+                plan.new_token_basic = refreshed.to_basic()
+                plan.existing_token = refreshed
+                print(f"✅ 已自动续期：{tokens.describe(refreshed)}")
 
     if args.force_token or plan.existing_token is None or plan.existing_token.is_expired():
         if args.token_stdin or sys.stdin.isatty():
@@ -413,20 +438,68 @@ class _Wizard:
     def step_token(self) -> None:
         existing = self.plan.existing_token
         valid = existing is not None and not existing.is_expired()
-        replace = self.force_token
-        if valid and not replace:
+        if existing is not None and not self.force_token:
+            actions = []
+            items = []
+            if valid:
+                items.append(("使用已保存的令牌", tokens.describe(existing)))
+                actions.append("keep")
+            items.append(
+                (
+                    "尝试自动续期（无需粘贴）",
+                    "调用续期接口延长有效期；失败时可以再粘贴新 token",
+                )
+            )
+            actions.append("refresh")
+            items.append(("重新粘贴令牌", "从浏览器重新复制 Authorization，或整段 cURL"))
+            actions.append("paste")
             choice = self.screen.menu(
                 step=1,
                 total=STEP_TOTAL,
                 title="访问令牌",
                 subtitle="令牌等同于账号访问权，只保存在本机 0600 文件里；向导不会显示明文。",
-                items=[
-                    ("使用已保存的令牌", tokens.describe(existing)),
-                    ("重新粘贴令牌", "从浏览器重新复制 Authorization，或整段 cURL"),
-                ],
+                items=items,
+                # 有效 token 默认「使用已保存」；已过期时第一项是「尝试自动续期」，
+                # 默认选中它，尽量免去重新进浏览器复制。
+                selected=0,
             )
-            if choice == 0:
+            action = actions[choice]
+            if action == "keep":
                 return
+            if action == "refresh":
+                self.screen.progress(
+                    step=1,
+                    total=STEP_TOTAL,
+                    title="访问令牌",
+                    label="正在请求续期 ...",
+                    done=0,
+                )
+                try:
+                    refreshed = refresh_existing_token(existing)
+                except (Web139Error, OSError) as exc:
+                    self.screen.message(
+                        step=1,
+                        total=STEP_TOTAL,
+                        title="自动续期失败",
+                        lines=[
+                            str(exc),
+                            "",
+                            "续期接口可能要求设备指纹；可以继续粘贴新的 token。",
+                        ],
+                        kind="err",
+                    )
+                else:
+                    self.plan.new_token_basic = refreshed.to_basic()
+                    self.plan.existing_token = refreshed
+                    self.screen.message(
+                        step=1,
+                        total=STEP_TOTAL,
+                        title="续期成功",
+                        lines=[tokens.describe(refreshed), "", "点击 Enter 继续。"],
+                        kind="ok",
+                    )
+                    return
+
         while True:
             raw = self.screen.read_pasted(TOKEN_INSTRUCTIONS)
             if not raw.strip():
@@ -579,6 +652,8 @@ class _Wizard:
             if self.plan.existing_token is not None
             else "未导入"
         )
+        auto = "开启" if token_status.auto_refresh_enabled() else "关闭"
+        auto_line = f"{auto}；{token_status.cadence_text()}"
         lines = [
             f"挂载点    {cfg.mountpoint}",
             f"云盘范围  {'整个云盘' if cfg.root == '/' else cfg.root}",
@@ -586,6 +661,7 @@ class _Wizard:
             f"删除方式  {'永久删除' if cfg.rm_mode == 'delete' else '移入回收站'}",
             f"冲突策略  {'保留冲突副本' if cfg.conflict == 'copy' else '报错（ESTALE）'}",
             f"令牌      {token_text}",
+            f"自动续期  {auto_line}",
             f"启动方式  {'systemd 用户服务' if cfg.install_service else '仅保存配置，手动挂载'}",
         ]
         self.screen.message(
@@ -672,6 +748,11 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         "--token-stdin",
         action="store_true",
         help="从标准输入读取 token（cURL / Authorization 行 / 裸 base64）",
+    )
+    parser.add_argument(
+        "--refresh-token",
+        action="store_true",
+        help="先尝试用续期接口延长已保存的 token，失败再粘贴",
     )
     parser.add_argument("--force-token", action="store_true", help="即使已有有效 token 也重新导入")
     return parser.parse_args(argv)

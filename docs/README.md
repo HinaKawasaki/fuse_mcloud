@@ -24,7 +24,7 @@
 | [端点契约](contracts.md) | 离线样例 + 每周真机字段漂移检查 |
 | [性能基线](performance.md) | 大目录、上传、删除、冷/热读实测 |
 | [Web API 分析](web-api-analysis.md) | 端点、鉴权、签名、风险、真机验证记录 |
-| [发布记录](release-notes.md) | v0.4.0 行为变化与升级说明 |
+| [发布记录](release-notes.md) | 版本行为变化与升级说明 |
 
 ## 历史
 

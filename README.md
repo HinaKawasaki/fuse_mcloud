@@ -83,12 +83,43 @@ mcloud-fuse
 粘贴时按 `Ctrl-D` 结束。向导只显示脱敏账号与到期时间，不显示 token 明文。
 不要复制 Cookie 里的 `skey` / `auth_token` / `ud_id`，它们不是 Authorization。
 
+已有 token 时，向导会多一个**「尝试自动续期」**：调用客户端已有的
+`tellin/authTokenRefresh.do`，不重新粘贴、不读浏览器 Cookie。续期被拒绝
+（接口可能要求设备指纹）时会给出原因，再退回粘贴。
+
+**token 会自动续期，也会在 `systemctl` 里报剩余时间**：
+
+- 服务运行期间每 12 小时检查一次 token；剩余不足 15 天时调用续期接口，
+  新 token 仍以 0600 原子写回，不写日志、不进服务单元；
+- `systemctl --user status mcloud-fuse` 的 `Status:` 一行会显示脱敏账号与剩余天数：
+
+  ```text
+  Status: "mounted on /home/you/mnt/mcloud | token 138****8000 剩余 29.8 天（2026-12-02 12:00 到期）"
+  ```
+
+- **默认开启，推荐保持开启**：服务 / 挂载运行期间自动续期，省去每隔一个月
+  回浏览器复制 token；确实不想让空闲挂载续期时设
+  `MCLOUD_TOKEN_AUTO_REFRESH=0`（请求时的续期仍由客户端按需处理）；
+- 手动查看 / 续期：`mcloud-fuse token status`、`mcloud-fuse token refresh`。
+  续期不会涉及账号密码，也不会读取浏览器 Cookie；失败就回到浏览器重新复制。
+
+> 没有已保存 token 时**仍然需要显式粘贴一次**：自动续期只延长已有 token 的
+> 有效期，不会凭空获取账号凭据，也不会读取浏览器 Cookie / 本地存储。
+
+以下情况仍需要回浏览器复制一次：
+
+- 服务 / 挂载停用时间超过 token 剩余寿命（例如笔记本关机一个月）；
+- 续期接口拒绝（设备指纹、风控或接口漂移）；
+- 换账号、token 被吊销，或手动删掉了 token 文件。
+
 非交互环境用行模式：
 
 ```bash
 mcloud-fuse setup --no-tui --yes \
   --mountpoint ~/mnt/cloud --cache-dir ~/.cache/mcloud-fuse --no-service
 ```
+
+已有 token 时也可以只尝试续期再进入提问：`mcloud-fuse setup --no-tui --refresh-token`。
 
 ---
 
@@ -115,6 +146,7 @@ mcloud-fuse setup --no-tui --yes \
 | `mcloud-fuse mount` | 显式挂载；可临时覆盖 `--mountpoint` / `--root` / `--cache-dir` |
 | `mcloud-fuse unmount` | 卸载；必要时先停 systemd 用户服务 |
 | `mcloud-fuse status` | 配置、挂载状态、token 到期时间、服务状态 |
+| `mcloud-fuse token status \| refresh` | 查看 token 剩余时间 / 尝试自动续期 |
 | `mcloud-fuse setup` | 重新运行设置向导 |
 | `mcloud-fuse journal list \| forget \| gc \| retry` | 写回日志查看 / 清理 / 补传 |
 | `mcloud-fuse doctor` | 环境、网络、配额自检 |
@@ -168,6 +200,8 @@ mcloud-fuse mount --root /Photos/2026
 | `MCLOUD_LAZY_READ` | `1` | 所有文件默认按需读；`0` 退回整文件下载 |
 | `MCLOUD_META_CACHE_ENTRIES` | `4096` | 元数据缓存条数上限 |
 | `MCLOUD_WEB_TOKEN_FILE` | `~/.config/mcloud-fuse/web_token` | token 文件（0600） |
+| `MCLOUD_TOKEN_AUTO_REFRESH` | `1` | 服务运行时是否在空闲时主动续期；`0` 只报告不续期 |
+| `MCLOUD_TOKEN_STATUS_INTERVAL_SEC` | `43200` | 向 systemd 刷新 token 状态的间隔；`0` 只在启动时报一次（不后台续期） |
 | `MCLOUD_JOURNAL_DB` | `~/.local/state/mcloud-fuse/writeback-<hash>.sqlite3` | 写回日志（SQLite，持久化；按缓存目录分库） |
 | `MCLOUD_STATE_DIR` | `~/.local/state/mcloud-fuse` | 状态目录（放日志） |
 | `MCLOUD_JOURNAL_SYNC` | `NORMAL` | SQLite 同步级别；payload 放持久盘且要抗断电时设 `FULL` |

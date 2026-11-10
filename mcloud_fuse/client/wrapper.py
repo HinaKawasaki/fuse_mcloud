@@ -32,6 +32,7 @@ from mcloud_fuse.client.web139 import (
     Web139AuthError,
     Web139Client,
     Web139Error,
+    Web139Token,
     WebFile,
 )
 from mcloud_fuse.config import (
@@ -99,6 +100,17 @@ class DirectClientWrapper:
         """token 在每次请求时按需续期，这里只做存在性检查。"""
         if self.auth.token.is_expired():
             raise MCloudAuthException("Web token 已过期，请重新执行 import_web_token.py")
+
+    def refresh_token(self, *, force: bool = False) -> Web139Token:
+        """续期 token（``force=False`` 时只在临近过期才真正请求）。
+
+        后台状态线程调用；续期失败转成 ``MCloudAuthException``，由调用方决定
+        是否降级为「只报告剩余天数」。
+        """
+        try:
+            return self.client.refresh_token(force=force)
+        except Web139AuthError as exc:
+            raise MCloudAuthException(str(exc)) from exc
 
     # ------------------------------------------------------------------ 读
 

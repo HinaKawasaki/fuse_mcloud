@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
-from mcloud_fuse import config, sdnotify, service, tokens, userconfig
+from mcloud_fuse import config, sdnotify, service, token_status, tokens, userconfig
 from mcloud_fuse.cache.data_cache import DataCache
 from mcloud_fuse.cache.meta_cache import MetaCache
 from mcloud_fuse.client.wrapper import DirectClientWrapper
@@ -49,6 +49,7 @@ HELP = """\
   unmount     卸载挂载点，必要时先停止 systemd 用户服务
   status      显示配置、挂载点、token 到期时间与服务状态
   setup       首次设置 / 重新配置（全屏向导）
+  token       令牌：status（剩余时间）| refresh（尝试自动续期）
   doctor      环境、网络、配额自检
   journal     写回日志：list | forget | gc | retry
   trash       回收站：list | restore <fileId>... | empty -y
@@ -263,10 +264,20 @@ async def main(
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add("fsname=mcloud_fuse")
 
+    # 后台每 12 小时把 token 剩余寿命写进 systemd 的 Status=，临近过期时顺便续期。
+    token_reporter = token_status.TokenStatusReporter(
+        str(mountpoint),
+        token=lambda: wrapper.auth.token,
+        refresh=wrapper.refresh_token if token_status.auto_refresh_enabled() else None,
+    )
+
     pyfuse3.init(fuse_ops, str(mountpoint), fuse_options)
     # Type=notify：挂载就绪后才算 systemd start 完成；手动运行没有 NOTIFY_SOCKET 时 no-op。
     sdnotify.ready()
-    sdnotify.status(f"mounted on {mountpoint}")
+    try:
+        token_reporter.start()
+    except Exception as exc:  # noqa: BLE001 - 状态上报失败不能拖垮挂载
+        logger.warning("token 状态上报启动失败（不影响挂载）: %s", exc)
 
     # 先挂载、再补传：否则大量未上传文件会把挂载点卡在“不可用”状态几分钟。
     recovery_thread = threading.Thread(
@@ -287,6 +298,8 @@ async def main(
             nursery.cancel_scope.cancel()
     finally:
         logger.info("正在卸载 ...")
+        token_reporter.stop()
+        sdnotify.status(f"unmounting {mountpoint}")
         # 1) 让后台补传停手；2) 在卸载前把 tmpfs 里的完整 payload 抢救到持久盘；
         # 3) 再走原来的删除队列收尾与 close。
         data_cache.begin_shutdown()
@@ -451,6 +464,7 @@ def _status(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  删除方式  {'永久删除' if cfg.rm_mode == 'delete' else '移入回收站'}")
     print(f"  冲突策略  {cfg.conflict}")
     print(f"  token     {tokens.token_summary()}")
+    print(f"  自动续期  {token_status.cadence_text()}")
     print(f"  服务      {service.status_text()}")
     try:
         cache_for_journal = (
@@ -539,6 +553,10 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         return _unmount()
     if command == "status":
         return _status(rest)
+    if command == "token":
+        from mcloud_fuse.token_cli import main as token_main
+
+        return token_main(rest)
 
     # 向后兼容：mcloud-fuse --mountpoint X --root Y
     if command.startswith("-"):
