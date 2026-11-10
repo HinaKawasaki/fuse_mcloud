@@ -18,8 +18,8 @@ jobs:
       # 这样 fork / 新仓库的定时任务不会每周固定变红。
       MCLOUD_WEB_TOKEN: ${{ secrets.MCLOUD_WEB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: 安装最小依赖（不需要 pyfuse3）
