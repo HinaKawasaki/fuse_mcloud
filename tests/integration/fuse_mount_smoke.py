@@ -102,7 +102,7 @@ class FakeCloud:
         return len(chunk)
 
     # --- 写 ---
-    def upload_file(self, local_file_path, target_dir_id, name=None):
+    def upload_file(self, local_file_path, target_dir_id, name=None, **kwargs):
         path = Path(local_file_path)
         payload = path.read_bytes()
         file_name = name or path.name
@@ -167,7 +167,8 @@ class FakeCloud:
                 raise FileNotFoundError(file_id)
             self.dirs.setdefault(to_parent_file_id, []).append(found)
 
-    def delete(self, file_ids, permanent=True):
+    def delete(self, file_ids, permanent=True, labels=None):
+        """``labels`` 与真实 wrapper 对齐（后台失败时用于写可读路径）。"""
         for file_id in file_ids:
             for items in self.dirs.values():
                 items[:] = [item for item in items if item["id"] != file_id]
