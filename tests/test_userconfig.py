@@ -142,3 +142,32 @@ def test_apply_saved_env_ignores_broken_config(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("MCLOUD_CACHE_DIR", raising=False)
     assert userconfig.apply_saved_env() is None
     assert "MCLOUD_CACHE_DIR" not in os.environ
+
+
+def test_allow_other_roundtrip_and_env(tmp_path: Path):
+    config = make_config(tmp_path, allow_other=True)
+    path = tmp_path / "config.json"
+    userconfig.save(config, path)
+    assert userconfig.load(path).allow_other is True
+    assert config.env()["MCLOUD_ALLOW_OTHER"] == "1"
+    assert make_config(tmp_path).env()["MCLOUD_ALLOW_OTHER"] == "0"
+
+
+def test_non_bool_allow_other_is_rejected(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"mountpoint": str(tmp_path / "mnt"), "allow_other": "yes"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="allow_other"):
+        userconfig.load(path)
+
+
+def test_old_config_without_allow_other_defaults_off(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"mountpoint": str(tmp_path / "mnt"), "cache_dir": str(tmp_path / "c")}),
+        encoding="utf-8",
+    )
+    loaded = userconfig.load(path)
+    assert loaded is not None and loaded.allow_other is False

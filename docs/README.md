@@ -14,7 +14,7 @@
 | [架构详解](architecture.md) | 模块、并发、懒加载、写回、SQLite 日志、关机抢救 |
 | [ADR-0001](adr/0001-private-api-boundary.md) | 早期「只走官方 Skill」的边界决策（历史） |
 | [ADR-0002](adr/0002-web-api-optin.md) | 为什么启用 Web API、如何隔离、风险承担 |
-| [ADR-0003](adr/0003-multiuser-and-locking.md) | 每人一个账号、本地 advisory 锁、冲突策略 |
+| [ADR-0003](adr/0003-multiuser-and-locking.md) | 每人一个账号、只读共享（allow_other）、本地 advisory 锁、冲突策略 |
 
 ## 运维与验证
 

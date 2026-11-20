@@ -91,3 +91,74 @@ def test_non_retryable_not_retried():
 def test_global_limiter_matches_config():
     from mcloud_fuse import config
     assert global_rate_limiter.max_concurrent == config.API_MAX_CONCURRENT
+
+
+def test_4xx_is_not_retried():
+    """404/403 这类确定性失败不该白等三次。"""
+    from mcloud_fuse.errors import MCloudAPIException
+
+    calls = []
+
+    def missing():
+        calls.append(1)
+        raise MCloudAPIException("不存在", status=404)
+
+    import pytest
+
+    with pytest.raises(MCloudAPIException):
+        retry_call(missing, max_retries=3, initial_delay=0.01, jitter=False)
+    assert len(calls) == 1
+
+
+def test_5xx_is_retried_then_succeeds():
+    from mcloud_fuse.errors import MCloudAPIException
+
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise MCloudAPIException("网关错误", status=502)
+        return "ok"
+
+    assert retry_call(flaky, max_retries=3, initial_delay=0.01, jitter=False) == "ok"
+    assert len(calls) == 3
+
+
+def test_429_is_retried():
+    from mcloud_fuse.errors import MCloudAPIException
+
+    calls = []
+
+    def limited():
+        calls.append(1)
+        if len(calls) < 2:
+            raise MCloudAPIException("限流", status=429)
+        return "ok"
+
+    assert retry_call(limited, max_retries=3, initial_delay=0.01, jitter=False) == "ok"
+    assert len(calls) == 2
+
+
+def test_custom_non_retryable_type_stops_immediately():
+    class AuthLike(Exception):
+        status = 401
+
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise AuthLike("refresh failed")
+
+    import pytest
+
+    with pytest.raises(AuthLike):
+        retry_call(
+            boom,
+            max_retries=5,
+            initial_delay=0.01,
+            jitter=False,
+            retry_exceptions=(AuthLike,),
+            non_retryable=(AuthLike,),
+        )
+    assert len(calls) == 1

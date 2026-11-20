@@ -5,6 +5,7 @@ import stat
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Dict, Optional
 
 import pyfuse3
@@ -19,6 +20,7 @@ from mcloud_fuse.client.wrapper import (
     MCloudConflictError,
 )
 from mcloud_fuse.config import QUOTA_CACHE_TTL, UPLOAD_KEEP_CACHE
+from mcloud_fuse.journal import BUILDING
 from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeEntry, InodeMapper
 from mcloud_fuse.mapping.tree import DirectoryTree
 
@@ -55,7 +57,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         self.wrapper = wrapper
 
         # 已打开文件句柄 inode -> 本地读缓存 Path（仅写句柄使用，读句柄见 _read_fds）
-        self._fh_map: Dict[int, "os.PathLike"] = {}
+        self._fh_map: Dict[int, Path] = {}
         # 读句柄 fh -> 已打开的本地 fd。
         # 为什么 open 时就持有 fd：read() 原先每次按路径重新 open，一旦 LRU 淘汰
         # 把该路径删掉（下载另一个文件就可能触发），正在读的文件会突然报 EBADF。
@@ -69,8 +71,12 @@ class MCloudFuseOps(pyfuse3.Operations):
         self._read_pins: Dict[int, str] = {}
         self._next_read_fh = 1 << 32
         self._fh_lock = threading.Lock()
-        # 写回状态：inode -> {buffer, dirty, size, base_file_id, target_dir_inode, name}
+        # 写回状态：写句柄 fh -> {inode, key, buffer, dirty, size, ...}。
+        # 每个写句柄独占一份暂存与 journal key：同一 inode 允许被并发打开写，
+        # 用 inode 当键会让第二个 open 覆盖第一个未提交的内容。
         self._write_state: Dict[int, dict] = {}
+        # inode -> 当前打开的写句柄集合（读同一个文件时要能找到在途暂存）
+        self._write_handles: Dict[int, set] = {}
         # 正在进行的写回上传：inode -> Event。
         # FUSE 的 release 是异步的，close() 返回时上传可能仍在后台进行；
         # 紧随其后的 open/read/unlink 必须等待它完成，否则会读到占位 fileId。
@@ -163,6 +169,15 @@ class MCloudFuseOps(pyfuse3.Operations):
         """把内部异常映射为合适的 errno，供内核返回给用户态。"""
         if isinstance(exc, pyfuse3.FUSEError):
             return exc
+        # 本地写回盘满/只读等 OSError 必须原样透传：应用要看到 ENOSPC 才会
+        # 停下或清理，而不是把它当成一个笼统的 EIO 继续重试。
+        if isinstance(exc, OSError) and exc.errno in (
+            errno.ENOSPC,
+            errno.EDQUOT,
+            errno.EFBIG,
+            errno.EROFS,
+        ):
+            return pyfuse3.FUSEError(exc.errno)
         if isinstance(exc, MCloudAuthException):
             return pyfuse3.FUSEError(errno.EACCES)
         if isinstance(exc, MCloudConflictError):
@@ -174,6 +189,11 @@ class MCloudFuseOps(pyfuse3.Operations):
         if isinstance(exc, NotADirectoryError):
             return pyfuse3.FUSEError(errno.ENOTDIR)
         if isinstance(exc, MCloudAPIException):
+            # 优先用后端带回来的结构化信息（HTTP 状态 / 业务码 → errno）
+            hint = getattr(exc, "errno_hint", None)
+            if hint is not None:
+                return pyfuse3.FUSEError(hint)
+            # 兼容旧路径：没有结构化信息时退回消息匹配
             message = str(exc)
             if "权限拒绝" in message or "沙箱" in message:
                 return pyfuse3.FUSEError(errno.EACCES)
@@ -352,6 +372,75 @@ class MCloudFuseOps(pyfuse3.Operations):
             self._next_read_fh += 1
             return fh
 
+    def _new_write_key(self, inode: int) -> str:
+        """每次写打开一条独立的 journal key。
+
+        inode 号跨进程会复用，key 若只由 inode 组成，上一轮残留的 ``.wb`` 与
+        journal 记录会被这一轮覆盖（旧内容被接在尾部上传）。
+        """
+        return f"inode-{inode}-{uuid.uuid4().hex[:10]}"
+
+    def _attach_write_handle(
+        self,
+        inode: int,
+        *,
+        key: str,
+        buffer_path,
+        size: int,
+        base_file_id: str,
+        base_updated_at: str,
+        name: str,
+        parent_inode: int,
+    ) -> int:
+        fh = self._alloc_read_fh()
+        self._write_state[fh] = {
+            "inode": inode,
+            "key": key,
+            "buffer": buffer_path,
+            "dirty": False,
+            "size": size,
+            "base_file_id": base_file_id,
+            "base_updated_at": base_updated_at,
+            "target_dir_inode": parent_inode,
+            "name": name,
+        }
+        self._fh_map[fh] = buffer_path
+        with self._fh_lock:
+            self._write_handles.setdefault(inode, set()).add(fh)
+        return fh
+
+    def _detach_write_handle(self, fh: int) -> Optional[dict]:
+        state = self._write_state.get(fh)
+        if state is None:
+            return None
+        inode = int(state["inode"])
+        with self._fh_lock:
+            fhs = self._write_handles.get(inode)
+            if fhs is not None:
+                fhs.discard(fh)
+                if not fhs:
+                    self._write_handles.pop(inode, None)
+        return state
+
+    def active_write_keys(self) -> set:
+        """仍被写句柄占用的 journal key（关机抢救必须跳过）。"""
+        with self._fh_lock:
+            handles = [fh for fhs in self._write_handles.values() for fh in fhs]
+        return {
+            str(self._write_state[fh]["key"])
+            for fh in handles
+            if fh in self._write_state
+        }
+
+    def _write_fhs(self, inode: int) -> list:
+        with self._fh_lock:
+            return sorted(self._write_handles.get(inode, ()))
+
+    def _drop_write_handle(self, fh: int) -> None:
+        self._detach_write_handle(fh)
+        self._write_state.pop(fh, None)
+        self._fh_map.pop(fh, None)
+
     def _conflict_base(self, entry: InodeEntry) -> tuple:
         """[阻塞] 取覆盖写基线；拿不到就退回本地缓存值。"""
         if str(entry.file_id).startswith(PENDING_FILE_ID_PREFIX):
@@ -366,7 +455,7 @@ class MCloudFuseOps(pyfuse3.Operations):
             logger.warning("读取 %s 的远端版本失败，按冲突处理: %s", entry.file_id, exc)
             return entry.file_id, entry.updated_at or "<unavailable>"
 
-    def _open_write_sync(self, inode: int, flags: int):
+    def _open_write_sync(self, inode: int, flags: int, key: str):
         entry = self.mapper.get_by_inode(inode)
         if entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -380,7 +469,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         truncate = bool(flags & os.O_TRUNC)
         if truncate:
             buffer_path = self.data_cache.create_write_buffer(
-                f"inode-{inode}",
+                key,
                 target_dir_id=target_dir_id,
                 file_name=name,
                 base_file_id=base_file_id,
@@ -392,7 +481,7 @@ class MCloudFuseOps(pyfuse3.Operations):
             read_path = self.data_cache.acquire_for_read(entry.file_id, name)
             try:
                 buffer_path = self.data_cache.create_write_buffer(
-                    f"inode-{inode}",
+                    key,
                     initial_path=read_path,
                     target_dir_id=target_dir_id,
                     file_name=name,
@@ -420,10 +509,11 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EISDIR)
 
         # 若有未关闭的写句柄，直接读它的暂存文件（此时云端还是占位 fileId）
-        state = self._write_state.get(inode)
-        if state is not None:
-            local_path = state["buffer"]
-            return os.open(local_path, os.O_RDONLY), None, None
+        fhs = self._write_fhs(inode)
+        if fhs:
+            state = self._write_state.get(fhs[-1])
+            if state is not None:
+                return os.open(state["buffer"], os.O_RDONLY), None, None
 
         file_name = entry.path.rstrip("/").rsplit("/", 1)[-1]
         if self.data_cache.should_read_lazily(entry.size):
@@ -448,21 +538,24 @@ class MCloudFuseOps(pyfuse3.Operations):
         await self._wait_inflight_commit(inode)
         try:
             if writable:
+                key = self._new_write_key(inode)
                 buffer_path, size, base_file_id, base_updated_at = (
-                    await trio.to_thread.run_sync(self._open_write_sync, inode, flags)
+                    await trio.to_thread.run_sync(self._open_write_sync, inode, flags, key)
                 )
                 entry = self.mapper.get_by_inode(inode)
+                if entry is None:
+                    raise pyfuse3.FUSEError(errno.ENOENT)
                 name = entry.path.rstrip("/").rsplit("/", 1)[-1]
-                self._write_state[inode] = {
-                    "buffer": buffer_path,
-                    "dirty": False,
-                    "size": size,
-                    "base_file_id": base_file_id,
-                    "base_updated_at": base_updated_at,
-                    "target_dir_inode": entry.parent_inode,
-                    "name": name,
-                }
-                self._fh_map[inode] = buffer_path
+                fh = self._attach_write_handle(
+                    inode,
+                    key=key,
+                    buffer_path=buffer_path,
+                    size=size,
+                    base_file_id=base_file_id,
+                    base_updated_at=base_updated_at,
+                    name=name,
+                    parent_inode=entry.parent_inode,
+                )
             else:
                 fd, pinned, lazy = await trio.to_thread.run_sync(
                     self._open_read_handle_sync, inode
@@ -481,10 +574,7 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise self._to_fuse_error(exc) from exc
 
         fi = pyfuse3.FileInfo()
-        if writable:
-            fi.fh = inode
-        else:
-            fi.fh = fh
+        fi.fh = fh
         fi.keep_cache = False
         return fi
 
@@ -503,11 +593,11 @@ class MCloudFuseOps(pyfuse3.Operations):
             if fd is not None:
                 # pread 不改文件偏移，多个并发 read 也不需要加锁
                 return os.pread(fd, size, off)
-            # 写句柄（fh == inode）：直接读写回暂存文件
-            local_path = self._fh_map.get(fh)
-            if local_path is None or not local_path.exists():
+            # 写句柄：直接读写回暂存文件
+            buffer_path = self._fh_map.get(fh)
+            if buffer_path is None or not buffer_path.exists():
                 raise pyfuse3.FUSEError(errno.EBADF)
-            with open(local_path, "rb") as handle:
+            with open(buffer_path, "rb") as handle:
                 handle.seek(off)
                 return handle.read(size)
 
@@ -523,6 +613,7 @@ class MCloudFuseOps(pyfuse3.Operations):
         state = self._write_state.get(fh)
         if state is None:
             raise pyfuse3.FUSEError(errno.EBADF)
+        inode = int(state["inode"])
 
         payload = bytes(buf)
         growth = max(0, off + len(payload) - int(state.get("size", 0)))
@@ -544,13 +635,23 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise self._to_fuse_error(exc) from exc
 
         # 让 getattr/ls -l 立即看到新的文件大小
-        self.mapper.update_entry(fh, size=state["size"])
-        self.meta_cache.invalidate_attr(fh)
+        self.mapper.update_entry(inode, size=state["size"])
+        self.meta_cache.invalidate_attr(inode)
         return len(payload)
 
     async def flush(self, fh: int) -> None:
-        # 数据在 release/fsync 时统一上传，这里不做额外动作
-        return None
+        """close(2) 之前把脏数据提交一次。
+
+        FUSE 内核会丢弃 ``release`` 的返回值，上传失败只有在 ``flush`` 里抛出
+        才能让 ``close(2)`` / ``cp`` / 编辑器看到错误；成功后再 release 就不会重复上传。
+        """
+        state = self._write_state.get(fh)
+        if state is None:
+            return
+        is_new = str(state.get("base_file_id", "")).startswith(PENDING_FILE_ID_PREFIX)
+        if not state.get("dirty") and not is_new:
+            return
+        await self._commit_write(fh, final=False)
 
     async def fsync(self, fh: int, datasync: bool) -> None:
         # fsync 只把当前内容推到云端，文件仍可能继续被写：保留写回暂存，不做收尾
@@ -577,7 +678,7 @@ class MCloudFuseOps(pyfuse3.Operations):
                 self.data_cache.release_read(pinned)
             return
 
-        state = self._write_state.get(fh)
+        state = self._detach_write_handle(fh)
         logger.debug("release fh=%s has_state=%s dirty=%s base=%s",
                      fh, state is not None, state and state.get("dirty"),
                      state and state.get("base_file_id"))
@@ -593,24 +694,28 @@ class MCloudFuseOps(pyfuse3.Operations):
     # 上传实现
     # ------------------------------------------------------------------
 
-    async def _commit_write(self, inode: int, *, final: bool) -> None:
+    async def _commit_write(self, fh: int, *, final: bool) -> None:
         """把写回暂存上传到云端。
 
+        ``fh`` 是写句柄：每个句柄有自己的暂存与 journal key，因此同一文件被并发
+        打开写时不会互相覆盖。
+
         :param final: True 表示文件已关闭，上传后把暂存改名进读缓存（零拷贝）；
-                      False 表示只是 fsync，保留暂存以便继续写入。
+                      False 表示只是 flush/fsync，保留暂存以便继续写入。
         """
-        state = self._write_state.get(inode)
+        state = self._write_state.get(fh)
         if state is None:
             return
-        logger.debug("commit_write inode=%s final=%s dirty=%s base=%s size=%s",
-                     inode, final, state["dirty"], state["base_file_id"], state["size"])
+        inode = int(state["inode"])
+        logger.debug("commit_write fh=%s inode=%s final=%s dirty=%s base=%s size=%s",
+                     fh, inode, final, state["dirty"], state["base_file_id"], state["size"])
 
         parent_inode = state["target_dir_inode"]
         parent_entry = self.mapper.get_by_inode(parent_inode)
         if parent_entry is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        key = f"inode-{inode}"
+        key = state["key"]
         file_name = state["name"]
         target_dir_id = parent_entry.file_id
         is_new = str(state["base_file_id"]).startswith(PENDING_FILE_ID_PREFIX)
@@ -664,7 +769,21 @@ class MCloudFuseOps(pyfuse3.Operations):
                 self.mapper.remap_file_id(old_file_id, item.file_id)
                 self.mapper.update_entry(inode, size=state["size"])
                 state["base_file_id"] = item.file_id
+                state["base_updated_at"] = item.updated_at or ""
                 state["dirty"] = False
+                if not final:
+                    # flush / fsync 之后文件还可能继续写：立刻用新基线重新登记一条
+                    # BUILDING 记录。否则日志已清，后续写入崩溃时完全失去追踪
+                    # （BUILDING 不会被补传，恢复时标记 lost，符合「半成品不上传」）。
+                    self.data_cache.register_write_meta(
+                        key,
+                        target_dir_id,
+                        file_name,
+                        base_file_id=item.file_id,
+                        base_updated_at=item.updated_at or "",
+                        payload_path=state["buffer"],
+                        state=BUILDING,
+                    )
 
                 # 云端搜索索引可能还没收录新上传的对象，给它一段宽限期
                 self.tree.mark_recent(inode)
@@ -686,7 +805,8 @@ class MCloudFuseOps(pyfuse3.Operations):
 
                 await trio.to_thread.run_sync(_finalize)
         finally:
-            self._commit_events.pop(inode, None)
+            if self._commit_events.get(inode) is event:
+                self._commit_events.pop(inode, None)
             event.set()
 
     # ==================================================================
@@ -695,6 +815,8 @@ class MCloudFuseOps(pyfuse3.Operations):
 
     def _new_pending_entry(self, parent_inode: int, name: str) -> InodeEntry:
         parent_entry = self.mapper.get_by_inode(parent_inode)
+        if parent_entry is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
         target_path = self.tree.child_path(parent_entry.path, name)
         return self.mapper.allocate_or_update(
             file_id=f"{PENDING_FILE_ID_PREFIX}{uuid.uuid4().hex}",
@@ -714,18 +836,19 @@ class MCloudFuseOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EEXIST)
 
         entry = self._new_pending_entry(parent_inode, name)
+        key = self._new_write_key(entry.inode)
         buffer_path = self.data_cache.create_write_buffer(
-            f"inode-{entry.inode}",
+            key,
             target_dir_id=parent_entry.file_id,
             file_name=name,
         )
-        return entry, buffer_path
+        return entry, buffer_path, key
 
     async def create(self, parent_inode, name, mode, flags, ctx=None):
         """[FUSE System Call] 创建普通文件并返回可写句柄。"""
         decoded = self._decode_name(name)
         try:
-            entry, buffer_path = await trio.to_thread.run_sync(
+            entry, buffer_path, key = await trio.to_thread.run_sync(
                 self._prepare_create_sync, parent_inode, decoded
             )
         except pyfuse3.FUSEError:
@@ -737,21 +860,22 @@ class MCloudFuseOps(pyfuse3.Operations):
             decoded, entry.inode, flags, entry.file_id,
         )
 
-        self._write_state[entry.inode] = {
-            "buffer": buffer_path,
-            "dirty": False,
-            "size": 0,
-            "base_file_id": entry.file_id,
-            "target_dir_inode": parent_inode,
-            "name": decoded,
-        }
-        self._fh_map[entry.inode] = buffer_path
+        fh = self._attach_write_handle(
+            entry.inode,
+            key=key,
+            buffer_path=buffer_path,
+            size=0,
+            base_file_id=entry.file_id,
+            base_updated_at="",
+            name=decoded,
+            parent_inode=parent_inode,
+        )
         self.tree.mark_recent(entry.inode)
         self.meta_cache.invalidate_readdir(parent_inode)
         self.tree.mark_directory_stale(parent_inode)
 
         fi = pyfuse3.FileInfo()
-        fi.fh = entry.inode
+        fi.fh = fh
         fi.keep_cache = False
         return fi, self._to_attrs(entry)
 
@@ -759,26 +883,27 @@ class MCloudFuseOps(pyfuse3.Operations):
         if not stat.S_ISREG(mode):
             raise pyfuse3.FUSEError(errno.ENOTSUP)
         decoded = self._decode_name(name)
-        try:
-            entry, buffer_path = await trio.to_thread.run_sync(
-                self._prepare_create_sync, parent_inode, decoded
-            )
-        except pyfuse3.FUSEError:
-            raise
-        self._write_state[entry.inode] = {
-            "buffer": buffer_path,
-            "dirty": False,
-            "size": 0,
-            "base_file_id": entry.file_id,
-            "target_dir_inode": parent_inode,
-            "name": decoded,
-        }
+        entry, buffer_path, key = await trio.to_thread.run_sync(
+            self._prepare_create_sync, parent_inode, decoded
+        )
+        fh = self._attach_write_handle(
+            entry.inode,
+            key=key,
+            buffer_path=buffer_path,
+            size=0,
+            base_file_id=entry.file_id,
+            base_updated_at="",
+            name=decoded,
+            parent_inode=parent_inode,
+        )
         self.tree.mark_recent(entry.inode)
         self.meta_cache.invalidate_readdir(parent_inode)
         self.tree.mark_directory_stale(parent_inode)
         # mknod 不返回句柄，立即落一个空文件
-        await self._commit_write(entry.inode, final=True)
-        self._write_state.pop(entry.inode, None)
+        try:
+            await self._commit_write(fh, final=True)
+        finally:
+            self._drop_write_handle(fh)
         return self._to_attrs(entry)
 
     def _mkdir_sync(self, parent_inode: int, name: str) -> InodeEntry:
@@ -814,8 +939,11 @@ class MCloudFuseOps(pyfuse3.Operations):
         return self._to_attrs(entry)
 
     def _delete_cloud_sync(self, entry: InodeEntry) -> None:
-        """真正删除（默认 /file/batchDelete），不再登记墓碑。"""
-        self.wrapper.delete([entry.file_id])
+        """真正删除（默认 /file/batchDelete），不再登记墓碑。
+
+        ``labels`` 让后台失败记录里能写出路径，而不是一串 fileId。
+        """
+        self.wrapper.delete([entry.file_id], labels={entry.file_id: entry.path})
 
     async def _delete_entry(self, entry: InodeEntry) -> None:
         parent_inode = entry.parent_inode
@@ -823,8 +951,11 @@ class MCloudFuseOps(pyfuse3.Operations):
         await self._wait_inflight_commit(entry.inode)
         if str(entry.file_id).startswith(PENDING_FILE_ID_PREFIX):
             # 从未上传成功的新建文件：云端没有对应对象，直接丢弃本地占位
-            self.data_cache.discard_write_buffer(f"inode-{entry.inode}")
-            self._write_state.pop(entry.inode, None)
+            for fh in self._write_fhs(entry.inode):
+                state = self._write_state.get(fh)
+                if state is not None:
+                    self.data_cache.discard_write_buffer(state["key"])
+                self._drop_write_handle(fh)
             self.mapper.remove_by_inode(entry.inode)
             self.meta_cache.invalidate_all_for_inode(entry.inode, parent_inode=parent_inode)
             return
@@ -918,7 +1049,8 @@ class MCloudFuseOps(pyfuse3.Operations):
         self.tree.mark_directory_stale(parent_inode_old)
         self.tree.mark_directory_stale(parent_inode_new)
 
-    def _truncate_sync(self, inode: int, size: int) -> None:
+    def _truncate_sync(self, inode: int, size: int) -> int:
+        """截断文件：把旧内容复制进新的写回暂存，返回它的写句柄。"""
         entry = self.mapper.get_by_inode(inode)
         if entry is None or entry.is_dir:
             raise pyfuse3.FUSEError(errno.EISDIR if entry else errno.ENOENT)
@@ -928,8 +1060,9 @@ class MCloudFuseOps(pyfuse3.Operations):
         read_path = self.data_cache.acquire_for_read(entry.file_id, name)
         try:
             base_file_id, base_updated_at = self._conflict_base(entry)
+            key = self._new_write_key(inode)
             buffer_path = self.data_cache.create_write_buffer(
-                f"inode-{inode}",
+                key,
                 initial_path=read_path,
                 target_dir_id=parent_entry.file_id if parent_entry else None,
                 file_name=name,
@@ -943,15 +1076,19 @@ class MCloudFuseOps(pyfuse3.Operations):
         )
         with open(buffer_path, "r+b") as handle:
             handle.truncate(size)
-        self._write_state[inode] = {
-            "buffer": buffer_path,
-            "dirty": True,
-            "size": size,
-            "base_file_id": base_file_id,
-            "base_updated_at": base_updated_at,
-            "target_dir_inode": entry.parent_inode,
-            "name": name,
-        }
+        fh = self._attach_write_handle(
+            inode,
+            key=key,
+            buffer_path=buffer_path,
+            size=size,
+            base_file_id=base_file_id,
+            base_updated_at=base_updated_at,
+            name=name,
+            parent_inode=entry.parent_inode,
+        )
+        state = self._write_state[fh]
+        state["dirty"] = True
+        return fh
 
     async def setattr(self, inode, attr, fields, fh, ctx=None):
         """[FUSE System Call] 处理 truncate(fsize=0) 等属性变更。"""
@@ -961,7 +1098,12 @@ class MCloudFuseOps(pyfuse3.Operations):
 
         if getattr(fields, "update_size", False):
             new_size = int(attr.st_size)
-            state = self._write_state.get(inode)
+            state = self._write_state.get(fh)
+            if state is None:
+                # truncate(path) 没有传句柄时，退回到该 inode 的任一写句柄
+                candidates = self._write_fhs(inode)
+                if candidates:
+                    state = self._write_state.get(candidates[-1])
             if state is not None:
                 def _truncate_buffer():
                     self.data_cache.ensure_write_back_capacity(
@@ -977,15 +1119,19 @@ class MCloudFuseOps(pyfuse3.Operations):
                 except OSError as exc:
                     raise self._to_fuse_error(exc) from exc
             else:
+                temp_fh = None
                 try:
-                    await trio.to_thread.run_sync(self._truncate_sync, inode, new_size)
-                    await self._commit_write(inode, final=True)
+                    temp_fh = await trio.to_thread.run_sync(
+                        self._truncate_sync, inode, new_size
+                    )
+                    await self._commit_write(temp_fh, final=True)
                 except pyfuse3.FUSEError:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     raise self._to_fuse_error(exc) from exc
                 finally:
-                    self._write_state.pop(inode, None)
+                    if temp_fh is not None:
+                        self._drop_write_handle(temp_fh)
 
         # mode/uid/gid/时间戳云盘侧不支持，静默忽略并回读当前属性
         fresh = self.mapper.get_by_inode(inode) or entry

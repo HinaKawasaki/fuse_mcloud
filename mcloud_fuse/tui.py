@@ -14,7 +14,9 @@ import curses
 import sys
 import unicodedata
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple, TypeVar
+
+T = TypeVar("T")
 
 MIN_HEIGHT = 16
 MIN_WIDTH = 60
@@ -343,7 +345,7 @@ class Screen:
                     break
                 offset += 1
             row = body_y
-            for item_index, label, description in rows[offset:]:
+            for item_index, label, desc_lines in rows[offset:]:
                 if row >= height - 3:
                     break
                 selected_row = item_index == index
@@ -355,7 +357,7 @@ class Screen:
                     self.attr("selected") if selected_row else self.attr("normal"),
                 )
                 row += 1
-                for line in description[:2]:
+                for line in desc_lines[:2]:
                     self.put(row, x + 4, clip(line, body_width - 4), self.attr("dim"))
                     row += 1
             self._footer(hint)
@@ -371,9 +373,7 @@ class Screen:
                 if allow_back:
                     raise Back()
                 raise Cancelled()
-            elif key == "\x03":
-                raise Cancelled()
-            elif key == "q" and allow_quit:
+            elif key == "\x03" or (key == "q" and allow_quit):
                 raise Cancelled()
 
     # ------------------------------------------------------------- 输入
@@ -523,7 +523,7 @@ class Screen:
             self.resume()
 
 
-def run(callback: Callable[[Screen], object]) -> object:
+def run(callback: Callable[[Screen], T]) -> T:
     """在 curses 里运行 ``callback``；终端不适合时抛 :class:`TuiUnavailable`。"""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise TuiUnavailable("当前不是交互终端")

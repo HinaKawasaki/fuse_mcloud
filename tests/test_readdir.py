@@ -5,9 +5,11 @@
 - 列表内容来自全盘搜索而非当前目录，导致任意目录都能看到无关文件
 - 分页 next_id 不稳定导致重复/遗漏
 """
+import errno
 import sys
 from pathlib import Path
 
+import pyfuse3
 import pytest
 import trio
 
@@ -73,9 +75,9 @@ class ReaddirCollector:
 
     def __call__(self, token, name, attrs, next_id):
         self.rows.append((name.decode("utf-8"), next_id, attrs.st_ino))
-        if self.stop_after is not None and len(self.rows) >= self.stop_after:
-            return False
-        return True
+        return not (
+            self.stop_after is not None and len(self.rows) >= self.stop_after
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,5 +225,6 @@ def test_lookup_populates_correct_parent(monkeypatch):
     assert child_attr.st_size == 7
     assert wrapper.list_calls == ["sandbox_root", "dir_docs"]
 
-    with pytest.raises(Exception):
+    with pytest.raises(pyfuse3.FUSEError) as excinfo:
         trio.run(ops.lookup, docs_inode, b"nope.txt")
+    assert excinfo.value.errno == errno.ENOENT

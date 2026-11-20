@@ -1,5 +1,105 @@
 # Release Notes
 
+## v0.6.0：任意挂载点、只读共享与写回可靠性
+
+> 升级：无破坏性接口变更，老 `config.json` 直接可用（新字段默认关闭）。
+> 一处行为变化：`close(2)` 现在会把上传失败返回给应用，以前是静默成功。
+
+v0.5.0 之后的六组改动。
+
+### 挂载点：家目录之外也能放
+
+- 任意绝对路径都行：`/mnt/mcloud`、`/srv/cloud`、`~/mnt/mcloud`；向导第 2 步给出
+  「家目录 / `/mnt/mcloud` / 自定义」三个入口；
+- 需要 root 的只有「建目录 + 改属主」这一步：向导带着执行一次
+  `sudo install -d -m 755 -o <user> -g <group> <path>`（先 `endwin()`，
+  sudo 密码提示回到正常终端），之后挂载、卸载、systemd 用户服务都不需要 root；
+- 目标已存在但不是你的、是符号链接、已有挂载或是文件，都会被拦下并给出修复命令；
+  `mcloud-fuse mount --mountpoint /mnt/cloud` 走同一套检查；
+- 新模块 `mcloud_fuse/mountopts.py` 承担「能不能挂 / 别人能不能进」的纯逻辑。
+
+### 只读共享（`allow_other`，opt-in，默认关闭）
+
+- 向导第 3 步选「其他本地用户可读」后，挂载加 `allow_other` +
+  `default_permissions`；attrs 固定 `0644/0755`，其他本地 uid 能读、能遍历，
+  写/删/改名被内核拒绝。共享写仍然不做（ADR-0003 §8）；
+- 两个前提逐条检查并给出可执行命令：`/etc/fuse.conf` 的 `user_allow_other`
+  （一条 sudo 追加）；从 `/` 到挂载点父目录的 `o+x`（`$HOME` 为 `0700` 时提示
+  改用 `/mnt/mcloud`，不静默改家目录权限）；
+- `config.json` 新增 `allow_other`（老配置默认 `false`，行为不变）；
+  `MCLOUD_ALLOW_OTHER`、`mount --allow-other/--no-allow-other`、
+  `setup --allow-other` 可覆盖；`status` / 确认页显示共享状态，
+  `doctor` 增加 `user_allow_other` 与「父目录可穿越」两项。
+
+### 写回数据安全
+
+- **恢复核对改为「证明式」**：`uploading` 崩溃后不再以「同名 + 同大小」判定上传
+  成功。覆盖写要求远端仍是同一个 fileId、`updatedAt` 已变化且晚于 payload 落盘；
+  新建文件要求远端 `updatedAt` 不早于 payload 的 mtime（5 秒容差）。证明不了
+  一律退回重传——此前远端恰有同名同大小文件时，会把从未上传的写回静默删掉；
+- **写句柄互相隔离**：`fh` 不再复用 inode，`_write_state`、`.wb` 与 journal key
+  都按句柄隔离（`inode-N-<随机后缀>`）。同一文件被两个进程同时写时，不再共用
+  一份暂存、第二个 open 覆盖第一个未提交的内容；
+- **新建暂存强制截断**（`O_TRUNC`），消除 inode 号被复用后旧 payload 尾巴被一起
+  上传的问题；**关机抢救跳过在途写**，避免后续 `write` 撞 `ENOENT`；
+- **`flush` 成为真正的提交点**：`close(2)` 前上传，失败时把 errno 回给应用
+  （FUSE 内核会丢弃 `release` 的返回值）；flush 后继续写会重新登记 `building`，
+  崩溃时按半成品标 `lost`。
+
+### 失败对应用可见
+
+- **errno 结构化映射**：`MCloudAPIException` 带 `status` / `code` / `errno_hint`，
+  `wrapper` 不再把 `Web139Error` 压成一句字符串。401/403 → `EACCES`、404/410 →
+  `ENOENT`、409 → `EEXIST`、412 → `ESTALE`、429 → `EAGAIN`、507（或本地盘满）→
+  `ENOSPC`、5xx → `EIO`；消息匹配只作为没有结构化信息时的兜底；
+- **幂等读接入退避重试**：目录列举、配额、`get_file` / `batch_get`、下载地址与
+  任务轮询在 5xx / 408 / 429 上最多重试 3 次；4xx 与鉴权失败立即返回。
+  创建 / 上传 / 删除 / 移动不自动重试——重发可能重复建对象；
+- **连接层只重试「连不上」**：`Retry(connect=2, read=0, status=0)`，已发出的
+  POST 不会被重发。
+
+### 删除：批量优先 + 失败可见
+
+- 删除仍是**批量异步**的：`rm -rf` 不会被网络卡住（`DELETE_BATCH_MAX=100`）；
+- 后台失败按 0.5s / 1s 退避重试最多 3 次；`404`（已经不存在）视为成功，
+  `403` / 鉴权失败不重试；
+- 重试仍失败时，对象从隐藏集移除、**重新出现在 `ls` 里**（云端确实没删掉），
+  并写入 `~/.local/state/mcloud-fuse/delete-failures.json`（0600，最多 100 条）；
+- `mcloud-fuse status` 显示失败数量与最近一条，`mcloud-fuse doctor` 增加
+  「删除失败」检查；再次 `rm` 成功会清掉记录；失败记录里是可读路径而不是 fileId。
+
+### 服务管理命令
+
+- 新增 `mcloud-fuse service status | install | restart | uninstall`：
+  卸载不再需要手工删 systemd 单元（`service.py` 里的 `uninstall()` 终于有入口），
+  `--yes` 用于脚本；`restart` 让改完配置不必重跑向导。
+
+### 工程与 CI
+
+- **CLI 不再依赖 pyfuse3**：`main.py` 只在真正挂载时导入 `fuse_ops`。缺
+  `libfuse3` / `pyfuse3` 时 `--version`、`setup`、`status`、`doctor`、`service`
+  都能正常跑；`mount` 会给出「装什么、怎么装」的一句话，而不是 traceback；
+- **mypy 零错误**（`check_untyped_defs`、`no_implicit_optional`、
+  `explicit_package_bases`），CI 的 lint job 同时跑 `ruff` 与 `mypy`；
+- **lint 扩容**：`ruff` 从 `E/F/W/I` 扩到 `E/F/W/I/B/C4/SIM`；
+- **覆盖率门槛 60 → 70**（语句 + 分支），补齐 service / status / unmount /
+  行模式 setup / 删除失败记录等用例；
+- 测试 368 条。
+
+### 兼容性与升级建议
+
+- 老配置不需要迁移，`allow_other` 默认关闭；
+- journal key 从 `inode-N` 变为 `inode-N-<随机>`：旧 `pending` 记录仍按原 key
+  补传，不需要手工处理；
+- 升级后建议执行 `mcloud-fuse doctor`；装了 systemd 服务的执行
+  `mcloud-fuse service restart`（或直接 `service install` 重写单元）。
+
+### 已知限制
+
+- 共享写不做（只读共享见上）；
+- `rename` 覆盖已存在目标仍是「先删后改名」，改名失败时目标可能丢失，下一版修；
+- 大目录首次 `ls` 仍是 50 秒级（云端游标分页），见 [performance.md](performance.md)。
+
 ## v0.5.0：令牌自动续期与云盘路径挂载
 
 本版汇总 v0.4.0 之后的三组改动，没有破坏性接口变更。

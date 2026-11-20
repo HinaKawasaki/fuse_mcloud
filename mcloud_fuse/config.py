@@ -90,6 +90,14 @@ WEB_TOKEN_FILE = Path(
 WEB_CLIENT_TYPE = os.getenv("MCLOUD_WEB_CLIENT_TYPE", "13").strip()
 WEB_PART_SIZE_BYTES = int(os.getenv("MCLOUD_WEB_PART_SIZE", str(100 * 1024 * 1024)))
 
+# ==================== 7.1 多用户共享（只读） ====================
+# 1 = 挂载时加 allow_other：本机其他用户可读挂载点。需要 /etc/fuse.conf 里的
+# user_allow_other（非 root 挂载的硬性要求），并配套 default_permissions。
+# 只读是刻意的：attrs 固定 0644/0755，其他用户的写入会被内核拒绝。
+ALLOW_OTHER = os.getenv("MCLOUD_ALLOW_OTHER", "0").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+
 # rm 语义：delete=调用 /file/batchDelete（不进回收站）；
 # trash=调用 /recyclebin/batchTrash（可在 App 回收站里恢复）。
 RM_PERMANENT = os.getenv("MCLOUD_RM_MODE", "delete").strip().lower() != "trash"

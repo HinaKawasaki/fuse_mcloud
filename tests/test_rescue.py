@@ -12,19 +12,19 @@ from mcloud_fuse.journal import BUILDING, RESCUED, WritebackJournal, rescue_dir
 
 
 def make_cache(tmp_path: Path, cloud=None, **kwargs) -> DataCache:
-    defaults = dict(
-        client_wrapper=cloud or FakeCloud(),
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        max_write_back_mb=16,
-        min_free_mb=0,
-        journal_db=tmp_path / "journal.sqlite3",
-        rescue_min_free_mb=0,
-        rescue_max_mb=64,
-        rescue_file_max_mb=8,
-        rescue_timeout_sec=10,
-    )
+    defaults = {
+        "client_wrapper": cloud or FakeCloud(),
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "max_write_back_mb": 16,
+        "min_free_mb": 0,
+        "journal_db": tmp_path / "journal.sqlite3",
+        "rescue_min_free_mb": 0,
+        "rescue_max_mb": 64,
+        "rescue_file_max_mb": 8,
+        "rescue_timeout_sec": 10,
+    }
     defaults.update(kwargs)
     return DataCache(**defaults)
 
@@ -140,3 +140,39 @@ def test_recovery_falls_back_to_rescue_path(tmp_path: Path, monkeypatch):
     assert ("inode-6.txt", b"orphan-rescue") in cloud.uploads
     assert not second.pending_uploads()
     second.close()
+
+
+def test_create_write_buffer_truncates_stale_payload(tmp_path: Path):
+    """同一 key 上残留的旧 payload 不能再被接在尾部上传。"""
+    cache = make_cache(tmp_path)
+    stale = tmp_path / "wb" / "k.wb"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"OLD-PAYLOAD-TAIL-0123456789")
+
+    path = cache.create_write_buffer("k", target_dir_id="root", file_name="x.txt")
+
+    assert path == stale
+    assert path.stat().st_size == 0, "新建写回暂存必须截断"
+
+
+def test_rescue_skips_payload_held_by_write_handle(tmp_path: Path):
+    """写句柄还开着的 payload 不能被搬走：否则后续 write 撞 ENOENT、上传截断内容。"""
+    cache = make_cache(tmp_path)
+    path = make_pending(cache, key="k-live", payload=b"still-open")
+
+    result = cache.rescue_pending_uploads(force=True, active_keys={"k-live"})
+
+    assert result.count == 0
+    assert any("写句柄" in reason for _, _, _, reason in result.skipped)
+    assert path.exists(), "在途 payload 不能被搬走或删除"
+    assert "k-live" in cache.pending_uploads()
+
+
+def test_rescuable_uploads_excludes_active_keys(tmp_path: Path):
+    cache = make_cache(tmp_path)
+    make_pending(cache, key="k-open", payload=b"a")
+    make_pending(cache, key="k-idle", payload=b"b")
+
+    rescuable = cache.rescuable_uploads(active_keys={"k-open"})
+
+    assert set(rescuable) == {"k-idle"}

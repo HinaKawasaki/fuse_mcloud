@@ -96,10 +96,11 @@ def main() -> int:
     print(f"   dirId={dir_id}")
 
     payload = (b"mcloud-fuse web139 probe\n" * 64)
-    tmp = tempfile.NamedTemporaryFile(prefix="web139-probe-", suffix=".txt", delete=False)
-    tmp.write(payload)
-    tmp.close()
-    tmp_path = Path(tmp.name)
+    with tempfile.NamedTemporaryFile(
+        prefix="web139-probe-", suffix=".txt", delete=False
+    ) as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
     file_id = ""
     try:
         print("\n3. 上传 hello.txt ...")

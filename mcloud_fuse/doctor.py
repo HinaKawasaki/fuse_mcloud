@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from mcloud_fuse import config, service, userconfig
+from mcloud_fuse import config, delete_failures, mountopts, service, userconfig
 from mcloud_fuse.client.web139 import (
     Web139Auth,
     Web139AuthError,
@@ -173,12 +173,60 @@ def _check_journal(write_back_dir: Optional[Path] = None) -> List[Check]:
     return checks
 
 
+def _check_delete_failures() -> Check:
+    items = delete_failures.load()
+    if not items:
+        return Check("删除失败", OK, "无")
+    latest = items[-1]
+    label = latest.get("name") or latest.get("file_id")
+    return Check(
+        "删除失败",
+        WARN,
+        f"{len(items)} 个后台删除失败，对象已重新出现（最近：{label}：{latest.get('error')}）；"
+        "重新 rm 或检查网络",
+    )
+
+
 def _check_mountpoint(path: Path) -> Check:
-    if not path.exists():
-        return Check("挂载点", WARN, f"不存在：{path}")
+    plan = mountopts.inspect_mountpoint(str(path))
+    if plan.action == mountopts.BLOCKED:
+        detail = plan.detail + (f"；修复：{plan.fix}" if plan.fix else "")
+        return Check("挂载点", FAIL, detail)
+    if plan.action == mountopts.NEED_ROOT:
+        return Check("挂载点", FAIL, f"{plan.detail}；修复：{plan.fix}")
+    if plan.action == mountopts.CREATE:
+        return Check("挂载点", WARN, f"还不存在，挂载时会自动创建：{path}")
     if os.path.ismount(path):
         return Check("挂载点", OK, f"已挂载：{path}")
     return Check("挂载点", WARN, f"存在但未挂载：{path}")
+
+
+def _check_share(allow_other: bool, mountpoint: Path) -> List[Check]:
+    if not allow_other:
+        return [Check("共享访问", OK, "仅当前用户（allow_other 未开启）")]
+    checks: List[Check] = []
+    conf = mountopts.fuse_conf_path()
+    if mountopts.user_allow_other_enabled():
+        checks.append(Check("user_allow_other", OK, str(conf)))
+    else:
+        checks.append(
+            Check(
+                "user_allow_other",
+                FAIL,
+                f"{conf} 里没有 user_allow_other；修复："
+                f"{mountopts.enable_user_allow_other_command(conf)}",
+            )
+        )
+    gaps = mountopts.traversal_gaps(mountpoint)
+    if gaps:
+        shown = "、".join(str(directory) for directory in gaps[:3])
+        checks.append(
+            Check("父目录可穿越", WARN, f"{shown} 缺 o+x，其他用户可能进不来")
+        )
+    else:
+        checks.append(Check("父目录可穿越", OK, "从 / 到挂载点父目录都有 o+x"))
+    checks.append(Check("共享语义", OK, "只读：文件 0644 / 目录 0755，其他用户不能写"))
+    return checks
 
 
 def run_checks(mountpoint: Optional[Path] = None, skip_api: bool = False) -> List[Check]:
@@ -206,6 +254,10 @@ def run_checks(mountpoint: Optional[Path] = None, skip_api: bool = False) -> Lis
         checks.extend(_check_api())
     if mountpoint is not None:
         checks.append(_check_mountpoint(mountpoint))
+    checks.extend(
+        _check_share(bool(saved.allow_other) if saved else False, mountpoint or Path("."))
+    )
+    checks.append(_check_delete_failures())
     checks.append(Check("rm 模式", OK, "永久删除" if config.RM_PERMANENT else "回收站"))
     checks.append(Check("冲突策略", OK, config.CONFLICT_MODE))
     return checks

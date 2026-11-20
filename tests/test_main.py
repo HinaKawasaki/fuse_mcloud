@@ -192,7 +192,7 @@ def _save_config(tmp_path, monkeypatch):
     return config
 
 
-def test_status_without_config(tmp_path, monkeypatch, capsys):
+def test_status_without_config_prints_hint(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(tmp_path / "missing.json"))
     assert mcloud_main._status() == 0
     assert "未配置" in capsys.readouterr().out
@@ -239,3 +239,227 @@ def test_parse_args_uses_config_defaults(tmp_path):
     assert args.mountpoint == config.mountpoint
     assert args.cache_dir == config.cache_dir
     assert args.root == "/"
+
+
+def test_parse_args_reads_allow_other_from_config(tmp_path):
+    cfg = mcloud_main.userconfig.UserConfig(
+        mountpoint=str(tmp_path / "mnt"),
+        cache_dir=str(tmp_path / "cache"),
+        allow_other=True,
+    )
+    assert mcloud_main.parse_args([], cfg).allow_other is True
+    assert mcloud_main.parse_args(["--no-allow-other"], cfg).allow_other is False
+
+
+def test_parse_args_allows_overriding_share_from_cli(tmp_path):
+    cfg = mcloud_main.userconfig.UserConfig(
+        mountpoint=str(tmp_path / "mnt"),
+        cache_dir=str(tmp_path / "cache"),
+        allow_other=False,
+    )
+    assert mcloud_main.parse_args(["--allow-other"], cfg).allow_other is True
+
+
+def test_prepare_mountpoint_explains_root_required(tmp_path, monkeypatch):
+    """父目录不可写时给出可执行的 sudo 命令，而不是抛 Python 栈。"""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root 能写任何目录")
+    parent = tmp_path / "system"
+    parent.mkdir()
+    os.chmod(parent, 0o555)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            mcloud_main.prepare_mountpoint(parent / "cloud")
+    finally:
+        os.chmod(parent, 0o755)
+    message = str(excinfo.value.code)
+    assert "sudo install -d" in message
+
+
+# --------------------------------------------------------- CLI 不依赖 pyfuse3
+
+
+def test_cli_works_without_pyfuse3():
+    """`--version` / `status` / `setup` 不该因为没装 FUSE 就 ModuleNotFoundError。"""
+    import subprocess
+    import sys
+
+    code = '''
+import builtins
+real_import = builtins.__import__
+
+def blocked(name, *args, **kwargs):
+    if name == "pyfuse3":
+        raise ImportError("blocked in test")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = blocked
+import mcloud_fuse.main as m
+raise SystemExit(m.cli(["--version"]))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "mcloud-fuse" in result.stdout
+
+
+def test_mount_reports_missing_fuse_dependencies(monkeypatch):
+    """缺依赖时给一句能照做的提示，而不是 traceback。"""
+    def boom():
+        raise SystemExit("❌ 缺少挂载依赖：pyfuse3\n   安装：apt-get install fuse3")
+
+    monkeypatch.setattr(mcloud_main, "_require_mount_dependencies", boom)
+    assert mcloud_main._mount([]) == 1
+
+
+# ------------------------------------------------------------- service 子命令
+
+
+def _make_config_file(tmp_path, monkeypatch, **overrides):
+    from mcloud_fuse import userconfig
+
+    values = {
+        "mountpoint": str(tmp_path / "mnt"),
+        "cache_dir": str(tmp_path / "cache"),
+        "install_service": True,
+    }
+    values.update(overrides)
+    path = tmp_path / "config.json"
+    userconfig.save(userconfig.UserConfig(**values), path)
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(path))
+    return path
+
+
+def test_service_status_prints_unit_and_mount(tmp_path, monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    _make_config_file(tmp_path, monkeypatch)
+    monkeypatch.setattr(service, "unit_path", lambda: tmp_path / "mcloud-fuse.service")
+    monkeypatch.setattr(service, "status_text", lambda: "未安装")
+    monkeypatch.setattr("mcloud_fuse.main.os.path.ismount", lambda path: False)
+
+    assert mcloud_main.cli(["service", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "服务单元" in out and "未安装" in out and "[未挂载]" in out
+
+
+def test_service_uninstall_dispatches(tmp_path, monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    calls = []
+
+    def fake_uninstall():
+        calls.append("uninstall")
+        return service.ServiceResult(True, "用户服务已卸载")
+
+    monkeypatch.setattr(service, "uninstall", fake_uninstall)
+
+    assert mcloud_main.cli(["service", "uninstall", "--yes"]) == 0
+    assert calls == ["uninstall"]
+    assert "已卸载" in capsys.readouterr().out
+
+
+def test_service_install_uses_saved_config(tmp_path, monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    _make_config_file(tmp_path, monkeypatch)
+    monkeypatch.setattr(service, "available", lambda: True)
+    seen = []
+
+    def fake_install(config):
+        seen.append(config.mountpoint)
+        return service.ServiceResult(True, "已安装")
+
+    monkeypatch.setattr(service, "install", fake_install)
+    assert mcloud_main.cli(["service", "install"]) == 0
+    assert seen == [str(tmp_path / "mnt")]
+
+
+def test_service_restart_dispatches(monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    monkeypatch.setattr(service, "restart", lambda: service.ServiceResult(True, "服务已重启"))
+
+    assert mcloud_main.cli(["service", "restart"]) == 0
+    assert "已重启" in capsys.readouterr().out
+
+
+def test_service_requires_systemd(monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    monkeypatch.setattr(service, "available", lambda: False)
+    assert mcloud_main.cli(["service", "restart"]) == 1
+    assert "systemctl" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ status / unmount
+
+
+def test_status_reports_share_and_delete_failures(tmp_path, monkeypatch, capsys):
+    import json
+
+    _make_config_file(tmp_path, monkeypatch)
+    monkeypatch.setenv("MCLOUD_STATE_DIR", str(tmp_path / "state"))
+    failures = tmp_path / "failures.json"
+    failures.write_text(
+        json.dumps([{"file_id": "f1", "name": "/a.txt", "error": "网关错误"}]), encoding="utf-8"
+    )
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(failures))
+
+    assert mcloud_main._status([]) == 0
+    out = capsys.readouterr().out
+    assert "共享访问" in out
+    assert "删除失败" in out and "/a.txt" in out
+
+
+def test_status_without_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(tmp_path / "missing.json"))
+    assert mcloud_main._status([]) == 0
+    assert "未配置" in capsys.readouterr().out
+
+
+def test_unmount_when_not_mounted(tmp_path, monkeypatch, capsys):
+    from mcloud_fuse import service
+
+    _make_config_file(tmp_path, monkeypatch)
+    monkeypatch.setattr(service, "is_active", lambda: False)
+    monkeypatch.setattr("mcloud_fuse.main.os.path.ismount", lambda path: False)
+
+    assert mcloud_main._unmount() == 0
+    assert "挂载点未挂载" in capsys.readouterr().out
+
+
+def test_unmount_runs_fusermount_and_reports(tmp_path, monkeypatch, capsys):
+    import types
+
+    from mcloud_fuse import service
+
+    _make_config_file(tmp_path, monkeypatch)
+    monkeypatch.setattr(service, "is_active", lambda: False)
+    states = {"mounts": 1}
+
+    def fake_ismount(path):
+        return states["mounts"] > 0
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        states["mounts"] -= 1
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("mcloud_fuse.main.os.path.ismount", fake_ismount)
+    monkeypatch.setattr(mcloud_main.subprocess, "run", fake_run)
+
+    assert mcloud_main._unmount() == 0
+    assert calls and calls[0][0].endswith("fusermount3")
+    assert "已卸载" in capsys.readouterr().out

@@ -49,7 +49,7 @@ mcloud-fuse
 ## 首次设置向导
 
 ```
-┌ mcloud-fuse 首次设置 ───────────────────────────── 步骤 2/7 ┐
+┌ mcloud-fuse 首次设置 ───────────────────────────── 步骤 2/8 ┐
 │                                                              │
 │  访问令牌                                                    │
 │  令牌等同于账号访问权，只保存在本机 0600 文件里。            │
@@ -66,12 +66,46 @@ mcloud-fuse
 | 步骤 | 会问什么 | 默认 |
 | --- | --- | --- |
 | 1 | 访问令牌：浏览器里的 `Authorization: Basic ...` 或整段 cURL | 已有则复用 |
-| 2 | 挂载点：云盘内容出现在哪个目录 | `~/mnt/mcloud` |
-| 3 | 云盘范围：整个云盘，或某个目录的路径（如 `/Photos/2026`） | 整个云盘 |
-| 4 | 缓存目录：读缓存与写回暂存 | `/tmp/cmcloud-fuse` |
-| 5 | 删除方式：永久删除 / 移入回收站 | 永久删除 |
-| 6 | 覆盖写冲突：另存副本 / 报错 | 另存副本 |
-| 7 | 启动方式：systemd 用户服务 / 仅保存配置 | 安装服务 |
+| 2 | 挂载点：家目录 / `/mnt/mcloud` / 自定义，需要 root 时向导带你 sudo | `~/mnt/mcloud` |
+| 3 | 共享访问：仅自己，或其他本地用户只读（`allow_other`） | 仅自己 |
+| 4 | 云盘范围：整个云盘，或某个目录的路径（如 `/Photos/2026`） | 整个云盘 |
+| 5 | 缓存目录：读缓存与写回暂存 | `/tmp/cmcloud-fuse` |
+| 6 | 删除方式：永久删除 / 移入回收站 | 永久删除 |
+| 7 | 覆盖写冲突：另存副本 / 报错 | 另存副本 |
+| 8 | 启动方式：systemd 用户服务 / 仅保存配置 | 安装服务 |
+
+### 挂载点放哪都行，需要时再开共享
+
+- **挂载点是任意绝对路径**：`~/mnt/mcloud`、`/mnt/mcloud`、`/srv/cloud` 都行。
+  放到 `/mnt`、`/srv` 这类系统目录时，向导会带你执行一次（只这一次）：
+
+  ```bash
+  sudo install -d -m 755 -o "$USER" -g "$(id -gn)" /mnt/mcloud
+  ```
+
+  之后挂载、卸载、systemd 用户服务都不再需要 root。
+- **共享访问默认关闭**。第 3 步选「其他本地用户可读」后，挂载时会加
+  `allow_other` + `default_permissions`：
+
+  | 谁 | 能做什么 |
+  | --- | --- |
+  | 当前用户 | 读写，和原来一样 |
+  | 其他本地用户 | 只读：`ls`、`cp` 读文件可以；写、删、改名被内核拒绝 |
+  | 网页端 / 手机 App | 不受影响，仍是账号内全权 |
+
+  两个前提（向导会逐条检查，能自动修的只用一条 sudo）：
+
+  1. `/etc/fuse.conf` 里要有 `user_allow_other` —— 非 root 挂载的硬性要求；
+  2. 从 `/` 到挂载点父目录的每一级都要有 `o+x`。`~/mnt/mcloud` 经常因为
+     `$HOME` 是 `0700` 而失败，这种情况把挂载点放到 `/mnt/mcloud` 更省事。
+
+  临时开关不必重跑向导：
+
+  ```bash
+  mcloud-fuse mount --allow-other       # 只这一次开启共享
+  mcloud-fuse mount --no-allow-other    # 只这一次关掉
+  mcloud-fuse doctor                    # 检查 user_allow_other 与父目录 o+x
+  ```
 
 **怎么拿 token**：
 
@@ -144,10 +178,12 @@ mcloud-fuse setup --no-tui --yes \
 | --- | --- |
 | `mcloud-fuse` | 挂载（未配置或 token 失效时自动进入向导） |
 | `mcloud-fuse mount` | 显式挂载；可临时覆盖 `--mountpoint` / `--root` / `--cache-dir` |
+| `mcloud-fuse mount --allow-other` | 本次挂载允许本机其他用户只读访问 |
 | `mcloud-fuse unmount` | 卸载；必要时先停 systemd 用户服务 |
 | `mcloud-fuse status` | 配置、挂载状态、token 到期时间、服务状态 |
 | `mcloud-fuse token status \| refresh` | 查看 token 剩余时间 / 尝试自动续期 |
 | `mcloud-fuse setup` | 重新运行设置向导 |
+| `mcloud-fuse service status \| install \| restart \| uninstall` | 管理 systemd 用户服务（不碰配置与 token） |
 | `mcloud-fuse journal list \| forget \| gc \| retry` | 写回日志查看 / 清理 / 补传 |
 | `mcloud-fuse doctor` | 环境、网络、配额自检 |
 | `mcloud-fuse trash list \| restore \| empty` | 回收站查看 / 恢复 / 清空 |
@@ -179,6 +215,7 @@ mcloud-fuse mount --root /Photos/2026
   "rm_mode": "delete",
   "conflict": "copy",
   "install_service": true,
+  "allow_other": false,
   "version": 1
 }
 ```
@@ -186,7 +223,7 @@ mcloud-fuse mount --root /Photos/2026
 `root` 可以是 `/`、`/Photos/2026` 这样的云盘路径，也可以是旧版直接填的 fileId
 （包括 `/synbox` 这类以 `/` 开头的特殊值；路径解析失败时会回退为 fileId）。
 命令行 `--root` 只覆盖本次挂载，不会写回配置；想长期只挂某个目录，重新运行
-`mcloud-fuse setup` 改第 3 步。
+`mcloud-fuse setup` 改第 4 步。
 
 环境变量优先于配置文件，常用覆盖：
 
@@ -213,6 +250,7 @@ mcloud-fuse mount --root /Photos/2026
 | `MCLOUD_STOP_EXTEND_MAX_SEC` | `30` | 关机时向 systemd 申请延长停止超时的上限 |
 | `MCLOUD_RM_MODE` | `delete` | `delete`=真删；`trash`=进回收站 |
 | `MCLOUD_CONFLICT` | `copy` | 覆盖写冲突：`copy` 另存副本；`error` 返回 ESTALE |
+| `MCLOUD_ALLOW_OTHER` | `0` | 本机其他用户只读访问（需 `/etc/fuse.conf` 的 `user_allow_other`） |
 | `MCLOUD_API_MAX_CONCURRENT` | `3` | API 最大并发 |
 | `MCLOUD_API_RPS` | `5` | 每秒请求上限 |
 | `MCLOUD_EAGER_DOWNLOAD_LIMIT` | `0` | `0`=所有文件按需读；>0 时只对大文件按需读 |
@@ -292,6 +330,9 @@ mcloud-fuse journal retry                # 未挂载时手动补传 pending
 | `未找到 Web token` | 运行 `mcloud-fuse setup`，重新粘贴 token |
 | `token 已过期` / 401 | 浏览器刷新云盘页面后重新复制；确认是 `file/list` 的 Authorization |
 | `token 续期被拒绝` | 续期接口可能需要设备指纹，直接重新导入 token |
+| 写入报 `ENOSPC` | 本地写回盘满：清 `/tmp/cmcloud-fuse` 或调大 `MCLOUD_MAX_WRITE_BACK_MB` |
+| `rm` 后文件又出现在 `ls` 里 | 后台删除失败（网络/权限），已记入 `mcloud-fuse status`；重新 `rm` 即可 |
+| 读写偶发 `EAGAIN` | 接口限流（HTTP 429）：降低 `MCLOUD_API_RPS` / `MCLOUD_API_MAX_CONCURRENT` |
 | 找不到 `fusermount3` | `sudo apt-get install -y fuse3 libfuse3-dev` |
 | `Device or resource busy` | 有进程停在挂载点，先 `cd` 出去再 `mcloud-fuse unmount` |
 | `Transport endpoint is not connected` | 进程被强杀后的失效挂载：`fusermount3 -uz <挂载点>` |
@@ -310,15 +351,20 @@ mcloud-fuse journal retry                # 未挂载时手动补传 pending
   账号密码，也不会把 token 写进日志或服务单元。
 - **`rm` 默认是永久删除**：`/file/batchDelete` 不进回收站。需要可恢复时设
   `MCLOUD_RM_MODE=trash`，或改配置里的 `rm_mode`。
-- **无随机写**：上传接口要求先给出总大小，所以 `write` 先落本地、`release` 整文件上传。
+- **无随机写**：上传接口要求先给出总大小，所以 `write` 先落本地，`flush` / `fsync` /
+  `release` 时整文件上传；`close(2)` 会带回上传失败的 errno。
 - **tmpfs 重启会丢待上传内容**：日志能保留，但 payload 在 `/tmp`；需要跨重启保住
   写回时改 `MCLOUD_WRITE_BACK_DIR`。
 - **上传按序**：分片必须按 partNumber 顺序发送；不支持跨进程断点续传。
 - **POSIX 语义不完整**：`chmod` / `chown` / 时间戳被忽略；不支持 xattr、符号链接、
-  硬链接、`allow_other`。
+  硬链接。
 - **锁只在本机有效**：`flock` / `fcntl` 由内核在本地维护；跨挂载、跨主机、手机 App /
   网页端都不受约束。
-- **每人一个账号**：一个挂载对应一个账号；共享只读 `allow_other` 不在当前计划。
+- **每人一个账号**：一个挂载对应一个账号。`allow_other` 只做**只读共享**——
+  文件固定 `0644`、目录 `0755`，其他本地用户能读不能写；共享写需要本地 ACL
+  覆盖层，仍在 [ADR-0003](docs/adr/0003-multiuser-and-locking.md) 的「不做」列表里。
+- **共享时 token 仍是私有的**：token 文件 `0600`，其他用户读不到；他们的读写都
+  经过同一挂载进程，云端看到的仍是同一个账号。
 
 ---
 

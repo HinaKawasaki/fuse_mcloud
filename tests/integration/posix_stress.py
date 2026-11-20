@@ -43,7 +43,7 @@ PAD_BYTES = int(os.environ.get("MCLOUD_STRESS_FILE_BYTES", "0"))
 
 
 def file_text(base: str) -> str:
-    if PAD_BYTES <= len(base):
+    if len(base) >= PAD_BYTES:
         return base
     return (base * (PAD_BYTES // len(base) + 1))[:PAD_BYTES]
 

@@ -31,9 +31,14 @@ mcloud-fuse doctor         # 环境/网络/配额自检
 - 提交前请确保：
 
 ```bash
-ruff check mcloud_fuse tests scripts
-ruff format --check mcloud_fuse tests scripts   # 可选：格式化
+ruff check mcloud_fuse tests scripts            # E/F/W/I/B/C4/SIM
+mypy                                           # 配置见 pyproject 的 [tool.mypy]
+coverage run --source=mcloud_fuse -m pytest tests && coverage report
 ```
+
+- `mypy` 只检查 `mcloud_fuse`（`explicit_package_bases`，忽略第三方 stub），
+  门槛是「零错误」；新增模块请顺手补类型标注。
+- 覆盖率门槛 `fail_under = 70`（语句 + 分支），CI 的真实挂载用例会把实际值抬高。
 
 - 导入约定：`mcloud_fuse/` 是常规包，内部一律用绝对导入
   （`from mcloud_fuse.config import ...`）。`tests/**` 与 `scripts/**` 需要先注入

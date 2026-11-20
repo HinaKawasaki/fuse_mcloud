@@ -37,6 +37,8 @@ dev = [
     "pytest-trio>=0.8",
     "pytest-cov>=5.0",
     "ruff>=0.6",
+    "mypy>=1.10,<2",
+    "types-requests>=2.31",
 ]
 
 [project.scripts]
@@ -54,13 +56,26 @@ version = { attr = "mcloud_fuse.version.__version__" }
 [tool.setuptools.packages.find]
 include = ["mcloud_fuse*"]
 
+[tool.mypy]
+python_version = "3.10"
+files = ["mcloud_fuse"]
+explicit_package_bases = true
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
-ignore = ["E501"]
+select = ["E", "F", "W", "I", "B", "C4", "SIM"]
+# E501 由 formatter/评审把关；SIM105 在这里是「尽力清理」的惯用写法，
+# 改成 contextlib.suppress 反而让出错路径更难读。
+ignore = ["E501", "SIM105"]
 
 [tool.ruff.lint.per-file-ignores]
 # 测试与部分脚本需要先把仓库根注入 sys.path 再 import
@@ -78,6 +93,6 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-# v0.4.0 后端重写期间临时下调到 60：旧 Skill 用例已归档，Web 端点的真机
-# 契约测试尚未补齐。补完后应回调到 70，避免覆盖率悄悄回退。
-fail_under = 60
+# 离线单测约 71%（分支+语句），CI 的真实挂载用例会再高几个点；
+# 门槛定在 70，避免覆盖率悄悄回退。
+fail_under = 70

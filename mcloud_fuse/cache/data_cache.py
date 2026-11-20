@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from mcloud_fuse.client.wrapper import CloudItem, DirectClientWrapper
 from mcloud_fuse.config import (
@@ -40,6 +40,30 @@ from mcloud_fuse.journal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_REMOTE_TIME_FORMATS = (
+    ("%Y%m%d%H%M%S", 14),
+    ("%Y-%m-%d %H:%M:%S", 19),
+    ("%Y-%m-%dT%H:%M:%S", 19),
+)
+
+
+def parse_remote_epoch(raw: Optional[str]) -> Optional[float]:
+    """把云端 ``updatedAt`` 解析成 epoch 秒；解析不了返回 None（调用方按「不可信」处理）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    for fmt, width in _REMOTE_TIME_FORMATS:
+        try:
+            moment = time.strptime(text[:width], fmt)
+        except (ValueError, OverflowError):
+            continue
+        try:
+            return time.mktime(moment)
+        except (ValueError, OverflowError):
+            return None
+    return None
 
 
 def _safe_component(name: str) -> str:
@@ -81,10 +105,7 @@ class _PartialFile:
         return sum(stop - begin for begin, stop in self.covered)
 
     def covers(self, start: int, end: int) -> bool:
-        for begin, stop in self.covered:
-            if begin <= start and end <= stop:
-                return True
-        return False
+        return any(begin <= start and end <= stop for begin, stop in self.covered)
 
     def add(self, start: int, end: int) -> None:
         if end <= start:
@@ -412,7 +433,7 @@ class DataCache:
                         "缓存已达上限，但所有条目都被打开的句柄占用，暂缓淘汰"
                     )
                     return
-                oldest_file_id = min(candidates, key=self._access_time.get)
+                oldest_file_id = min(candidates, key=lambda fid: self._access_time.get(fid, 0.0))
             logger.info("缓存超出限额，触发 LRU 淘汰旧文件: file_id=%s", oldest_file_id)
             self.invalidate_file_cache(oldest_file_id)
 
@@ -677,12 +698,19 @@ class DataCache:
         with self._lock:
             return self._journal.lost()
 
-    def rescuable_uploads(self) -> Dict[str, dict]:
-        """真正会在关机抢救里被搬运的条目（pending/uploading 且 payload 存在）。"""
+    def rescuable_uploads(self, *, active_keys: Optional[Iterable[str]] = None) -> Dict[str, dict]:
+        """真正会在关机抢救里被搬运的条目（pending/uploading 且 payload 存在）。
+
+        ``active_keys`` 是仍被写句柄占用的 key：搬走它们会让后续 ``write`` 撞
+        ENOENT，也会把截断后的内容当成完整文件上传，必须排除。
+        """
+        active = set(active_keys or ())
         with self._lock:
             entries = self._journal.entries(PENDING) + self._journal.entries(UPLOADING)
         result = {}
         for entry in entries:
+            if entry.key in active:
+                continue
             if Path(entry.payload_path).exists():
                 result[entry.key] = entry.meta()
         return result
@@ -703,7 +731,9 @@ class DataCache:
             dst.flush()
             os.fsync(dst.fileno())
 
-    def rescue_pending_uploads(self, *, force: bool = False) -> RescueResult:
+    def rescue_pending_uploads(
+        self, *, force: bool = False, active_keys: Optional[Iterable[str]] = None
+    ) -> RescueResult:
         """关机时把待上传 payload 从 tmpfs 复制到持久盘。
 
         - 只处理 ``pending`` / ``uploading``；``building`` 是半成品，绝不上传；
@@ -720,10 +750,15 @@ class DataCache:
             result.reason = "写回目录不在 tmpfs，无需抢救"
             return result
 
+        active = set(active_keys or ())
         with self._lock:
             entries = self._journal.entries(PENDING) + self._journal.entries(UPLOADING)
         candidates = []
         for entry in entries:
+            if entry.key in active:
+                # 句柄还开着：搬走会让后续 write 撞 ENOENT，也会把截断内容当完整文件上传
+                result.skipped.append((entry.key, entry.file_name, 0, "写句柄仍在使用"))
+                continue
             path = Path(entry.payload_path)
             if not path.exists():
                 self._journal.set_state(
@@ -949,7 +984,9 @@ class DataCache:
             if initial_path is not None and Path(initial_path).exists():
                 shutil.copyfile(initial_path, target)
             else:
-                target.touch()
+                # 必须用 O_TRUNC：万一 key 被复用，残留的旧内容会留在尾部被一起上传
+                with open(target, "wb"):
+                    pass
             # 让日志里的「pending」在数据真正落盘之后才出现
             with open(target, "rb") as handle:
                 os.fsync(handle.fileno())
@@ -1042,26 +1079,56 @@ class DataCache:
         self.register_cache_file(file_id, cache_path)
         return cache_path
 
+    # 云端时间戳只到秒，本地 mtime 有毫秒；比较时留一点容差。
+    UPLOAD_TIME_SLACK_SEC = 5.0
+
     def _looks_uploaded(self, entry: JournalEntry) -> bool:
-        """保守核对：目标目录里存在同名、同大小、且不是旧基线的文件。"""
+        """保守核对：只有能「证明」这次上传已经落地时才返回 True。
+
+        判据（必须同时满足）：
+
+        1. 目标目录里存在同名、同大小的对象；
+        2. 覆盖写（有真实 ``base_file_id``）：远端仍是同一个 fileId，但 ``updatedAt``
+           已经不是我打开时的基线 —— 说明打开之后有人写成功，只可能是这次上传；
+        3. 新建文件（base 是 ``pending-*``）：远端对象的 ``updatedAt`` 不早于 payload
+           的落盘时间（留 :attr:`UPLOAD_TIME_SLACK_SEC` 容差）。
+
+        任何一项无法证明（时间戳缺失/解析失败/对不上）一律返回 False：宁可重传
+        一次（可能多出一个冲突副本），也不能把没上传成功的写回当成成功删掉。
+        """
         path = Path(entry.payload_path)
-        if not path.exists():
-            return False
         try:
-            size = path.stat().st_size
+            stat_result = path.stat()
+        except OSError:
+            return False
+        size = stat_result.st_size
+        payload_mtime = stat_result.st_mtime
+        try:
             items = self.wrapper.list_directory(entry.target_dir_id, page_limit=200)
         except Exception:  # noqa: BLE001 - 核对失败就退回重传，宁可多传不丢
             return False
+
+        has_real_base = bool(entry.base_file_id) and not str(
+            entry.base_file_id
+        ).startswith("pending-")
         for item in items:
-            same_name = item.name == entry.file_name or item.name.startswith(
-                entry.file_name + ".conflict-"
-            )
-            if not same_name or int(item.size or 0) != size:
+            if item.name != entry.file_name or int(item.size or 0) != size:
                 continue
-            if entry.base_file_id and item.file_id == entry.base_file_id:
+            remote_epoch = parse_remote_epoch(item.updated_at)
+            if has_real_base:
+                if item.file_id != entry.base_file_id:
+                    continue  # 同名同大小，但已经不是我们打开的那个对象
                 if not entry.base_updated_at or item.updated_at == entry.base_updated_at:
                     continue  # 还是上传前的旧对象
-            return True
+                if remote_epoch is None or remote_epoch + self.UPLOAD_TIME_SLACK_SEC < payload_mtime:
+                    # updatedAt 变过，但比我们写完的时间还早：多半是别的设备改的，
+                    # 不能当成这次上传的证据。
+                    continue
+                return True
+            if remote_epoch is None:
+                continue  # 没有可信时间戳，证明不了，交给重传
+            if remote_epoch + self.UPLOAD_TIME_SLACK_SEC >= payload_mtime:
+                return True
         return False
 
     def close(self) -> None:

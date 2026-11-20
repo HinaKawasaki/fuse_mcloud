@@ -141,24 +141,31 @@ read(fh, off, size)
 
 ```text
 create()/open(O_WRONLY)
-  └─ create_write_buffer()        新建 .wb，日志状态 building
+  └─ create_write_buffer(key)     新建 .wb（O_TRUNC），日志状态 building
+     key = inode-N-<随机后缀>     每个写句柄一条，互不覆盖
 
 write(fh, off, data)
   └─ 直接写 .wb；检查写回上限 + 剩余空间（ENOSPC）
 
-fsync(fh)
+flush(fh) / fsync(fh)
   └─ mark ready → uploading → 上传 → 清日志，保留 .wb
+       └─ flush 在 close(2) 时调用：它的错误会回给应用（release 的错误会被内核丢弃）
 
 release(fh)
-  └─ mark ready → uploading → 上传 → remap fileId → finalize
+  └─ 需要时再上传 → remap fileId → finalize
        └─ .wb 改名进读缓存（同文件系统零拷贝；跨文件系统回退拷贝）
 ```
 
 要点：
 
 - 写回日志状态：`building → pending → uploading → uploaded/清除`；
+- **每个写句柄一条 key**：同一 inode 可以被并发打开写，各自一份 `.wb` 与日志，
+  谁也不会覆盖谁；inode 号跨会话复用也不会撞上上一轮的残留；
+- 新建暂存用 `O_TRUNC`，绝不在旧 payload 的尾部续写；
 - 崩溃在 `building` 阶段不会上传半成品；
-- 上传成功后再清日志；`uploading` 崩溃由下次启动核对远端同名同大小文件；
+- 上传成功后再清日志；`uploading` 崩溃由下次启动**证明式核对**（见下）；
+- `flush` 之后若继续写，会立刻用新基线重新登记 `building`，崩溃时按半成品
+  标 `lost`，不会被误当成已上传；
 - 云盘要求先给总大小，所以必须整文件落本地后上传，**不支持随机写**；
 - 分片大小默认 100MiB，严格按序上传；失败重试，末片后 `file/complete`；
 - 覆盖写冲突：提交前比对 `updatedAt`，默认另存 `name.conflict-<host>-<ts>`，
@@ -174,8 +181,15 @@ trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 ```
 
 - 删除是**真删除**，不是墓碑；
-- `batchDelete` / `batchMove` 返回 `taskId`，必须等任务结束再返回，避免 `rm` 后
+- `batchDelete` / `batchMove` 返回 `taskId`，客户端等任务结束才返回，避免 `rm` 后
   对象又出现在下一次 `ls`；
+- 但 FUSE 层是**批量优先**：`unlink` 只把 fileId 放进隐藏集与后台队列，
+  `rm -rf` 不会逐个等网络（`DELETE_BATCH_MAX=100`）；
+- 后台失败按 0.5s / 1s 退避重试，最多 3 次；`404` 视为成功（对象已经不在了），
+  `403` / 鉴权失败不重试；
+- 最终失败时**对象从隐藏集移除**——它会重新出现在 `ls` 里（云端确实没删掉），
+  同时写一条 `~/.local/state/mcloud-fuse/delete-failures.json`，
+  `mcloud-fuse status` / `doctor` 会显示；再次 `rm` 成功会清掉该记录；
 - 网页端删除的对象也出现在回收站 CLI 里。
 
 ## SQLite 写回日志与恢复
@@ -184,7 +198,7 @@ trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 
 | 字段 | 说明 |
 | --- | --- |
-| `key` | 本地写回 key（通常 `inode-N`） |
+| `key` | 本地写回 key（`inode-N-<随机后缀>`，每个写句柄一条） |
 | `target_dir_id` / `file_name` | 目标目录与文件名 |
 | `payload_path` | `.wb` 或 rescue 文件路径 |
 | `base_file_id` / `base_updated_at` | 覆盖写冲突基线 |
@@ -193,7 +207,10 @@ trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 
 启动时后台补传：
 
-1. `uploading`：先核对远端是否有同名同大小对象；有则清日志，避免重复上传；
+1. `uploading`：**只有能证明上传落地**才清日志——覆盖写要求远端仍是同一个
+   fileId 且 `updatedAt` 已变化、晚于 payload 落盘；新建文件要求远端对象的
+   `updatedAt` 不早于 payload 的 mtime（5 秒容差）。时间戳缺失/对不上一律
+   退回 `pending` 重传：宁可多一个冲突副本，也不能把没上传的写回当成功删掉；
 2. `building`：半成品，标记 `lost`，不上传；
 3. `pending` / `rescued`：从 payload 路径补传；成功转读缓存并清日志；
 4. payload 不存在：标记 `lost`，保留记录供 `journal list` 查看。
@@ -206,7 +223,8 @@ trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 
 1. 通过 `sd_notify` 申请一次有界停止延时（默认最多 30 秒）；
 2. 只挑 `pending` / `uploading`，按大小从小到大复制到
-   `~/.local/state/mcloud-fuse/rescue/<hash>/`；
+   `~/.local/state/mcloud-fuse/rescue/<hash>/`；**仍被写句柄占用的 key 跳过**
+   （搬走会让后续 `write` 撞 `ENOENT`，也会把截断内容当完整文件上传）；
 3. `.part` + `fsync` + 原子 `rename`，更新日志 `payload_path`，状态 `rescued`；
 4. 超时/超单文件/超总量/空间不足就跳过，记录原因；`building` 不搬；
 5. 下次启动从持久盘补传。
@@ -227,16 +245,25 @@ trash：/recyclebin/batchTrash → 可在 mcloud-fuse trash 恢复
 ## 限流、重试与错误映射
 
 - `RateLimiter`：并发 3 + 5 RPS（可环境变量覆盖）。
-- `retry_call`：指数退避 + 抖动；权限/入参错误不重试。
-- `MCloudFuseOps._to_fuse_error`：
+- `requests` 连接层：`Retry(connect=2, read=0, status=0)`，只重试「连接没建起来」，
+  已发出的 POST 不会被重发。
+- `retry_call`：指数退避 + 抖动，接入**幂等读**——目录列举、配额、`get_file` /
+  `batch_get`、下载地址、任务轮询；5xx / 408 / 429 最多 3 次，4xx 与鉴权失败
+  立即返回。创建 / 上传 / 删除 / 移动不自动重试（重发可能重复建对象）。
+- `MCloudFuseOps._to_fuse_error` 优先用 `MCloudAPIException.errno_hint`
+  （由 HTTP 状态 / 业务码算出），没有结构化信息才退回消息匹配：
 
-| 内部异常 | errno |
+| HTTP / 情况 | errno |
 | --- | --- |
-| 鉴权失败 / token 过期 | `EACCES` |
-| 不存在 | `ENOENT` |
-| 已存在 | `EEXIST` |
-| 写回超过上限 / 磁盘满 | `ENOSPC` |
-| 其它 API 异常 | `EIO` |
+| 401 / 403 / token 过期 | `EACCES` |
+| 404 / 410 | `ENOENT` |
+| 409 | `EEXIST` |
+| 412 | `ESTALE` |
+| 413 | `EFBIG` |
+| 423 / 503 | `EBUSY` |
+| 425 / 429 | `EAGAIN` |
+| 507 / 本地盘满 | `ENOSPC` |
+| 5xx / 未知 | `EIO` |
 
 ## 历史实现
 

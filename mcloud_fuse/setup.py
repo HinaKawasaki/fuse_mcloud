@@ -14,12 +14,13 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from mcloud_fuse import service, token_status, tokens, tui, userconfig
+from mcloud_fuse import mountopts, service, token_status, tokens, tui, userconfig
 from mcloud_fuse.client.web139 import (
     Web139Auth,
     Web139AuthError,
@@ -29,7 +30,7 @@ from mcloud_fuse.client.web139 import (
 )
 from mcloud_fuse.userconfig import UserConfig
 
-STEP_TOTAL = 7
+STEP_TOTAL = 8
 
 TOKEN_INSTRUCTIONS = (
     "请先在浏览器里拿到 token：",
@@ -74,22 +75,50 @@ def _is_within(child: str, parent: str) -> bool:
 
 
 def validate_mountpoint(value: str) -> Optional[str]:
-    if not value.strip():
-        return "挂载点不能为空"
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        return "请填绝对路径，例如 ~/mnt/mcloud"
-    if str(path) == os.path.sep:
-        return "不能把云盘挂载到 /"
-    if os.path.ismount(path):
-        return f"{path} 已经是一个挂载点；请先卸载或换一个目录"
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return f"无法创建挂载点：{exc}"
-    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
-        return f"{path} 当前用户不可读写"
-    return None
+    """校验并尽可能创建挂载点；需要 root 时把 sudo 命令一起带回来。"""
+    plan = mountopts.inspect_mountpoint(value)
+    if plan.action == mountopts.CREATE:
+        plan = mountopts.create_mountpoint(plan)
+    if plan.ok:
+        return None
+    message = plan.detail
+    if plan.fix:
+        message += f"\n   修复：{plan.fix}"
+    return message
+
+
+def ensure_share(mountpoint: str, enabled: bool, assume_yes: bool) -> bool:
+    """行模式下确认 allow_other 的前置条件；返回最终要不要开启。"""
+    if not enabled:
+        return False
+    target = Path(mountpoint)
+    problems = mountopts.share_problems(target)
+    blocking = [problem for problem in problems if problem.fatal]
+    if blocking:
+        for problem in blocking:
+            print(f"⚠️  {problem.detail}", file=sys.stderr)
+            print(f"   修复：{problem.fix}", file=sys.stderr)
+        if (
+            sys.stdin.isatty()
+            and not assume_yes
+            and _confirm("现在执行上面的 sudo 命令", True, False)
+        ):
+            try:
+                subprocess.run(mountopts.enable_user_allow_other_argv(), check=False)
+            except OSError as exc:
+                print(f"❌ 执行 sudo 失败：{exc}", file=sys.stderr)
+        problems = mountopts.share_problems(target)
+        if any(problem.fatal for problem in problems):
+            print(
+                "⚠️  未开启共享访问：先解决上面的前置条件，再重新运行 mcloud-fuse setup。",
+                file=sys.stderr,
+            )
+            return False
+    for problem in problems:
+        if not problem.fatal:
+            print(f"⚠️  {problem.detail}", file=sys.stderr)
+            print(f"   修复：{problem.fix}", file=sys.stderr)
+    return True
 
 
 def validate_cache(value: str, mountpoint: str = "") -> Optional[str]:
@@ -319,6 +348,9 @@ def run_line(plan: SetupPlan, args: argparse.Namespace) -> int:
 
     if not args.yes:
         mountpoint = _prompt_value("挂载点", cfg.mountpoint, validate_mountpoint, args.yes)
+        share = _confirm(
+            "允许本机其他用户只读访问（allow_other）", cfg.allow_other, args.yes
+        )
         root = _prompt_value(
             "云盘路径（/ 表示整个云盘，如 /Photos/2026）", cfg.root, validate_root, args.yes
         )
@@ -346,6 +378,7 @@ def run_line(plan: SetupPlan, args: argparse.Namespace) -> int:
             cache_dir=_absolute(cache_dir),
             rm_mode=rm_mode,
             conflict=conflict,
+            allow_other=share,
         )
         if service.available() and not args.no_service:
             cfg = cfg.with_changes(
@@ -355,6 +388,9 @@ def run_line(plan: SetupPlan, args: argparse.Namespace) -> int:
             cfg = cfg.with_changes(install_service=False)
     if not service.available():
         cfg = cfg.with_changes(install_service=False)
+    # 统一在这里确认 allow_other 的前置条件：交互终端可以现场 sudo，
+    # 非交互（--yes / 管道）缺条件时降级为「仅自己」并打印原因。
+    cfg = cfg.with_changes(allow_other=ensure_share(cfg.mountpoint, cfg.allow_other, args.yes))
     plan.config = cfg
 
     results = execute(plan, lambda name, index, total: print(f"→ [{index + 1}/{total}] {name} ..."))
@@ -381,6 +417,7 @@ class _Wizard:
         steps = [
             self.step_token,
             self.step_mountpoint,
+            self.step_share,
             self.step_root,
             self.step_cache,
             self.step_rm_mode,
@@ -395,7 +432,7 @@ class _Wizard:
             except tui.Back:
                 if index == 0:
                     if not self.welcome():
-                        raise tui.Cancelled()
+                        raise tui.Cancelled() from None
                 else:
                     index -= 1
         while True:
@@ -419,6 +456,9 @@ class _Wizard:
         lines = [
             "向导会导入 token、选挂载点/缓存/云盘范围、写配置，",
             "并可选安装 systemd --user 服务（登录后自动挂载）。",
+            "",
+            "第 2 步可以把挂载点放到 /mnt/mcloud 这类系统目录（用 sudo 创建一次），",
+            "第 3 步决定本机其他用户能否只读访问。",
             "",
             "注意：Web 接口是第三方逆向接口，不在厂商授权范围内；",
             "账号风控与接口漂移风险由使用者承担（docs/adr/0002）。",
@@ -535,20 +575,208 @@ class _Wizard:
             return
 
     def step_mountpoint(self) -> None:
-        value = self.screen.input(
-            step=2,
+        default = str(userconfig.default_mountpoint())
+        current = self.plan.config.mountpoint
+        if current.rstrip("/") == "/mnt/mcloud":
+            selected = 1
+        elif current == default:
+            selected = 0
+        else:
+            selected = 2
+        while True:
+            choice = self.screen.menu(
+                step=2,
+                total=STEP_TOTAL,
+                title="挂载点",
+                subtitle="云盘内容会出现在这个目录；不存在时会按这里的选项创建。",
+                items=[
+                    ("家目录（推荐）", f"{default}；只给自己用，不需要 root"),
+                    ("系统目录 /mnt/mcloud", "本机所有用户都能进入；需要 sudo 创建一次"),
+                    ("自定义路径", "任意绝对路径，例如 /srv/cloud 或 /mnt/data/cloud"),
+                ],
+                selected=selected,
+            )
+            if choice == 0:
+                value = default
+            elif choice == 1:
+                value = "/mnt/mcloud"
+            else:
+                value = self.screen.input(
+                    step=2,
+                    total=STEP_TOTAL,
+                    title="挂载点路径",
+                    subtitle="填绝对路径；目录不存在时向导会自动创建。",
+                    default=current,
+                    note="放到 /mnt、/srv 这类系统目录时，向导会用 sudo 建一次并改成你的属主。",
+                )
+                value = _absolute(value)
+            if self._apply_mountpoint(value):
+                return
+            selected = 2
+
+    def _apply_mountpoint(self, value: str) -> bool:
+        """校验/创建挂载点；需要 root 时给出 sudo 选项而不是一句报错。"""
+        while True:
+            plan = mountopts.inspect_mountpoint(value)
+            if plan.action == mountopts.CREATE:
+                plan = mountopts.create_mountpoint(plan)
+            if plan.ok:
+                self.plan.config = self.plan.config.with_changes(mountpoint=str(plan.path))
+                if plan.warnings:
+                    self.screen.message(
+                        step=2,
+                        total=STEP_TOTAL,
+                        title="挂载点提示",
+                        lines=list(plan.warnings)
+                        + ["", "挂载后这些内容会被遮住，但不会被删除。"],
+                        kind="warn",
+                    )
+                return True
+            if plan.action == mountopts.BLOCKED:
+                self.screen.message(
+                    step=2,
+                    total=STEP_TOTAL,
+                    title="挂载点不可用",
+                    lines=[plan.detail] + ([f"可尝试：{plan.fix}"] if plan.fix else []),
+                    kind="err",
+                )
+                return False
+
+            choice = self.screen.menu(
+                step=2,
+                total=STEP_TOTAL,
+                title="需要 root 创建",
+                subtitle="只执行一次；之后挂载与卸载都不需要 root。",
+                preamble=[plan.detail, "", "将执行：", f"  {plan.fix}"],
+                items=[
+                    ("用 sudo 创建（会暂时离开界面）", "退出全屏后在正常终端里执行，可能要输密码"),
+                    ("我已经手动建好了，重试", "在另一个终端执行上面的命令后选这个"),
+                    ("换一个路径", "回到上一步重新选"),
+                ],
+            )
+            if choice == 2:
+                return False
+            if choice == 1:
+                continue
+            if not self._run_privileged(
+                mountopts.sudo_prepare_argv(plan.path), step=2, title="创建挂载点"
+            ):
+                continue
+
+    def _run_privileged(self, argv: Sequence[str], *, step: int, title: str) -> bool:
+        """暂时退出 curses 执行 sudo：密码提示要回到正常终端。"""
+        self.screen.suspend()
+        error = ""
+        code = 0
+        try:
+            try:
+                code = subprocess.run(list(argv), check=False).returncode
+            except OSError as exc:
+                error = str(exc)
+        finally:
+            self.screen.resume()
+        if error:
+            self.screen.message(
+                step=step, total=STEP_TOTAL, title=title, lines=[error], kind="err"
+            )
+            return False
+        if code != 0:
+            self.screen.message(
+                step=step,
+                total=STEP_TOTAL,
+                title=title,
+                lines=[
+                    f"命令退出码 {code}：{' '.join(argv)}",
+                    "",
+                    "可以自己在终端里执行同一条命令，然后选「重试」。",
+                ],
+                kind="err",
+            )
+            return False
+        return True
+
+    def step_share(self) -> None:
+        cfg = self.plan.config
+        choice = self.screen.menu(
+            step=3,
             total=STEP_TOTAL,
-            title="挂载点",
-            subtitle="云盘内容会出现在这个目录；目录不存在时会自动创建。",
-            default=self.plan.config.mountpoint,
-            note="提示：如果目录里已有文件，挂载后会被暂时遮住，原文件不会被删除。",
-            validator=validate_mountpoint,
+            title="共享访问",
+            subtitle="挂载默认只有你自己能访问；开启后本机其他用户可只读浏览，写入仍被拒绝。",
+            items=[
+                ("仅自己（推荐）", "不需要 root，也不需要改 /etc/fuse.conf"),
+                (
+                    "其他本地用户可读（allow_other）",
+                    "需要 /etc/fuse.conf 里的 user_allow_other；文件固定 0644、目录 0755",
+                ),
+            ],
+            selected=1 if cfg.allow_other else 0,
         )
-        self.plan.config = self.plan.config.with_changes(mountpoint=_absolute(value))
+        if choice == 0:
+            self.plan.config = self.plan.config.with_changes(allow_other=False)
+            return
+
+        while not mountopts.user_allow_other_enabled():
+            choice = self.screen.menu(
+                step=3,
+                total=STEP_TOTAL,
+                title="还差一步：user_allow_other",
+                subtitle="非 root 挂载时，FUSE 只在 /etc/fuse.conf 允许时才接受 allow_other。",
+                preamble=[
+                    "将执行：",
+                    f"  {mountopts.enable_user_allow_other_command()}",
+                    "",
+                    "只追加一行，不动其它配置。",
+                ],
+                items=[
+                    ("用 sudo 写入（会暂时离开界面）", "sudo 可能要输入密码"),
+                    ("我已经手动改好了，重试", "在另一个终端改完再选这个"),
+                    ("算了，仅自己访问", "保持默认，不需要 root"),
+                ],
+            )
+            if choice == 2:
+                self.plan.config = self.plan.config.with_changes(allow_other=False)
+                return
+            if choice == 1:
+                continue
+            if not self._run_privileged(
+                mountopts.enable_user_allow_other_argv(), step=3, title="写入 /etc/fuse.conf"
+            ):
+                continue
+
+        gaps = mountopts.traversal_gaps(Path(self.plan.config.mountpoint))
+        if gaps:
+            lines = ["这些目录没有 o+x，其他用户在路径解析这一步就会失败：", ""]
+            lines.extend(f"  {directory}" for directory in gaps[:3])
+            lines.extend(["", "逐条修复："])
+            lines.extend(
+                f"  {mountopts.traversal_fix_command(directory)}"
+                for directory in gaps[:3]
+            )
+            lines.extend(
+                [
+                    "",
+                    "把家目录改成 o+x 等于让其他用户能穿过它；只想共享云盘的话，",
+                    "更稳的做法是把挂载点放到 /mnt/mcloud（向导第 2 步）。",
+                ]
+            )
+            choice = self.screen.menu(
+                step=3,
+                total=STEP_TOTAL,
+                title="其他用户可能进不来",
+                items=[
+                    ("仍然开启", "挂载会成功，但别人未必看得到"),
+                    ("改为仅自己", "最省事；之后可以重新运行 setup"),
+                ],
+                preamble=lines,
+            )
+            if choice == 1:
+                self.plan.config = self.plan.config.with_changes(allow_other=False)
+                return
+        self.plan.config = self.plan.config.with_changes(allow_other=True)
 
     def step_root(self) -> None:
         choice = self.screen.menu(
-            step=3,
+            step=4,
             total=STEP_TOTAL,
             title="云盘范围",
             subtitle="默认挂载整个云盘。只挂某个目录时，直接填云盘里的路径即可。",
@@ -561,7 +789,7 @@ class _Wizard:
             self.plan.config = self.plan.config.with_changes(root="/")
             return
         value = self.screen.input(
-            step=3,
+            step=4,
             total=STEP_TOTAL,
             title="目录路径",
             subtitle="从云盘根开始，以 / 开头；旧版填过的 fileId 也可以继续用。",
@@ -578,7 +806,7 @@ class _Wizard:
         except OSError:
             pass
         value = self.screen.input(
-            step=4,
+            step=5,
             total=STEP_TOTAL,
             title="缓存目录",
             subtitle="大文件按需读取与写回上传都依赖它；不要放在挂载点里面。",
@@ -591,7 +819,7 @@ class _Wizard:
     def step_rm_mode(self) -> None:
         current = self.plan.config.rm_mode
         choice = self.screen.menu(
-            step=5,
+            step=6,
             total=STEP_TOTAL,
             title="删除方式",
             subtitle="决定 rm / rmdir 的行为。之后可随时修改配置或设 MCLOUD_RM_MODE 覆盖。",
@@ -608,7 +836,7 @@ class _Wizard:
     def step_conflict(self) -> None:
         current = self.plan.config.conflict
         choice = self.screen.menu(
-            step=6,
+            step=7,
             total=STEP_TOTAL,
             title="覆盖写冲突",
             subtitle="打开写句柄后会记录远端 updatedAt；提交前发现别人改过时怎么办。",
@@ -626,17 +854,17 @@ class _Wizard:
         if not service.available():
             self.plan.config = self.plan.config.with_changes(install_service=False)
             self.screen.message(
-                step=7,
+                step=8,
                 total=STEP_TOTAL,
                 title="启动方式",
                 lines=["当前环境没有 systemd（或 systemctl），将只保存配置。", "", "之后可手动运行 `mcloud-fuse` 挂载。"],
             )
             return
         choice = self.screen.menu(
-            step=7,
+            step=8,
             total=STEP_TOTAL,
             title="启动方式",
-            subtitle="systemd --user 服务会在登录后自动挂载，不需要 root，也不开 allow_other。",
+            subtitle="systemd --user 服务会在登录后自动挂载，不需要 root；挂载点在第 2 步已经建好。",
             items=[
                 ("安装为 systemd 用户服务（推荐）", "开机/登录后自动挂载；用 mcloud-fuse status 查看"),
                 ("只保存配置", "之后手动运行 mcloud-fuse（前台，Ctrl-C 卸载）"),
@@ -654,8 +882,12 @@ class _Wizard:
         )
         auto = "开启" if token_status.auto_refresh_enabled() else "关闭"
         auto_line = f"{auto}；{token_status.cadence_text()}"
+        share_text = (
+            "其他本地用户可读（allow_other）" if cfg.allow_other else "仅当前用户"
+        )
         lines = [
             f"挂载点    {cfg.mountpoint}",
+            f"共享访问  {share_text}",
             f"云盘范围  {'整个云盘' if cfg.root == '/' else cfg.root}",
             f"缓存目录  {cfg.cache_dir}",
             f"删除方式  {'永久删除' if cfg.rm_mode == 'delete' else '移入回收站'}",
@@ -711,10 +943,14 @@ def _run_tui(screen: tui.Screen, plan: SetupPlan, force_token: bool) -> Tuple[Se
         lines.append("配置未完成，请根据上面的错误重试。")
     elif plan.config.install_service:
         lines.append(f"之后可以： ls {plan.config.mountpoint}")
+        if plan.config.allow_other:
+            lines.append(f"其他用户（只读）：ls {plan.config.mountpoint}")
         lines.append("查看状态：mcloud-fuse status    卸载：mcloud-fuse unmount")
     else:
         lines.append("手动挂载：mcloud-fuse")
         lines.append(f"挂载后内容在：{plan.config.mountpoint}")
+        if plan.config.allow_other:
+            lines.append(f"其他用户（只读）：ls {plan.config.mountpoint}")
     screen.message(
         step=STEP_TOTAL,
         total=STEP_TOTAL,
@@ -740,6 +976,19 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser.add_argument("--cache-dir", help="缓存目录（默认 /tmp/cmcloud-fuse）")
     parser.add_argument("--rm-mode", choices=("delete", "trash"), help="删除语义")
     parser.add_argument("--conflict", choices=("copy", "error"), help="覆盖写冲突策略")
+    parser.add_argument(
+        "--allow-other",
+        dest="allow_other",
+        action="store_true",
+        default=None,
+        help="允许本机其他用户只读访问挂载点（需要 /etc/fuse.conf 的 user_allow_other）",
+    )
+    parser.add_argument(
+        "--no-allow-other",
+        dest="allow_other",
+        action="store_false",
+        help="只允许当前用户访问（默认）",
+    )
     parser.add_argument("--no-service", action="store_true", help="不安装 systemd 用户服务")
     parser.add_argument("--no-check-api", action="store_true", help="跳过账号连通性检查")
     parser.add_argument("--no-tui", action="store_true", help="使用逐行提问，不进入全屏界面")
@@ -772,6 +1021,8 @@ def _apply_args(base: UserConfig, args: argparse.Namespace) -> UserConfig:
         changes["conflict"] = args.conflict
     if args.no_service:
         changes["install_service"] = False
+    if args.allow_other is not None:
+        changes["allow_other"] = args.allow_other
     return base.with_changes(**changes) if changes else base
 
 
@@ -783,6 +1034,7 @@ def _print_summary(plan: SetupPlan, results: Sequence[StepResult]) -> None:
         print(f"[{marker}] {result.name}：{result.detail}")
     print(f"配置：{userconfig.config_path()}")
     print(f"挂载点：{plan.config.mountpoint}")
+    print(f"共享访问：{mountopts.describe_share(plan.config.allow_other)}")
     if plan.config.install_service:
         print("查看状态：mcloud-fuse status")
     else:

@@ -40,10 +40,7 @@ SCHEMA = json.loads((CONTRACT_DIR / "schema.json").read_text(encoding="utf-8"))
 def resolve(doc: Any, path: str) -> Any:
     current = doc
     for part in path.split("."):
-        if part.isdigit():
-            current = current[int(part)]
-        else:
-            current = current[part]
+        current = current[int(part)] if part.isdigit() else current[part]
     return current
 
 

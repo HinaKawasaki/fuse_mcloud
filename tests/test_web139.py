@@ -722,3 +722,69 @@ def test_restore_recycle_waits_for_task():
         "fileIds": ["r1", "r2"]
     }
     assert session.calls_to("POST", "/task/get")
+
+
+# ------------------------------------------------------- 幂等读的退避重试
+
+
+def _file_doc(file_id: str = "f9", size: int = 42) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "data": {
+            "fileId": file_id,
+            "name": "x.bin",
+            "type": "file",
+            "size": size,
+            "createdAt": "c",
+            "updatedAt": "u",
+            "parentFileId": "p",
+        },
+    }
+
+
+def test_read_retries_transient_5xx(monkeypatch):
+    """503 这类瞬时失败要退避重试，应用不该看到一个假的 EIO。"""
+    monkeypatch.setattr("mcloud_fuse.router.retry.time.sleep", lambda *_: None)
+    attempts = {"n": 0}
+
+    def flaky(_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise Web139Error("busy", status=503)
+        return FakeResponse(200, _file_doc())
+
+    client, session = make_client({("POST", "/file/get"): flaky})
+    item = client.get_file("f9")
+
+    assert item.file_id == "f9"
+    assert attempts["n"] == 3
+    assert len(session.calls_to("POST", "/file/get")) == 3
+
+
+def test_read_does_not_retry_404(monkeypatch):
+    """404 是确定性失败，重试只会白等。"""
+    monkeypatch.setattr("mcloud_fuse.router.retry.time.sleep", lambda *_: None)
+    attempts = {"n": 0}
+
+    def missing(_kwargs):
+        attempts["n"] += 1
+        raise Web139Error("not found", status=404)
+
+    client, _ = make_client({("POST", "/file/get"): missing})
+    with pytest.raises(Web139Error):
+        client.get_file("f9")
+    assert attempts["n"] == 1
+
+
+def test_read_does_not_retry_auth_error(monkeypatch):
+    monkeypatch.setattr("mcloud_fuse.router.retry.time.sleep", lambda *_: None)
+    attempts = {"n": 0}
+
+    def denied(_kwargs):
+        attempts["n"] += 1
+        raise Web139AuthError("token 失效", status=401)
+
+    client, _ = make_client({("POST", "/file/get"): denied})
+    with pytest.raises(Web139AuthError):
+        client.get_file("f9")
+    assert attempts["n"] == 1

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from mcloud_fuse import doctor, tokens
+from mcloud_fuse import doctor, tokens, userconfig
 from mcloud_fuse import setup as setup_mod
 from mcloud_fuse.client.web139 import Web139AuthError, Web139Token
 from mcloud_fuse.userconfig import UserConfig
@@ -282,3 +282,180 @@ def test_wizard_expired_token_defaults_to_auto_refresh(tmp_path: Path, monkeypat
     ]
     assert screen.menu_kwargs["selected"] == 0
     assert plan.existing_token == new
+
+
+# ------------------------------------------------------- TUI 第 2/3 步（离线）
+
+
+class _ScriptedScreen:
+    """按顺序回放菜单选择；message 只记录不阻塞。"""
+
+    def __init__(self, choices=()):
+        self.choices = list(choices)
+        self.messages = []
+
+    def menu(self, **kwargs):
+        assert self.choices, "界面等待了一个没有排队的菜单选择"
+        return self.choices.pop(0)
+
+    def message(self, **kwargs):
+        self.messages.append(kwargs)
+
+    def progress(self, **kwargs):
+        return None
+
+
+def make_wizard(tmp_path: Path, screen, *, mountpoint=None, allow_other=False):
+    config = make_config(
+        tmp_path,
+        mountpoint=str(mountpoint or (tmp_path / "mnt")),
+        allow_other=allow_other,
+    )
+    return setup_mod._Wizard(screen, setup_mod.SetupPlan(config=config), False)
+
+
+def _conf(tmp_path: Path, text: str = "user_allow_other\n") -> Path:
+    path = tmp_path / "fuse.conf"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_wizard_share_off_is_default(tmp_path: Path):
+    screen = _ScriptedScreen([0])
+    wizard = make_wizard(tmp_path, screen)
+    wizard.step_share()
+    assert wizard.plan.config.allow_other is False
+    assert screen.choices == []
+
+
+def test_wizard_share_on_when_prerequisites_ready(tmp_path, monkeypatch, world_dir):
+    conf = _conf(tmp_path)
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(conf))
+    screen = _ScriptedScreen([1])
+    wizard = make_wizard(tmp_path, screen, mountpoint=world_dir / "cloud")
+    wizard.step_share()
+    assert wizard.plan.config.allow_other is True
+    assert screen.choices == []
+
+
+def test_wizard_share_can_back_out_without_fuse_conf(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(tmp_path / "missing.conf"))
+    screen = _ScriptedScreen([1, 2])  # 选共享（允许 1），再选「算了，仅自己」
+    wizard = make_wizard(tmp_path, screen)
+    wizard.step_share()
+    assert wizard.plan.config.allow_other is False
+
+
+def test_wizard_share_warns_when_home_is_private(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(_conf(tmp_path)))
+    # tmp_path 是 0700：父目录不可穿越，向导应给出提示页并允许改回「仅自己」。
+    screen = _ScriptedScreen([1, 1])
+    wizard = make_wizard(tmp_path, screen, mountpoint=tmp_path / "cloud")
+    wizard.step_share()
+    assert wizard.plan.config.allow_other is False
+    assert screen.choices == []
+
+
+def test_wizard_apply_mountpoint_creates_directory(tmp_path: Path):
+    screen = _ScriptedScreen([])
+    wizard = make_wizard(tmp_path, screen)
+    target = tmp_path / "a" / "b" / "cloud"
+    assert wizard._apply_mountpoint(str(target)) is True
+    assert target.is_dir()
+    assert wizard.plan.config.mountpoint == str(target)
+
+
+def test_wizard_apply_mountpoint_reports_blocked_path(tmp_path: Path):
+    screen = _ScriptedScreen([])
+    wizard = make_wizard(tmp_path, screen)
+    assert wizard._apply_mountpoint("relative/path") is False
+    assert screen.messages and "绝对路径" in screen.messages[-1]["lines"][0]
+
+
+def test_wizard_review_shows_share_state(tmp_path: Path):
+    from mcloud_fuse import tui
+
+    class _ReviewScreen(_ScriptedScreen):
+        def __init__(self):
+            super().__init__([1])  # review 的菜单直接选「重新配置」
+            self.lines = []
+
+        def message(self, **kwargs):
+            self.lines.extend(kwargs.get("lines", []))
+
+        def menu(self, **kwargs):
+            if self.choices:
+                return self.choices.pop(0)
+            raise tui.Back()
+
+    screen = _ReviewScreen()
+    wizard = make_wizard(tmp_path, screen, allow_other=True)
+    action = wizard.review()
+    assert action == "edit"
+    assert any("共享访问" in line and "allow_other" in line for line in screen.lines)
+
+
+def test_ensure_share_line_mode_degrades_without_fuse_conf(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(tmp_path / "missing.conf"))
+    assert setup_mod.ensure_share(str(tmp_path / "mnt"), True, assume_yes=False) is False
+    captured = capsys.readouterr()
+    assert "user_allow_other" in captured.err
+
+
+def test_ensure_share_line_mode_keeps_off_when_disabled(tmp_path):
+    assert setup_mod.ensure_share(str(tmp_path / "mnt"), False, assume_yes=True) is False
+
+
+def test_doctor_share_check_off(tmp_path: Path):
+    checks = doctor._check_share(False, tmp_path)
+    assert len(checks) == 1 and checks[0].status == doctor.OK
+
+
+def test_doctor_share_check_flags_missing_conf(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(tmp_path / "missing.conf"))
+    checks = doctor._check_share(True, tmp_path)
+    assert any(check.status == doctor.FAIL for check in checks)
+    assert any("user_allow_other" in check.detail for check in checks)
+
+
+def test_doctor_share_check_ok_with_conf(tmp_path, monkeypatch, world_dir):
+    monkeypatch.setenv("MCLOUD_FUSE_CONF", str(_conf(tmp_path)))
+    mount = world_dir / "cloud"
+    mount.mkdir()
+    checks = doctor._check_share(True, mount)
+    assert [check.status for check in checks if check.status == doctor.FAIL] == []
+
+
+def test_run_line_saves_config_without_network(tmp_path, monkeypatch, capsys):
+    """行模式 --yes：不提问、不联网，也要把配置写对（CI/脚本的入口）。"""
+    import argparse
+
+    future = int(time.time() * 1000) + 30 * 86400_000
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("MCLOUD_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(tmp_path / "failures.json"))
+
+    cfg = UserConfig(
+        mountpoint=str(tmp_path / "mnt"),
+        cache_dir=str(tmp_path / "cache"),
+        install_service=False,
+    )
+    plan = setup_mod.SetupPlan(
+        config=cfg,
+        existing_token=Web139Token("pc", "13800138000", f"v1|sig|opaque|{future}"),
+        verify_api=False,
+    )
+    args = argparse.Namespace(
+        refresh_token=False,
+        force_token=False,
+        token_stdin=False,
+        yes=True,
+        no_service=True,
+    )
+
+    assert setup_mod.run_line(plan, args) == 0
+    saved = userconfig.load(config_path)
+    assert saved is not None
+    assert saved.mountpoint == str(tmp_path / "mnt")
+    assert saved.cache_dir == str(tmp_path / "cache")
+    assert "写入配置" in capsys.readouterr().out

@@ -43,9 +43,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from mcloud_fuse import config
 from mcloud_fuse.router.rate_limiter import global_rate_limiter
+from mcloud_fuse.router.retry import retry_call
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +403,28 @@ class Web139Client:
     只负责协议；限流、重试与缓存由上层决定。所有方法都是同步阻塞的。
     """
 
+    @staticmethod
+    def _build_session() -> requests.Session:
+        """默认 Session：连接阶段的瞬时失败重试两次。
+
+        只重试「连接没建起来」的情况（connect=2），响应阶段的读超时/5xx 一律
+        不重试——POST 请求重发可能重复建文件/重复删除，交给调用方按幂等性处理。
+        """
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=0,
+            status=0,
+            backoff_factor=0.3,
+            allowed_methods=None,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
     def __init__(
         self,
         auth: Optional[Web139Auth] = None,
@@ -412,7 +437,7 @@ class Web139Client:
         base_url: Optional[str] = None,
     ):
         self.auth = auth or Web139Auth.load()
-        self._session = session or requests.Session()
+        self._session = session or self._build_session()
         self._timeout = timeout
         self._part_size = part_size
         self._client_type = client_type
@@ -420,6 +445,21 @@ class Web139Client:
         self._base_url = base_url
         self._host: Optional[str] = base_url
         self._host_lock = threading.Lock()
+
+    def _retry_read(self, func, *args, **kwargs):
+        """对幂等读（列举 / 查询 / 取下载地址）做退避重试。
+
+        创建、上传、删除、移动这些可能产生副作用的调用不走这里。
+        """
+        return retry_call(
+            func,
+            *args,
+            max_retries=3,
+            initial_delay=0.4,
+            retry_exceptions=(Web139Error, ConnectionError, TimeoutError, OSError),
+            non_retryable=(Web139AuthError, ValueError, PermissionError),
+            **kwargs,
+        )
 
     def refresh_token(self, *, force: bool = False, timeout: float = 15) -> Web139Token:
         """检查 token；``force=True`` 时立即续期（向导 / 手动命令）。
@@ -578,7 +618,8 @@ class Web139Client:
         """按页遍历目录（服务端游标分页）。"""
         cursor = ""
         while True:
-            doc = self._post_json(
+            doc = self._retry_read(
+                self._post_json,
                 "/file/list",
                 {
                     # 不请求缩略图：FUSE 用不到，省掉每页的 URL 生成与服务端开销
@@ -606,14 +647,15 @@ class Web139Client:
 
     def quota(self) -> DiskQuota:
         """取个人云配额。返回值的单位是 MB。"""
-        doc = self._post_json("", {}, url=QUOTA_URL, timeout=15)
+        doc = self._retry_read(self._post_json, "", {}, url=QUOTA_URL, timeout=15)
         return DiskQuota.from_api(self._data(doc))
 
     def iter_recycle_bin(self, page_size: int = 100) -> Iterator[RecycleItem]:
         """遍历回收站（游标分页）。"""
         cursor = ""
         while True:
-            doc = self._post_json(
+            doc = self._retry_read(
+                self._post_json,
                 "/recyclebin/list",
                 {"pageInfo": {"pageSize": page_size, "pageCursor": cursor}},
             )
@@ -628,7 +670,7 @@ class Web139Client:
         return list(self.iter_recycle_bin(page_size))
 
     def get_download_url(self, file_id: str) -> str:
-        doc = self._post_json("/file/getDownloadUrl", {"fileId": file_id})
+        doc = self._retry_read(self._post_json, "/file/getDownloadUrl", {"fileId": file_id})
         data = self._data(doc)
         url = data.get("cdnUrl") or data.get("url")
         if not url:
@@ -637,7 +679,7 @@ class Web139Client:
 
     def get_file(self, file_id: str) -> WebFile:
         """按 fileId 取单个对象的元数据（``/file/get``）。"""
-        doc = self._post_json("/file/get", {"fileId": file_id})
+        doc = self._retry_read(self._post_json, "/file/get", {"fileId": file_id})
         data = self._data(doc)
         item = data.get("file") if isinstance(data.get("file"), dict) else data
         if not item or not item.get("fileId"):
@@ -648,7 +690,7 @@ class Web139Client:
         """批量取元数据（``/file/batchGet``）。"""
         if not file_ids:
             return []
-        doc = self._post_json("/file/batchGet", {"fileIds": list(file_ids)})
+        doc = self._retry_read(self._post_json, "/file/batchGet", {"fileIds": list(file_ids)})
         data = self._data(doc)
         items = data.get("items") or data.get("files") or []
         return [WebFile.from_api(item, str(item.get("parentFileId") or "")) for item in items]
@@ -731,7 +773,7 @@ class Web139Client:
         deadline = time.monotonic() + TASK_TIMEOUT_SEC
         while True:
             try:
-                info_doc = self._post_json("/task/get", {"taskId": task_id})
+                info_doc = self._retry_read(self._post_json, "/task/get", {"taskId": task_id})
                 info = self._data(info_doc).get("taskInfo") or {}
                 status = str(info.get("status") or "")
             except Web139Error as exc:

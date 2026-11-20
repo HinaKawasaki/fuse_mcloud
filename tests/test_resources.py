@@ -15,15 +15,15 @@ from mcloud_fuse.mapping.id_map import InodeEntry
 
 
 def make_cache(tmp_path: Path, **kwargs) -> DataCache:
-    defaults = dict(
-        client_wrapper=FakeCloud(),
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        max_write_back_mb=1,
-        min_free_mb=0,
-        journal_db=tmp_path / "journal.sqlite3",
-    )
+    defaults = {
+        "client_wrapper": FakeCloud(),
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "max_write_back_mb": 1,
+        "min_free_mb": 0,
+        "journal_db": tmp_path / "journal.sqlite3",
+    }
     defaults.update(kwargs)
     return DataCache(**defaults)
 

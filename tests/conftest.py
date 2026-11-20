@@ -5,6 +5,7 @@
 """
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -29,3 +30,18 @@ def _isolate_journal(tmp_path, monkeypatch):
     """每个用例一份独立的 SQLite 写回日志，避免测试之间串数据。"""
     monkeypatch.setenv("MCLOUD_JOURNAL_DB", str(tmp_path / "writeback.sqlite3"))
     monkeypatch.setenv("MCLOUD_STATE_DIR", str(tmp_path / "state"))
+
+
+@pytest.fixture
+def world_dir():
+    """位于 /tmp 且 o+x 的目录：用来测「其他用户能否穿越路径」。
+
+    pytest 的 ``tmp_path`` 是 0700，任何 allow_other 用例都会被它挡住，
+    所以共享相关的测试用这个目录做挂载点。
+    """
+    path = Path(tempfile.mkdtemp(prefix="mcloud-world-", dir="/tmp"))
+    os.chmod(path, 0o755)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)

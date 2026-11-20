@@ -160,3 +160,85 @@ def test_stop_success(monkeypatch):
         lambda args, timeout=30: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
     assert service.stop().ok is True
+
+
+def test_restart_success(monkeypatch):
+    import types
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_run",
+        lambda args, timeout=30: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    result = service.restart()
+    assert result.ok is True and "已重启" in result.detail
+
+
+def test_restart_failure_reports_stderr(monkeypatch):
+    import types
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_run",
+        lambda args, timeout=30: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="unit not found"
+        ),
+    )
+    result = service.restart()
+    assert result.ok is False and "unit not found" in result.detail
+
+
+def test_restart_without_systemctl(monkeypatch):
+    monkeypatch.setattr(service, "available", lambda: False)
+    result = service.restart()
+    assert result.ok is False and "systemctl" in result.detail
+
+
+def test_install_reports_enable_failure(tmp_path: Path, monkeypatch):
+    import types
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    monkeypatch.setattr(service, "write_unit", lambda cfg: tmp_path / "unit")
+
+    def fake_run(args, timeout=30):
+        if args[-1] in ("daemon-reload",):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="failed to start")
+
+    monkeypatch.setattr(service, "_run", fake_run)
+    result = service.install(make_config(tmp_path))
+    assert result.ok is False and "启动服务失败" in result.detail
+
+
+def test_install_write_failure_is_reported(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(service, "available", lambda: True)
+
+    def boom(cfg):
+        raise OSError("read-only fs")
+
+    monkeypatch.setattr(service, "write_unit", boom)
+    result = service.install(make_config(tmp_path))
+    assert result.ok is False and "read-only fs" in result.detail
+
+
+def test_uninstall_without_systemctl(monkeypatch):
+    monkeypatch.setattr(service, "available", lambda: False)
+    result = service.uninstall()
+    assert result.ok is False and "systemctl" in result.detail
+
+
+def test_stop_failure_reports_reason(monkeypatch):
+    import types
+
+    monkeypatch.setattr(service, "available", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_run",
+        lambda args, timeout=30: types.SimpleNamespace(
+            returncode=1, stdout="", stderr="stop failed"
+        ),
+    )
+    result = service.stop()
+    assert result.ok is False and "stop failed" in result.detail

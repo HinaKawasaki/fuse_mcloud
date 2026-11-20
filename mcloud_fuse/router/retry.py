@@ -3,7 +3,7 @@ import random
 import time
 from typing import Callable, Tuple, Type, TypeVar
 
-from mcloud_fuse.errors import MCloudAPIException, MCloudAuthException
+from mcloud_fuse.errors import MCloudAPIException, MCloudAuthException, retryable_status
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +33,14 @@ def retry_call(
     backoff_factor: float = 2.0,
     jitter: bool = True,
     retry_exceptions: Tuple[Type[BaseException], ...] = DEFAULT_RETRY_EXCEPTIONS,
+    non_retryable: Tuple[Type[BaseException], ...] = NON_RETRYABLE_EXCEPTIONS,
     **kwargs,
 ) -> T:
     """以指数退避重试一个同步调用。
 
-    ``max_retries`` 是**总尝试次数**（含首次）。权限/入参类异常直接抛出，
-    不浪费重试次数。
+    ``max_retries`` 是**总尝试次数**（含首次）。权限/入参类异常、以及带 4xx
+    状态的确定性失败直接抛出，不浪费重试次数；只有 5xx / 408 / 429 与网络
+    异常才会退避重试。
 
     实现为同步阻塞（内部 ``time.sleep``），因为它总是运行在
     ``trio.to_thread.run_sync`` 派发的工作线程里，不会阻塞事件循环。
@@ -50,7 +52,10 @@ def retry_call(
         try:
             return func(*args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 - 需要按类型判断是否重试
-            if isinstance(exc, NON_RETRYABLE_EXCEPTIONS):
+            if isinstance(exc, non_retryable):
+                raise
+            # 4xx（除 408/429）是确定性失败：重试只会白等三倍时间。
+            if not retryable_status(getattr(exc, "status", None)):
                 raise
             if not isinstance(exc, retry_exceptions):
                 raise

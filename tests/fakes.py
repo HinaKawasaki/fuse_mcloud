@@ -1,4 +1,5 @@
 """测试共享的内存假云盘。"""
+import time
 import uuid
 from pathlib import Path
 
@@ -24,7 +25,12 @@ class FakeCloud:
         self.list_calls.append(dir_file_id)
         return [
             CloudItem(
-                i["id"], i["name"], bool(i.get("isDir")), int(i.get("size") or 0), "", dir_file_id
+                i["id"],
+                i["name"],
+                bool(i.get("isDir")),
+                int(i.get("size") or 0),
+                str(i.get("updated_at") or ""),
+                dir_file_id,
             )
             for i in self.dirs.get(dir_file_id, [])
         ]
@@ -35,16 +41,18 @@ class FakeCloud:
         path.write_bytes(self.content[file_id])
         return path
 
-    def upload_file(self, local_file_path, target_dir_id, name=None):
+    def upload_file(self, local_file_path, target_dir_id, name=None, **kwargs):
+        """``expected_file_id`` / ``expected_updated_at`` 是覆盖写的冲突基线，这里忽略。"""
         payload = Path(local_file_path).read_bytes()
         file_name = name or Path(local_file_path).name
         new_id = f"up_{uuid.uuid4().hex[:8]}"
         self.content[new_id] = payload
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         self.dirs.setdefault(target_dir_id, []).append(
-            {"id": new_id, "name": file_name, "size": len(payload)}
+            {"id": new_id, "name": file_name, "size": len(payload), "updated_at": stamp}
         )
         self.uploads.append((file_name, payload))
-        return CloudItem(new_id, file_name, False, len(payload), "", target_dir_id)
+        return CloudItem(new_id, file_name, False, len(payload), stamp, target_dir_id)
 
     def create_folder(self, name, parent_file_id):
         new_id = f"dir_{uuid.uuid4().hex[:8]}"
@@ -98,7 +106,8 @@ class FakeCloud:
             self.dirs.setdefault(to_parent_file_id, []).append(item)
             self.moves.append((file_id, to_parent_file_id))
 
-    def delete(self, file_ids, permanent=True):
+    def delete(self, file_ids, permanent=True, labels=None):
+        """``labels`` 与真实 wrapper 对齐：删除失败时用于写可读的路径。"""
         for file_id in file_ids:
             for items in self.dirs.values():
                 items[:] = [item for item in items if item["id"] != file_id]

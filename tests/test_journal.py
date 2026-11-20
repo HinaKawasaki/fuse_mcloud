@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from fakes import FakeCloud
@@ -134,13 +135,13 @@ def test_data_cache_migrates_legacy_json(tmp_path: Path):
 def test_uncommitted_write_is_not_uploaded_after_crash(tmp_path: Path):
     """只创建、没 fsync/release 的写回文件是半成品，崩溃恢复不能上传。"""
     cloud = FakeCloud()
-    kwargs = dict(
-        client_wrapper=cloud,
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        journal_db=tmp_path / "journal.sqlite3",
-    )
+    kwargs = {
+        "client_wrapper": cloud,
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "journal_db": tmp_path / "journal.sqlite3",
+    }
     first = DataCache(**kwargs)
     first.create_write_buffer("inode-7", target_dir_id="root", file_name="half.txt")
     assert not first.pending_uploads(), "创建阶段不应进入 pending"
@@ -156,13 +157,13 @@ def test_uncommitted_write_is_not_uploaded_after_crash(tmp_path: Path):
 
 def test_missing_payload_is_marked_lost(tmp_path: Path):
     cloud = FakeCloud()
-    kwargs = dict(
-        client_wrapper=cloud,
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        journal_db=tmp_path / "journal.sqlite3",
-    )
+    kwargs = {
+        "client_wrapper": cloud,
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "journal_db": tmp_path / "journal.sqlite3",
+    }
     first = DataCache(**kwargs)
     buffer = first.create_write_buffer("inode-9", target_dir_id="root", file_name="gone.txt")
     first.mark_write_ready("inode-9")
@@ -277,13 +278,13 @@ def test_journal_cli_gc_removes_orphan_and_stale(tmp_path: Path):
 def test_uploading_entry_is_deduped_when_remote_matches(tmp_path: Path):
     """上传中崩溃：远端已有同名同大小文件时不再重传。"""
     cloud = FakeCloud()
-    kwargs = dict(
-        client_wrapper=cloud,
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        journal_db=tmp_path / "journal.sqlite3",
-    )
+    kwargs = {
+        "client_wrapper": cloud,
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "journal_db": tmp_path / "journal.sqlite3",
+    }
     first = DataCache(**kwargs)
     buffer = first.create_write_buffer("inode-8", target_dir_id="root", file_name="same.txt")
     buffer.write_bytes(b"payload")
@@ -291,8 +292,16 @@ def test_uploading_entry_is_deduped_when_remote_matches(tmp_path: Path):
     first.mark_write_uploading("inode-8")
     first.close()
 
-    # 模拟服务端其实已经存好，只是进程没来得及清日志
-    cloud.dirs["root"].append({"id": "remote_1", "name": "same.txt", "size": len(b"payload")})
+    # 模拟服务端其实已经存好（同名同大小，且 updatedAt 晚于 payload 落盘），
+    # 只是进程没来得及清日志；缺时间戳时会被判为「无法证明」而重传。
+    cloud.dirs["root"].append(
+        {
+            "id": "remote_1",
+            "name": "same.txt",
+            "size": len(b"payload"),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
     second = DataCache(**kwargs)
     assert second.recover_pending_uploads() == 0
     assert not second.pending_uploads()
@@ -302,13 +311,13 @@ def test_uploading_entry_is_deduped_when_remote_matches(tmp_path: Path):
 
 def test_uploading_entry_without_remote_match_is_retried(tmp_path: Path):
     cloud = FakeCloud()
-    kwargs = dict(
-        client_wrapper=cloud,
-        cache_dir=tmp_path / "cache",
-        write_back_dir=tmp_path / "wb",
-        max_size_mb=64,
-        journal_db=tmp_path / "journal.sqlite3",
-    )
+    kwargs = {
+        "client_wrapper": cloud,
+        "cache_dir": tmp_path / "cache",
+        "write_back_dir": tmp_path / "wb",
+        "max_size_mb": 64,
+        "journal_db": tmp_path / "journal.sqlite3",
+    }
     first = DataCache(**kwargs)
     buffer = first.create_write_buffer("inode-9", target_dir_id="root", file_name="new.txt")
     buffer.write_bytes(b"payload")

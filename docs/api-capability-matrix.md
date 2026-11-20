@@ -110,7 +110,7 @@
 | 跨目录移动 | 🟡 | `batchCopy` + 墓碑（异步等待） | `wrapper.py:350` | 复制即占双倍容量直至手删 |
 | `chmod` / `chown` / 时间戳 | ❌ | 静默忽略 | README 已知限制 | 不报错也不生效 |
 | `flock` / `fcntl` 锁 / xattr / 符号链接 / 硬链接 | ❌ | 不支持 | README 已知限制 | 依赖这些的工具（git、部分编辑器）会退化 |
-| `allow_other` 多用户 | ❌ | 不支持 | README 已知限制 | 单用户挂载 |
+| `allow_other` 多用户 | 🟡 | opt-in 只读共享（`default_permissions` + 固定 0644/0755） | `mountopts.py` / ADR-0003 §8 | 其他本地用户可读，不能写；需 `user_allow_other` |
 | `statfs` | 🟡 | 配额接口缺失，靠估算 | `fuse_ops.py` | `df` 数字不可信 |
 | 沙箱外**读** | 🟡 | 云内复制进 `.MCloudHydrate/` 再下载 | README 已知限制 | 首次读有延迟；副本**占容量且删不掉** |
 | 沙箱外**写** | ❌ | 明确 `EACCES` | `cm_cloud_sandbox.py:79-84` | 有清晰报错，不是玄学失败 |

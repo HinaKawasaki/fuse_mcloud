@@ -10,4 +10,4 @@ from mcloud_fuse.userconfig import apply_saved_env as _apply_saved_env
 _apply_saved_env()
 del _apply_saved_env
 
-__all__ = []
+__all__: list[str] = []

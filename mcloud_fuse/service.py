@@ -187,6 +187,19 @@ def uninstall() -> ServiceResult:
     return ServiceResult(True, "用户服务已卸载")
 
 
+def restart() -> ServiceResult:
+    """重启用户服务（配置改过之后无需重新 setup）。"""
+    if not available():
+        return ServiceResult(False, "找不到 systemctl")
+    try:
+        result = _run(["systemctl", "--user", "restart", UNIT_NAME], timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return ServiceResult(False, f"重启服务失败：{exc}")
+    if result.returncode != 0:
+        return ServiceResult(False, f"重启服务失败：{_tail(result)}")
+    return ServiceResult(True, "服务已重启")
+
+
 def stop() -> ServiceResult:
     if not available():
         return ServiceResult(False, "找不到 systemctl")

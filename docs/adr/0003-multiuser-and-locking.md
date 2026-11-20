@@ -1,6 +1,6 @@
 # ADR-0003：多用户与文件锁的设计
 
-- 状态：**已接受**（Accepted，2026-10-28）
+- 状态：**已接受**（Accepted，2026-10-28；2026-11-19 修订：落地只读 `allow_other`）
 - 日期：2026-10-28
 - 相关：[ADR-0002](0002-web-api-optin.md)、[Web API 分析](../web-api-analysis.md)
 
@@ -9,7 +9,8 @@
 1. **采用「每人一个账号、各自挂载」**（下文的形态 A）。一个挂载只持有一个
    Web token，也只代表一个云盘账号；不实现「一个挂载、多个身份」。
 2. **接受「权限只在本机有效」**。因此不实现共享写的本地 ACL 覆盖层；
-   `allow_other` 只保留为未来「共享只读」的可选项，默认关闭。
+   `allow_other` 作为「共享只读」的可选项已经落地（opt-in、默认关闭，
+   见 §8 修订记录），共享写仍然不做。
 3. **文件锁不在 FUSE 层实现**。pyfuse3 3.5 没有暴露 `lock` / `flock` 回调；
    内核把锁保留在本地，`flock` 与 `fcntl` 在单机单挂载内已经可用（已实测）。
    锁是**本机 advisory**，不能跨主机、也不能约束手机 App / 网页端。
@@ -60,7 +61,7 @@ bob    ~/mnt/cloud  ->  token B  ->  账号 B
 - 缺点：不能共享同一个云盘目录；每个用户要各自导入 token。
 - 适用：绝大多数「多用户」需求其实是「每人一个账号」。
 
-### B. 共享一个账号，只读（未实现，保留为未来选项）
+### B. 共享一个账号，只读（v0.5.0 起已实现，opt-in）
 
 挂载进程用专用服务账号（或 root）持 token，开启：
 
@@ -72,6 +73,8 @@ bob    ~/mnt/cloud  ->  token B  ->  账号 B
 
 - 前提：`/etc/fuse.conf` 里的 `user_allow_other`（当前宿主机是注释状态，
   所以非 root 用户挂载时 `allow_other` 会被拒绝；systemd 以 root 跑则可用）。
+  向导会用一条 `sudo sh -c ...` 追加这一行，并检查从 `/` 到挂载点父目录的
+  `o+x`（`$HOME` 为 `0700` 时其他用户进不去）。
 - 适用：家庭媒体库、团队只读资料。
 - 风险：token 必须只对服务账号可读；root 天然可读，威胁模型不覆盖 root。
 
@@ -142,7 +145,8 @@ cache_dir/local_acl.sqlite3
 | --- | --- |
 | token | 只对挂载进程的服务账号可读（0600）；`allow_other` 时其他用户不可读 |
 | 挂载权限 | 始终保持 `default_permissions`；不允许 `allow_other` 但不带它 |
-| 共享写 | 默认关闭；需显式 `MCLOUD_ALLOW_OTHER=1` + `MCLOUD_LOCAL_ACL=1` |
+| 共享只读 | `allow_other` opt-in：`MCLOUD_ALLOW_OTHER=1` 或 `mount --allow-other`；attrs 固定 `0644/0755` |
+| 共享写 | 不做；需本地 ACL 覆盖层（形态 C），仍在「不做」列表 |
 | 世界可写 | 不提供 `0777` 快捷方式；共享写必须走 ACL 覆盖层 |
 | root | 视为可信；root 可读 token、可绕过本地权限 |
 | 云端 | 所有本地用户的操作都记在同一个云盘账号下，云端无本地用户审计 |
@@ -152,7 +156,7 @@ cache_dir/local_acl.sqlite3
 1. **写冲突检测**：`MCLOUD_CONFLICT=copy|error`，默认 `copy`；
 2. **每用户挂载的 systemd user 模板**：v0.4.0 起由 `mcloud_fuse/service.py`
    生成（`mcloud-fuse setup` 安装），不再使用 shell 模板；
-3. 本地 ACL / `allow_other`：**不做**，等真实共享写需求出现；
+3. 本地 ACL：**不做**；`allow_other` 只读共享：**v0.5.0 已实现**（见 §8）；
 4. 多租户 broker：**不做**。
 
 ## 7. 决策记录（2026-10-28）
@@ -161,5 +165,43 @@ cache_dir/local_acl.sqlite3
 - 权限只在本机有效：**接受**。
 - 覆盖写冲突：**默认 `copy`**（`MCLOUD_CONFLICT=copy`）。
 - 文件锁：接受「本机 advisory」，不做跨主机锁。
-- 未决但不在当前范围：共享只读 `allow_other`、共享写 ACL 覆盖层、
-  多租户 broker。
+- 未决但不在当前范围：共享写 ACL 覆盖层、多租户 broker。
+
+## 8. 修订记录（2026-11-19）：只读共享落地
+
+需求变化：使用者希望「挂载点放到 `/mnt` 让家里/团队其他人也能读」。这与
+形态 A 的「每用户一个挂载」不冲突——一个挂载仍只持有一个 token，只是允许
+其他本地 uid 通过同一个挂载读取。
+
+### 8.1 做了什么
+
+1. **挂载点可以是任意绝对路径**（`/mnt/mcloud`、`/srv/cloud`、……）。
+   需要 root 的只有「建目录 + 改属主」这一步，由向导带一条
+   `sudo install -d -m 755 -o <user> -g <group> <path>` 完成；之后挂载、
+   卸载、systemd 用户服务都不需要 root。
+2. **`allow_other` + `default_permissions`**，由 `config.json` 的
+   `allow_other` 字段（或 `MCLOUD_ALLOW_OTHER=1` / `--allow-other`）控制，
+   默认关闭。默认值不变，因此老配置的行为完全不变。
+3. **向导第 3 步「共享访问」**：检查 `/etc/fuse.conf` 的 `user_allow_other`，
+   缺了就用一条 sudo 追加；再检查父目录 `o+x`，列出不能穿越的目录和
+   `sudo chmod o+x <dir>`，不静默改家目录权限。
+4. `mcloud-fuse doctor` 增加 `user_allow_other` 与「父目录可穿越」两项；
+   `status` / 向导确认页显示共享状态。
+
+### 8.2 为什么仍是「只读」
+
+- `attrs` 固定 `st_uid/st_gid = 挂载进程`、`0644/0755`，没有本地 ACL 覆盖层
+  （形态 C）。`default_permissions` 让内核按这些 mode 判定：其他 uid 能读、
+  能遍历，写/删/改名得到 `EACCES`。
+- 想放开写，就必须实现形态 C 的 `local_acl.sqlite3`，并接受「权限只在本机
+  有效、换机即失效」的语义；这一步不在本次范围内。
+
+### 8.3 已知限制
+
+| 限制 | 说明 |
+| --- | --- |
+| 只读 | 其他用户不能写；共享写仍是「不做」 |
+| 云端身份唯一 | 其他用户的所有操作都记在挂载进程的账号下，云端无法区分本地 uid |
+| 依赖 `user_allow_other` | 非 root 挂载的硬性要求；没有它时挂载会明确失败，不会静默降级 |
+| 依赖父目录 `o+x` | `$HOME` 为 `0700` 时其他用户进不来，向导只提示不改权限 |
+| token 仍私有 | 0600，其他用户读不到；共享不扩大凭据的可见范围 |

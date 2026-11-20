@@ -211,3 +211,98 @@ def test_delete_batches_and_hides_immediately():
     assert wrapper.flush_deletes(timeout=5) is True
     delete_calls = [call for call in wrapper.client.calls if call[0] == "delete"]
     assert delete_calls == [("delete", ["f1", "f2"], True)]
+
+
+# ------------------------------------------------- 后台删除：重试 / 失败可见
+
+
+class FailingDeleteClient(FakeClient):
+    """``delete`` 按给定异常失败；其余行为与 FakeClient 一致。"""
+
+    def __init__(self, exc: BaseException):
+        super().__init__()
+        self.exc = exc
+        self.delete_calls = 0
+
+    def delete(self, file_ids, *, permanent=True):
+        self.delete_calls += 1
+        self.calls.append(("delete", list(file_ids), permanent))
+        raise self.exc
+
+
+def _no_sleep(monkeypatch):
+    import mcloud_fuse.client.wrapper as wrapper_module
+
+    monkeypatch.setattr(wrapper_module.time, "sleep", lambda *_: None)
+
+
+def test_delete_failure_retries_then_resurfaces_and_records(tmp_path, monkeypatch):
+    """批量优先：不阻塞 rm；重试仍失败时对象重新出现，并留下可查记录。"""
+    from mcloud_fuse import delete_failures
+    from mcloud_fuse.errors import MCloudAPIException
+
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(tmp_path / "failures.json"))
+    _no_sleep(monkeypatch)
+    client = FailingDeleteClient(MCloudAPIException("gateway", status=503))
+    wrapper = DirectClientWrapper(client=client)
+
+    wrapper.delete(["f1"], labels={"f1": "/a.txt"})
+    assert wrapper.flush_deletes(timeout=5) is True
+
+    assert client.delete_calls == 3, "5xx 应重试 3 次"
+    assert any(item.file_id == "f1" for item in wrapper.list_directory("/")), (
+        "删除失败后对象必须重新出现在 ls 里"
+    )
+    failures = delete_failures.load()
+    assert len(failures) == 1
+    assert failures[0]["file_id"] == "f1"
+    assert failures[0]["name"] == "/a.txt"
+
+
+def test_delete_404_counts_as_success(tmp_path, monkeypatch):
+    """对象已经不存在（404）视为删除成功：不重试、不记录、继续隐藏。"""
+    from mcloud_fuse import delete_failures
+    from mcloud_fuse.client.web139 import Web139Error
+
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(tmp_path / "failures.json"))
+    _no_sleep(monkeypatch)
+    client = FailingDeleteClient(Web139Error("gone", status=404))
+    wrapper = DirectClientWrapper(client=client)
+
+    wrapper.delete(["f1"])
+    assert wrapper.flush_deletes(timeout=5) is True
+
+    assert client.delete_calls == 1
+    assert all(item.file_id != "f1" for item in wrapper.list_directory("/"))
+    assert delete_failures.load() == []
+
+
+def test_delete_403_is_not_retried(tmp_path, monkeypatch):
+    from mcloud_fuse import delete_failures
+    from mcloud_fuse.errors import MCloudAPIException
+
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(tmp_path / "failures.json"))
+    _no_sleep(monkeypatch)
+    client = FailingDeleteClient(MCloudAPIException("denied", status=403))
+    wrapper = DirectClientWrapper(client=client)
+
+    wrapper.delete(["f1"])
+    assert wrapper.flush_deletes(timeout=5) is True
+
+    assert client.delete_calls == 1, "403 是确定性失败，不该重试"
+    assert any(item.file_id == "f1" for item in wrapper.list_directory("/"))
+    assert len(delete_failures.load()) == 1
+
+
+def test_delete_success_clears_previous_failure(tmp_path, monkeypatch):
+    from mcloud_fuse import delete_failures
+
+    monkeypatch.setenv("MCLOUD_DELETE_FAILURES_FILE", str(tmp_path / "failures.json"))
+    delete_failures.record([{"file_id": "f1", "name": "/a.txt", "error": "old"}])
+    assert len(delete_failures.load()) == 1
+
+    wrapper = make_wrapper()
+    wrapper.delete(["f1"])
+    assert wrapper.flush_deletes(timeout=5) is True
+
+    assert delete_failures.load() == [], "重试成功后应清掉旧的失败记录"

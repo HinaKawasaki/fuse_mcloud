@@ -17,9 +17,11 @@ def filesystem_type(path: Path) -> str:
                 if len(parts) < 3:
                     continue
                 mountpoint, fstype = parts[1], parts[2]
-                if target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/"):
-                    if len(mountpoint) >= len(best_mount):
-                        best_mount, best_type = mountpoint, fstype
+                matches = target == mountpoint or target.startswith(
+                    mountpoint.rstrip("/") + "/"
+                )
+                if matches and len(mountpoint) >= len(best_mount):
+                    best_mount, best_type = mountpoint, fstype
         return best_type or "未知"
     except OSError:
         return "未知"

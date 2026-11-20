@@ -84,6 +84,9 @@ class UserConfig:
     rm_mode: str = "delete"
     conflict: str = "copy"
     install_service: bool = True
+    # 其他本地用户只读访问挂载点（FUSE allow_other，需要 /etc/fuse.conf 的
+    # user_allow_other）。默认关闭：一条命令就能装好，不必碰 root 的文件。
+    allow_other: bool = False
     version: int = CONFIG_VERSION
 
     def __post_init__(self) -> None:
@@ -97,6 +100,7 @@ class UserConfig:
         object.__setattr__(self, "root", (str(self.root).strip() or "/"))
         object.__setattr__(self, "rm_mode", str(self.rm_mode).strip().lower())
         object.__setattr__(self, "conflict", str(self.conflict).strip().lower())
+        object.__setattr__(self, "allow_other", bool(self.allow_other))
         if self.rm_mode not in _RM_MODES:
             raise ConfigError(f"rm_mode 必须是 {_RM_MODES} 之一，收到 {self.rm_mode!r}")
         if self.conflict not in _CONFLICT_MODES:
@@ -110,11 +114,13 @@ class UserConfig:
     def from_mapping(cls, data: Mapping[str, Any]) -> "UserConfig":
         if not isinstance(data, Mapping):
             raise ConfigError("配置根节点必须是对象")
-        known = {field for field in cls.__dataclass_fields__}
+        known = set(cls.__dataclass_fields__)
         # 忽略未知字段：旧版本读到新版本写的配置时不至于直接拒绝启动。
         values: Dict[str, Any] = {key: data[key] for key in known & set(data)}
         if "install_service" in values and not isinstance(values["install_service"], bool):
             raise ConfigError("install_service 必须是布尔值")
+        if "allow_other" in values and not isinstance(values["allow_other"], bool):
+            raise ConfigError("allow_other 必须是布尔值")
         if "version" in values and not isinstance(values["version"], int):
             raise ConfigError("version 必须是整数")
         try:
@@ -133,6 +139,7 @@ class UserConfig:
             "MCLOUD_CACHE_DIR": self.cache_dir,
             "MCLOUD_RM_MODE": self.rm_mode,
             "MCLOUD_CONFLICT": self.conflict,
+            "MCLOUD_ALLOW_OTHER": "1" if self.allow_other else "0",
             "MCLOUD_WEB_TOKEN_FILE": str(default_token_path()),
         }
 

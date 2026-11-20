@@ -1,4 +1,5 @@
 """写回上传、目录创建、真删除的离线回归测试（不需要真实挂载）。"""
+import errno
 import os
 import shutil
 import sys
@@ -17,6 +18,7 @@ from fakes import FakeCloud  # noqa: E402
 from mcloud_fuse.cache.data_cache import DataCache  # noqa: E402
 from mcloud_fuse.cache.meta_cache import MetaCache  # noqa: E402
 from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps  # noqa: E402
+from mcloud_fuse.journal import BUILDING
 from mcloud_fuse.mapping.id_map import PENDING_FILE_ID_PREFIX, InodeMapper  # noqa: E402
 from mcloud_fuse.mapping.tree import DirectoryTree  # noqa: E402
 
@@ -183,7 +185,7 @@ def test_fsync_keeps_buffer_then_release_finalizes(env):
     trio.run(ops.write, fi.fh, 0, b"part1")
     trio.run(ops.fsync, fi.fh, False)
 
-    buffer_path = ops._write_state[attrs.st_ino]["buffer"]
+    buffer_path = ops._write_state[fi.fh]["buffer"]
     assert buffer_path.exists(), "fsync 后暂存被删会导致后续写入丢失"
 
     trio.run(ops.write, fi.fh, 5, b"part2")
@@ -200,3 +202,133 @@ def test_fsync_keeps_buffer_then_release_finalizes(env):
     fi2 = trio.run(ops.open, attrs.st_ino, os.O_RDONLY, None)
     assert trio.run(ops.read, fi2.fh, 0, 100) == b"part1part2"
     trio.run(ops.release, fi2.fh)
+
+
+def test_two_write_handles_are_isolated(env):
+    """同一 inode 被打开两次写：两个句柄各自一份暂存，谁也不覆盖谁。"""
+    ops, cloud, mapper, _ = env
+    entry = mapper.get_by_path("/a.txt") or mapper.allocate_or_update(
+        "f_a", "/a.txt", False, parent_inode=1, size=3
+    )
+
+    first = trio.run(ops.open, entry.inode, os.O_WRONLY, None)
+    second = trio.run(ops.open, entry.inode, os.O_WRONLY, None)
+    assert first.fh != second.fh, "写句柄不能复用 inode 当 fh"
+
+    trio.run(ops.write, first.fh, 0, b"from-first")
+    trio.run(ops.write, second.fh, 0, b"from-second!")
+
+    first_state = ops._write_state[first.fh]
+    second_state = ops._write_state[second.fh]
+    assert first_state["buffer"] != second_state["buffer"]
+    assert first_state["key"] != second_state["key"]
+    assert first_state["buffer"].read_bytes() == b"from-first"
+    assert second_state["buffer"].read_bytes() == b"from-second!"
+
+    # 先关第一个：第二个句柄的暂存不能被删除/截断
+    trio.run(ops.release, first.fh)
+    assert second_state["buffer"].exists()
+    trio.run(ops.release, second.fh)
+
+    uploaded = [payload for name, payload in cloud.uploads if name == "a.txt"]
+    assert b"from-first" in uploaded
+    assert b"from-second!" in uploaded
+
+
+def test_flush_uploads_and_release_does_not_reupload(env):
+    """flush（close 前的钩子）要把数据传上去，release 不再重复上传。"""
+    ops, cloud, mapper, _ = env
+    fi, attrs = trio.run(ops.create, 1, b"flush.txt", 0o644, os.O_WRONLY | os.O_CREAT, None)
+
+    trio.run(ops.write, fi.fh, 0, b"via flush")
+    trio.run(ops.flush, fi.fh)
+
+    assert ("flush.txt", b"via flush") in cloud.uploads
+    before = len(cloud.uploads)
+
+    trio.run(ops.release, fi.fh)
+    assert len(cloud.uploads) == before, "flush 已上传过，release 不应再传一次"
+    assert mapper.get_by_inode(attrs.st_ino).size == 9
+
+
+def test_deleting_pending_file_discards_its_buffer(env):
+    """新建文件还没上传就被 unlink：暂存与 journal 都要清掉，不留孤儿。"""
+    ops, cloud, mapper, _ = env
+    fi, attrs = trio.run(ops.create, 1, b"tmp.txt", 0o644, os.O_WRONLY | os.O_CREAT, None)
+    trio.run(ops.write, fi.fh, 0, b"never uploaded")
+    buffer_path = ops._write_state[fi.fh]["buffer"]
+
+    trio.run(ops.unlink, 1, b"tmp.txt", None)
+
+    assert not buffer_path.exists()
+    assert ops._write_state == {}
+    assert ops.data_cache.pending_uploads() == {}
+    assert not cloud.uploads
+
+
+def test_flush_keeps_tracking_for_later_writes(env):
+    """flush 上传后如果还有写入，崩溃时不能被当成「已全部上传」。"""
+    ops, cloud, mapper, _ = env
+    fi, attrs = trio.run(ops.create, 1, b"later.txt", 0o644, os.O_WRONLY | os.O_CREAT, None)
+    trio.run(ops.write, fi.fh, 0, b"part1")
+    trio.run(ops.flush, fi.fh)
+
+    key = ops._write_state[fi.fh]["key"]
+    assert ops.data_cache._journal.entries(BUILDING), "flush 后必须重新登记写回日志"
+
+    trio.run(ops.write, fi.fh, 5, b"part2")
+    cache = ops.data_cache
+    journal_path = cache.journal_path
+    cache.close()
+
+    # 模拟崩溃：不 release，重新打开同一份日志
+    second = DataCache(
+        client_wrapper=cloud,
+        cache_dir=cache.cache_dir,
+        write_back_dir=cache.write_back_dir,
+        journal_db=journal_path,
+    )
+    try:
+        assert second.recover_pending_uploads() == 0
+        assert ("later.txt", b"part1part2") not in cloud.uploads
+        assert key in second.lost_uploads(), "半成品应标记 lost，而不是补传"
+    finally:
+        second.close()
+
+
+def test_write_back_enospc_surfaces_as_enospc(env, monkeypatch):
+    """写回上限/磁盘满必须让应用看到 ENOSPC，而不是笼统的 EIO。"""
+    ops, cloud, mapper, _ = env
+    fi, attrs = trio.run(ops.create, 1, b"big.txt", 0o644, os.O_WRONLY | os.O_CREAT, None)
+
+    def _boom(_growth):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ops.data_cache, "ensure_write_back_capacity", _boom)
+    import pyfuse3
+
+    with pytest.raises(pyfuse3.FUSEError) as excinfo:
+        trio.run(ops.write, fi.fh, 0, b"x" * 128)
+    assert excinfo.value.errno == errno.ENOSPC
+
+
+def test_api_status_maps_to_real_errno():
+    """失败不再是统一的 EIO：HTTP 状态要翻译成有意义的 errno。"""
+    from mcloud_fuse.errors import MCloudAPIException, MCloudAuthException
+
+    cases = {
+        404: errno.ENOENT,
+        409: errno.EEXIST,
+        401: errno.EACCES,
+        429: errno.EAGAIN,
+        507: errno.ENOSPC,
+        500: errno.EIO,
+        503: errno.EBUSY,
+    }
+    for status, expected in cases.items():
+        error = MCloudFuseOps._to_fuse_error(MCloudAPIException("x", status=status))
+        assert error.errno == expected, status
+
+    assert MCloudFuseOps._to_fuse_error(MCloudAuthException("expired")).errno == errno.EACCES
+    # 没有任何结构化信息时仍退回 EIO，不会假装成功
+    assert MCloudFuseOps._to_fuse_error(MCloudAPIException("未知")).errno == errno.EIO

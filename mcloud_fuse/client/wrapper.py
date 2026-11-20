@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
+from mcloud_fuse import delete_failures
 from mcloud_fuse.client.web139 import (
     DiskQuota,
     RecycleItem,
@@ -46,14 +47,26 @@ from mcloud_fuse.errors import (
     MCloudAPIException,
     MCloudAuthException,
     MCloudConflictError,
+    api_error_from,
+    retryable_status,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _api_error(exc: BaseException, message: Optional[str] = None) -> MCloudAPIException:
+    """统一转换后端异常：鉴权类保持 ``MCloudAuthException``，其余带 status/code。"""
+    return api_error_from(
+        exc, message=message, auth=isinstance(exc, Web139AuthError)
+    )
 
 DEFAULT_PAGE_LIMIT = 500
 # 删除是异步任务：本地先隐藏，后台批量提交，避免 rm 逐个等 0.7s
 DELETE_HIDE_TTL = 60.0
 DELETE_BATCH_MAX = 100
+# 后台删除失败的重试：3 次指数退避；整批失败不会阻塞挂载，只多花几秒
+DELETE_ATTEMPTS = 3
+DELETE_RETRY_BASE_SEC = 0.5
 MAX_PAGES = 200
 MAX_LIST_ITEMS = 50000
 
@@ -110,7 +123,7 @@ class DirectClientWrapper:
         try:
             return self.client.refresh_token(force=force)
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     # ------------------------------------------------------------------ 读
 
@@ -162,9 +175,9 @@ class DirectClientWrapper:
                         break
             return collected
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     @staticmethod
     def _take(iterator, limit: int):
@@ -179,31 +192,31 @@ class DirectClientWrapper:
         try:
             item = self.client.find_child(parent_file_id, name)
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
         return self._to_item(item) if item is not None else None
 
     def file_name(self, file_id: str) -> str:
         try:
             return self.client.get_file(file_id).name
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def get_item(self, file_id: str) -> CloudItem:
         try:
             return self._to_item(self.client.get_file(file_id))
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def quota(self) -> DiskQuota:
         """个人云配额，单位 MB。"""
         try:
             return self.client.quota()
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def get_download_urls(self, file_ids: Sequence[str]) -> Dict[str, str]:
         urls: Dict[str, str] = {}
@@ -222,7 +235,7 @@ class DirectClientWrapper:
         try:
             with requests.get(url, stream=True, timeout=300) as resp:
                 if resp.status_code != 200:
-                    raise MCloudAPIException(f"下载失败：HTTP {resp.status_code}")
+                    raise MCloudAPIException(f"下载失败：HTTP {resp.status_code}", status=resp.status_code)
                 written = 0
                 with path.open("wb") as sink:
                     for chunk in resp.iter_content(1 << 20):
@@ -255,9 +268,9 @@ class DirectClientWrapper:
         try:
             return self.client.get_download_url(file_id)
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     @staticmethod
     def _range_get(
@@ -273,7 +286,7 @@ class DirectClientWrapper:
                 if resp.status_code == 416:
                     return 0
                 if resp.status_code not in (200, 206):
-                    raise MCloudAPIException(f"分片下载失败：HTTP {resp.status_code}")
+                    raise MCloudAPIException(f"分片下载失败：HTTP {resp.status_code}", status=resp.status_code)
 
                 full_body = resp.status_code == 200
                 if not full_body:
@@ -318,19 +331,19 @@ class DirectClientWrapper:
         try:
             return self.client.create_folder(parent_file_id, name)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def rename(self, file_id: str, new_name: str) -> None:
         try:
             self.client.rename(file_id, new_name)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def move(self, file_ids: Sequence[str], to_parent_file_id: str) -> None:
         try:
             self.client.move(file_ids, to_parent_file_id)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def batch_copy(
         self, file_ids: Sequence[str], to_parent_file_id: str
@@ -338,15 +351,25 @@ class DirectClientWrapper:
         try:
             self.client.copy(file_ids, to_parent_file_id)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
         return [{"fileId": file_id, "newFileId": ""} for file_id in file_ids]
 
-    def delete(self, file_ids: Sequence[str], *, permanent: Optional[bool] = None) -> None:
+    def delete(
+        self,
+        file_ids: Sequence[str],
+        *,
+        permanent: Optional[bool] = None,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> None:
         """删除。默认按 ``MCLOUD_RM_MODE``：``delete``=真删，``trash``=回收站。
 
         删除是异步任务，逐个等待会让 ``rm -rf`` 慢到不可用。这里只做两件事：
         1. 立即把 fileId 记入本地隐藏集（列举时过滤）；
         2. 投入后台队列，由 worker 合并成一个 ``batchDelete`` 提交。
+
+        后台失败**不会**让 ``rm`` 卡住：重试 3 次后放弃，把对象从隐藏集移除
+        （它会重新出现在 ``ls`` 里），并把失败写进 ``delete-failures.json``，
+        由 ``status`` / ``doctor`` 展示。
         """
         ids = [str(file_id) for file_id in file_ids if file_id]
         if not ids:
@@ -358,7 +381,7 @@ class DirectClientWrapper:
                 self._deleted[file_id] = now
         with self._delete_cond:
             self._delete_pending += 1
-        self._delete_queue.put((ids, use_permanent))
+        self._delete_queue.put((ids, use_permanent, dict(labels or {})))
 
     def _is_deleted(self, file_id: str) -> bool:
         now = time.monotonic()
@@ -382,17 +405,76 @@ class DirectClientWrapper:
                     except queue.Empty:
                         break
                 by_mode: Dict[bool, List[str]] = {}
-                for ids, permanent in batch:
+                labels: Dict[str, str] = {}
+                for ids, permanent, names in batch:
                     by_mode.setdefault(bool(permanent), []).extend(ids)
+                    labels.update(names)
                 for permanent, ids in by_mode.items():
-                    try:
-                        self.client.delete(ids, permanent=permanent)
-                    except Exception as exc:  # noqa: BLE001 - 后台失败只能告警
-                        logger.warning("后台删除 %s 个对象失败: %s", len(ids), exc)
+                    self._submit_delete(ids, permanent, labels)
             finally:
                 with self._delete_cond:
                     self._delete_pending -= len(batch)
                     self._delete_cond.notify_all()
+
+    @staticmethod
+    def _delete_retryable(exc: BaseException) -> bool:
+        if isinstance(exc, MCloudAuthException):
+            return False
+        return retryable_status(getattr(exc, "status", None))
+
+    def _submit_delete(self, ids: List[str], permanent: bool, labels: Dict[str, str]) -> None:
+        """提交一批删除；失败按 0.5s / 1s 退避重试，最终失败则记录并恢复显示。"""
+        for attempt in range(1, DELETE_ATTEMPTS + 1):
+            try:
+                self.client.delete(ids, permanent=permanent)
+            except Exception as exc:  # noqa: BLE001 - 后台删除失败不能泄漏到 FUSE
+                status = getattr(exc, "status", None)
+                if status == 404:
+                    # 已经不存在：目标状态达成，按成功处理（重复删除/并发删除）
+                    logger.info("删除 %s 个对象时发现已不存在，按成功处理", len(ids))
+                    break
+                if attempt < DELETE_ATTEMPTS and self._delete_retryable(exc):
+                    delay = DELETE_RETRY_BASE_SEC * (2 ** (attempt - 1))
+                    logger.warning(
+                        "后台删除 %s 个对象失败（第 %s/%s 次）：%s；%.1fs 后重试",
+                        len(ids), attempt, DELETE_ATTEMPTS, exc, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                self._record_delete_failure(ids, labels, exc)
+                return
+            else:
+                break
+        self._mark_delete_done(ids)
+
+    def _mark_delete_done(self, ids: Sequence[str]) -> None:
+        """删除成功：保留隐藏直到 TTL（掩盖云端列举的最终一致），并清掉旧失败。"""
+        delete_failures.forget(ids)
+
+    def _record_delete_failure(
+        self, ids: Sequence[str], labels: Dict[str, str], exc: BaseException
+    ) -> None:
+        """删除最终失败：对象会重新出现在 ls 里，同时落一条可查的失败记录。"""
+        with self._deleted_lock:
+            for file_id in ids:
+                self._deleted.pop(str(file_id), None)
+        delete_failures.record(
+            {
+                "file_id": str(file_id),
+                "name": labels.get(str(file_id)) or "",
+                "error": str(exc),
+                "status": getattr(exc, "status", None),
+            }
+            for file_id in ids
+        )
+        logger.error(
+            "后台删除最终失败（已恢复显示）：%s",
+            "、".join(labels.get(str(i)) or str(i) for i in ids),
+        )
+
+    def list_delete_failures(self) -> List[Dict[str, Any]]:
+        """当前记录的删除失败（status / doctor 用）。"""
+        return delete_failures.load()
 
     def flush_deletes(self, timeout: float = 30.0) -> bool:
         """等待后台删除队列清空（测试与卸载前使用）。"""
@@ -412,19 +494,19 @@ class DirectClientWrapper:
         try:
             return self.client.list_recycle_bin(page_size)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def restore_recycle(self, file_ids: Sequence[str]) -> None:
         try:
             self.client.restore_recycle(file_ids)
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def clear_recycle_bin(self) -> None:
         try:
             self.client.clear_recycle_bin()
         except Web139Error as exc:
-            raise MCloudAPIException(str(exc)) from exc
+            raise _api_error(exc) from exc
 
     def upload_file(
         self,
@@ -458,9 +540,9 @@ class DirectClientWrapper:
         try:
             file_id = self.client.upload_file(path, target_dir_id, file_name)
         except Web139AuthError as exc:
-            raise MCloudAuthException(str(exc)) from exc
+            raise _api_error(exc) from exc
         except Web139Error as exc:
-            raise MCloudAPIException(f"上传文件 {file_name} 失败: {exc}") from exc
+            raise _api_error(exc, message=f"上传文件 {file_name} 失败: {exc}") from exc
         return CloudItem(
             file_id=file_id,
             name=file_name,

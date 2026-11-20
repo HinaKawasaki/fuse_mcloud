@@ -25,12 +25,20 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
-from mcloud_fuse import config, sdnotify, service, token_status, tokens, userconfig
+from mcloud_fuse import (
+    config,
+    delete_failures,
+    mountopts,
+    sdnotify,
+    service,
+    token_status,
+    tokens,
+    userconfig,
+)
 from mcloud_fuse.cache.data_cache import DataCache
 from mcloud_fuse.cache.meta_cache import MetaCache
 from mcloud_fuse.client.wrapper import DirectClientWrapper
 from mcloud_fuse.errors import MCloudAPIException
-from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps
 from mcloud_fuse.journal import WritebackJournal, default_journal_path
 from mcloud_fuse.lock import CacheLock, CacheLockError
 from mcloud_fuse.mapping.id_map import InodeMapper
@@ -48,6 +56,7 @@ HELP = """\
   mount       挂载云盘（默认命令）
   unmount     卸载挂载点，必要时先停止 systemd 用户服务
   status      显示配置、挂载点、token 到期时间与服务状态
+  service     用户服务：status | install | restart | uninstall
   setup       首次设置 / 重新配置（全屏向导）
   token       令牌：status（剩余时间）| refresh（尝试自动续期）
   doctor      环境、网络、配额自检
@@ -88,6 +97,19 @@ def parse_args(argv: Optional[Sequence[str]] = None, cfg: Optional[userconfig.Us
         help="挂载根：云盘路径（如 /Photos/2026）或旧版 fileId；默认 / = 整个云盘",
     )
     parser.add_argument("--foreground", action="store_true", help="前台运行（默认行为，保留兼容）")
+    parser.add_argument(
+        "--allow-other",
+        dest="allow_other",
+        action="store_true",
+        default=defaults.allow_other,
+        help="允许本机其他用户只读访问（需要 /etc/fuse.conf 的 user_allow_other）",
+    )
+    parser.add_argument(
+        "--no-allow-other",
+        dest="allow_other",
+        action="store_false",
+        help="只允许当前用户访问（默认）",
+    )
     return parser.parse_args(argv)
 
 
@@ -129,8 +151,23 @@ def resolve_root(wrapper: DirectClientWrapper, root: str) -> str:
         return text
 
 
+def _root_required_message(plan: mountopts.MountpointPlan) -> str:
+    return (
+        f"挂载点 {plan.path} 需要一次性授权：{plan.detail}\n"
+        f"请先执行（只需一次）：\n  {plan.fix}\n"
+        "或运行 `mcloud-fuse setup`，向导里可以选 /mnt/mcloud 并代你完成这一步。"
+    )
+
+
 def prepare_mountpoint(mountpoint: Path) -> None:
     """确保挂载点存在且可用，并清理残留的失效 FUSE 挂载。"""
+    # 放到 /mnt 这类系统目录时，普通 mkdir 会 EACCES；先给出可执行的 sudo 命令，
+    # 而不是抛一个 Python 栈。
+    plan = mountopts.inspect_mountpoint(str(mountpoint))
+    if plan.action == mountopts.NEED_ROOT:
+        raise SystemExit(_root_required_message(plan))
+    if plan.action == mountopts.BLOCKED:
+        raise SystemExit(f"挂载点不可用：{plan.detail}" + (f"\n修复：{plan.fix}" if plan.fix else ""))
     try:
         mountpoint.mkdir(parents=True, exist_ok=True)
     except FileExistsError:
@@ -171,6 +208,21 @@ def _import_fuse():
     return pyfuse3, trio
 
 
+def _require_mount_dependencies() -> None:
+    """真正挂载前检查 FUSE 依赖；把 ImportError 变成一句能照做的提示。"""
+    try:
+        import pyfuse3  # noqa: F401
+        import trio  # noqa: F401
+
+        from mcloud_fuse.fuse import fuse_ops  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            f"❌ 缺少挂载依赖：{exc}\n"
+            "   安装：sudo apt-get install -y fuse3 libfuse3-dev && pip install -e .\n"
+            "   只做设置 / 卸载不需要 FUSE：mcloud-fuse setup、mcloud-fuse service uninstall。"
+        ) from exc
+
+
 async def _watch_termination_signals(pyfuse3, trio, stop_requested) -> None:
     """收到 SIGTERM / SIGINT 时优雅终止 FUSE 主循环，并记录这是主动停止。"""
     with trio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as signals:
@@ -207,6 +259,27 @@ async def main(
 
     prepare_mountpoint(mountpoint)
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    allow_other = bool(getattr(args, "allow_other", False))
+    if allow_other:
+        problems = mountopts.share_problems(mountpoint)
+        blocking = [problem for problem in problems if problem.fatal]
+        if blocking:
+            detail = "\n".join(
+                f"  - {problem.detail}\n    修复：{problem.fix}" for problem in blocking
+            )
+            raise SystemExit(
+                "❌ 配置里开启了 allow_other，但缺少前置条件：\n"
+                f"{detail}\n"
+                "改回仅本用户：`mcloud-fuse setup`（关掉共享访问）或 `--no-allow-other`。"
+            )
+        for problem in problems:
+            logger.warning(
+                "共享访问提醒：%s（%s）→ %s", problem.name, problem.detail, problem.fix
+            )
+        logger.info(
+            "已开启 allow_other：本机其他用户可读 %s；写入仍被 0644/0755 拒绝", mountpoint
+        )
 
     logger.info("正在初始化移动云盘（yun.139.com Web API）...")
     try:
@@ -252,6 +325,8 @@ async def main(
     except Exception:  # noqa: BLE001
         pass
 
+    from mcloud_fuse.fuse.fuse_ops import MCloudFuseOps
+
     fuse_ops = MCloudFuseOps(
         mapper=mapper,
         tree=tree,
@@ -261,7 +336,9 @@ async def main(
     )
 
     logger.info("正在挂载到 %s ...", mountpoint)
-    fuse_options = set(pyfuse3.default_options)
+    # default_permissions 始终带上：内核按 attrs 里的 0644/0755 做权限检查，
+    # allow_other 时这是「只读共享」成立的前提。
+    fuse_options = mountopts.mount_options(pyfuse3.default_options, allow_other)
     fuse_options.add("fsname=mcloud_fuse")
 
     # 后台每 12 小时把 token 剩余寿命写进 systemd 的 Status=，临近过期时顺便续期。
@@ -305,7 +382,9 @@ async def main(
         data_cache.begin_shutdown()
         if config.RESCUE_ON_SHUTDOWN and stop_requested.is_set():
             try:
-                candidates = data_cache.rescuable_uploads()
+                candidates = data_cache.rescuable_uploads(
+                    active_keys=fuse_ops.active_write_keys()
+                )
                 if candidates:
                     # 只申请一次，且不超过硬上限；rescue 自身仍有 20s 硬超时。
                     extension = min(
@@ -321,7 +400,9 @@ async def main(
             logger.info("等待后台补传让路（最多 10 秒）...")
             recovery_thread.join(timeout=10)
         try:
-            rescue = data_cache.rescue_pending_uploads()
+            rescue = data_cache.rescue_pending_uploads(
+                active_keys=fuse_ops.active_write_keys()
+            )
             if rescue.count or rescue.skipped:
                 logger.info(
                     "关机遇失抢救：%s 个 / %.1f MiB / %.1f 秒%s",
@@ -369,9 +450,9 @@ def _load_config(require: bool = False) -> Optional[userconfig.UserConfig]:
 def _mount(args: Sequence[str], cfg: Optional[userconfig.UserConfig] = None) -> int:
     cfg = cfg or _load_config() or userconfig.UserConfig()
     try:
-        import trio
-    except ImportError as exc:
-        print(f"❌ 缺少挂载依赖：{exc}\n请先安装：pip install -e .", file=sys.stderr)
+        _require_mount_dependencies()
+    except SystemExit as exc:
+        print(exc.code, file=sys.stderr)
         return 1
 
     # 同一个缓存目录只能有一个挂载进程；flock 在进程被 kill 时自动释放。
@@ -385,6 +466,8 @@ def _mount(args: Sequence[str], cfg: Optional[userconfig.UserConfig] = None) -> 
     except OSError as exc:
         print(f"❌ 无法锁定缓存目录：{exc}", file=sys.stderr)
         return 1
+
+    import trio
 
     try:
         trio.run(main, list(args), cfg)
@@ -410,9 +493,9 @@ def _unmount() -> int:
     mountpoint = Path(cfg.mountpoint)
     if service.is_active():
         print("正在停止 systemd 用户服务 ...")
-        result = service.stop()
-        if not result.ok:
-            print(f"⚠️  停止服务失败：{result.detail}（继续尝试直接卸载）", file=sys.stderr)
+        stopped = service.stop()
+        if not stopped.ok:
+            print(f"⚠️  停止服务失败：{stopped.detail}（继续尝试直接卸载）", file=sys.stderr)
         for _ in range(20):
             if not os.path.ismount(mountpoint):
                 break
@@ -425,21 +508,71 @@ def _unmount() -> int:
     binary = shutil.which("fusermount3") or "fusermount3"
     for flag in ("-u", "-uz"):
         try:
-            result = subprocess.run(
+            unmount_result = subprocess.run(
                 [binary, flag, str(mountpoint)], check=False, capture_output=True, text=True
             )
         except OSError as exc:
             print(f"❌ 无法执行 {binary}：{exc}", file=sys.stderr)
             return 1
-        if result.returncode == 0:
+        if unmount_result.returncode == 0:
             break
-        if result.stderr:
-            print(result.stderr.strip(), file=sys.stderr)
+        if unmount_result.stderr:
+            print(unmount_result.stderr.strip(), file=sys.stderr)
     if os.path.ismount(mountpoint):
         print(f"❌ 仍无法卸载 {mountpoint}；请先 cd 出该目录再试。", file=sys.stderr)
         return 1
     print(f"✅ 已卸载 {mountpoint}")
     return 0
+
+
+def _service(argv: Sequence[str]) -> int:
+    """systemd 用户服务的状态 / 安装 / 重启 / 卸载。"""
+    parser = argparse.ArgumentParser(
+        prog="mcloud-fuse service",
+        description="管理 systemd --user 服务（不碰配置与 token）",
+    )
+    parser.add_argument(
+        "action", choices=("status", "install", "restart", "uninstall"), help="要执行的动作"
+    )
+    parser.add_argument("--yes", "-y", action="store_true", help="卸载时不再询问")
+    args = parser.parse_args(list(argv))
+
+    if args.action == "status":
+        unit = service.unit_path()
+        print(f"服务单元  {unit}  {'[已安装]' if unit.exists() else '[未安装]'}")
+        print(f"状态      {service.status_text()}")
+        cfg = _load_config()
+        if cfg is not None:
+            mounted = os.path.ismount(cfg.mountpoint)
+            print(f"挂载点    {cfg.mountpoint}  {'[已挂载]' if mounted else '[未挂载]'}")
+        return 0
+
+    if not service.available():
+        print("当前环境没有 systemctl（或不是 systemd 会话），无法管理用户服务。", file=sys.stderr)
+        return 1
+
+    if args.action == "install":
+        cfg = _load_config(require=True)
+        if cfg is None:
+            return 1
+        result = service.install(cfg)
+    elif args.action == "restart":
+        result = service.restart()
+    else:
+        if not args.yes and sys.stdin.isatty():
+            try:
+                answer = input(
+                    "卸载 systemd 用户服务（不会删除配置与 token）？[y/N] "
+                ).strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes", "是"):
+                print("已取消。")
+                return 0
+        result = service.uninstall()
+
+    print(("✅ " if result.ok else "❌ ") + result.detail)
+    return 0 if result.ok else 1
 
 
 def _status(argv: Optional[Sequence[str]] = None) -> int:
@@ -461,11 +594,20 @@ def _status(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  挂载点    {mountpoint}  {'[已挂载]' if mounted else '[未挂载]'}")
     print(f"  缓存      {cfg.cache_dir}")
     print(f"  云盘范围  {'整个云盘' if cfg.root == '/' else cfg.root}")
+    print(f"  共享访问  {mountopts.describe_share(cfg.allow_other)}")
     print(f"  删除方式  {'永久删除' if cfg.rm_mode == 'delete' else '移入回收站'}")
     print(f"  冲突策略  {cfg.conflict}")
     print(f"  token     {tokens.token_summary()}")
     print(f"  自动续期  {token_status.cadence_text()}")
     print(f"  服务      {service.status_text()}")
+    failures = delete_failures.load()
+    if failures:
+        latest = failures[-1]
+        label = latest.get("name") or latest.get("file_id")
+        print(
+            f"  删除失败  {len(failures)} 个（最近：{label}：{latest.get('error')}）\n"
+            "            后台删除没成功，对象已重新出现在 ls 里；重新 rm 或检查网络"
+        )
     try:
         cache_for_journal = (
             Path(status_args.cache_dir).expanduser()
@@ -553,6 +695,8 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         return _unmount()
     if command == "status":
         return _status(rest)
+    if command == "service":
+        return _service(rest)
     if command == "token":
         from mcloud_fuse.token_cli import main as token_main
 
